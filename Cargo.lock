@@ -432,6 +432,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lge-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lge-cli"
 version = "0.1.0"
 dependencies = [
@@ -453,6 +464,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lge-filter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lge-index"
 version = "0.1.0"
 dependencies = [
@@ -462,6 +482,38 @@ dependencies = [
  "lge-core",
  "tree-sitter",
  "tree-sitter-python",
+]
+
+[[package]]
+name = "lge-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lge-resolve"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lge-retrieve"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -476,12 +528,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lge-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lge-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "lbug",
  "lge-core",
+]
+
+[[package]]
+name = "lge-usage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

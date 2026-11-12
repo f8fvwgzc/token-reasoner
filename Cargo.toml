@@ -1,11 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["crates/lge-core", "crates/lge-index", "crates/lge-store", "crates/lge-router", "crates/lge-cli"]
+members = [
+    "crates/lge-core",
+    "crates/lge-index",
+    "crates/lge-resolve",
+    "crates/lge-store",
+    "crates/lge-retrieve",
+    "crates/lge-router",
+    "crates/lge-usage",
+    "crates/lge-filter",
+    "crates/lge-session",
+    "crates/lge-mcp",
+    "crates/lge-bench",
+    "crates/lge-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"

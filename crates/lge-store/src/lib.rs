@@ -1,5 +1,8 @@
 //! LadybugDB adapter. No other crate talks to `lbug` directly.
 
+mod graph_store;
+pub use graph_store::GraphStore;
+
 use anyhow::{anyhow, Result};
 use lbug::{Connection, Database, SystemConfig, Value};
 use lge_core::{method, Hit, ParsedFile};
