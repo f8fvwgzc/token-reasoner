@@ -1,0 +1,14 @@
+[package]
+name = "lge-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+lge-core = { path = "../lge-core" }
+lge-store = { path = "../lge-store" }
+
+[dev-dependencies]
+lge-index = { path = "../lge-index" }

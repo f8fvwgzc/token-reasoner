@@ -1,0 +1,18 @@
+[package]
+name = "lge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+lge-core = { path = "../lge-core" }
+lge-index = { path = "../lge-index" }
+lge-store = { path = "../lge-store" }
+lge-router = { path = "../lge-router" }
+clap = { version = "4.6.7", features = ["derive"] }
+
+[[bin]]
+name = "lge"
+path = "src/main.rs"

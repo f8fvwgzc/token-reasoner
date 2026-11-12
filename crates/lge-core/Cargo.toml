@@ -1,0 +1,9 @@
+[package]
+name = "lge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+blake3.workspace = true
