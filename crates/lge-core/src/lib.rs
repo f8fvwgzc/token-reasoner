@@ -182,6 +182,9 @@ pub mod fact {
     /// The symbol mentions another symbol without calling it (callback, decorator
     /// argument, type annotation). key = name as written.
     pub const REFERENCE: &str = "reference";
+    /// The symbol is its file's default export (TypeScript and JavaScript).
+    /// key = symbol name. Used to resolve `import x from "./file"`.
+    pub const DEFAULT_EXPORT: &str = "default_export";
 }
 
 // ---------------------------------------------------------------------------

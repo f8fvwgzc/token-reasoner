@@ -113,6 +113,10 @@ pub mod facts { pub fn sql_tables(sql: &str) -> Vec<(String, bool)>; } // (table
   - `inherits` / `implements`: class bases, `extends` and `implements`.
   - `reference`: an identifier that names a function or class and is passed as an
     argument or used as a decorator without being called.
+  - `default_export`: on the symbol a TS/JS file exports as default
+    (`export default function f`, `export default class C`, `export default f;`).
+  - For SQL, `literal` describes the table name: a table written out in a template
+    string or f-string that interpolates only values is still `literal = true`.
 
 ## lge-resolve
 
