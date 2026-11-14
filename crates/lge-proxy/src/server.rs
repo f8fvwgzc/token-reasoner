@@ -66,6 +66,8 @@ impl Config {
 pub struct Settings {
     pub inject_context: bool,
     pub shorten_outputs: bool,
+    /// Skeletons for whole-file reads. Experimental, off by default.
+    pub shorten_reads: bool,
     pub context_budget: usize,
     /// Index a git repository the first time the agent works in it.
     pub auto_index: bool,
@@ -77,6 +79,7 @@ impl Default for Settings {
         Settings {
             inject_context: o.inject_context,
             shorten_outputs: o.shorten_outputs,
+            shorten_reads: o.shorten_reads,
             context_budget: o.context_budget,
             auto_index: true,
         }
@@ -88,6 +91,7 @@ impl Settings {
         Options {
             inject_context: self.inject_context,
             shorten_outputs: self.shorten_outputs,
+            shorten_reads: self.shorten_reads,
             context_budget: self.context_budget,
             ..Options::default()
         }
@@ -424,6 +428,7 @@ impl Daemon {
             .clone();
         let options = lock(&self.settings).options();
         let repo = seen.cwd.as_deref().and_then(|cwd| self.repo_for(Path::new(cwd)));
+        let changed;
         {
             let mut c = lock(&conv);
             c.requests += 1;
@@ -458,18 +463,22 @@ impl Daemon {
                                     c.record.services = route.services;
                                 }
                             }
-                            transform(&mut value, &mut c.session, Some(&graph), &options);
+                            changed = transform(&mut value, &mut c.session, Some(&graph), &options);
                         }
                         _ => {
-                            transform(&mut value, &mut c.session, None, &options);
+                            changed = transform(&mut value, &mut c.session, None, &options);
                         }
                     }
                 }
                 None => {
-                    transform(&mut value, &mut c.session, None, &options);
+                    changed = transform(&mut value, &mut c.session, None, &options);
                 }
             }
             c.record.pack_tokens = c.session.saved.context_tokens as i64;
+        }
+        // Nothing was replaced or added: send the bytes exactly as they came.
+        if changed.outputs_replaced == 0 && changed.contexts_present == 0 {
+            return Some((body.to_vec(), conv));
         }
         Some((serde_json::to_vec(&value).ok()?, conv))
     }

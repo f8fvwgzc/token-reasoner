@@ -125,7 +125,10 @@ fn a_file_read_from_the_top_becomes_a_skeleton_once() {
         store: &store,
         root: &root,
     };
-    let opts = Options::default();
+    let opts = Options {
+        shorten_reads: true,
+        ..Options::default()
+    };
     let mut session = Session::default();
     let file = billing_module();
 
@@ -197,7 +200,10 @@ fn a_read_is_left_alone_when_the_proxy_cannot_be_sure_of_it() {
         store: &store,
         root: &root,
     };
-    let opts = Options::default();
+    let opts = Options {
+        shorten_reads: true,
+        ..Options::default()
+    };
     let file = billing_module();
 
     // Without a graph there is nothing to decide relevance with.
@@ -234,6 +240,17 @@ fn a_read_is_left_alone_when_the_proxy_cannot_be_sure_of_it() {
             None,
             &format!("# edited\n{file}"),
             &opts
+        ),
+        None
+    );
+    // Whole-file skeletons are opt-in: with the defaults a read passes through.
+    assert_eq!(
+        Session::default().rewrite_output(
+            Some(&graph),
+            "cat orders_api/billing.py",
+            None,
+            &format!("# edited\n{file}"),
+            &Options::default()
         ),
         None
     );

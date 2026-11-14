@@ -84,7 +84,8 @@
     <h2>Settings</h2>
     <div class="card row">
       <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
-      <label class="switch"><input type="checkbox" id="s_shorten"> Shorten file reads, searches and check output</label>
+      <label class="switch"><input type="checkbox" id="s_shorten"> Shorten check output and long searches; point repeated output to its first copy</label>
+      <label class="switch"><input type="checkbox" id="s_reads"> Send a skeleton for whole-file reads (experimental)</label>
       <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
     </div>
   </section>
@@ -144,7 +145,7 @@ function render(s) {
       : '<tr><td colspan="6" class="dim">Nothing measured yet.</td></tr>');
 
   if (!settingsDirty) {
-    $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_auto').checked = s.settings.auto_index;
+    $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_reads').checked = s.settings.shorten_reads; $('s_auto').checked = s.settings.auto_index;
   }
 }
 
@@ -184,9 +185,9 @@ $('import').onclick = async () => {
   catch (e) { say(e.message, 'bad'); }
   $('import').disabled = false;
 };
-for (const id of ['s_inject', 's_shorten', 's_auto']) $(id).onchange = async () => {
+for (const id of ['s_inject', 's_shorten', 's_reads', 's_auto']) $(id).onchange = async () => {
   settingsDirty = true;
-  const body = Object.assign({}, state ? state.settings : {}, { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, auto_index: $('s_auto').checked });
+  const body = Object.assign({}, state ? state.settings : {}, { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, shorten_reads: $('s_reads').checked, auto_index: $('s_auto').checked });
   try { await api('settings', 'POST', body); } catch (e) { say(e.message, 'bad'); }
   settingsDirty = false; refresh();
 };

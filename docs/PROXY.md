@@ -24,12 +24,19 @@ Only two kinds of item in the conversation, and nothing else in the body:
 |---|---|---|
 | Output of a test, lint or type-check run | Reduced to its failures, or to one line when it passed | Only for tools whose output format is recognised; an unknown format is left alone |
 | Output of `rg` / `grep` with more than 60 matching lines | Capped: the files the task is about first, six lines per file, and a line saying what was left out | The closing line tells the model to narrow the search |
-| Output of `cat file`, or of a read that starts at line 1, for a file in the graph | A skeleton: functions the task is not about keep their signature and first docstring line; each left-out body is replaced by a marker with the exact `sed -n 'A,Bp' file` that reads it | Only when the file on disk is exactly what was indexed; a second read of the same file is always sent whole |
+| The same large output a second time (a file read again, a command rerun with nothing changed) | Replaced by one line that points to the first copy | Only while the first copy is still in the request; after the agent compacts its history the content is sent again |
+| Output of `cat file`, or of a read that starts at line 1, for a file in the graph. **Off by default** | A skeleton: functions the task is not about keep their signature and first docstring line; each left-out body is replaced by a marker with the exact `sed -n 'A,Bp' file` that reads it | Only when the file on disk is exactly what was indexed; a second read of the same file is always sent whole |
 | A message the user typed, when it names a symbol or clearly matches one | One extra message is added after it: the evidence pack for that message, in `<lge_context>` tags | Small talk gets nothing; the same starting points are never added twice |
 
 Never touched: the system prompt, tool definitions, reasoning items, tool calls,
 patches, diffs, reads of a line range that does not start at the top, and any output
 the proxy cannot classify with certainty.
+A request in which nothing was replaced or added is forwarded as the exact bytes that
+came in.
+
+Whole-file skeletons are opt-in because Headroom and RTK, which both measured this,
+leave file reads alone by default: a shortened read can cost more in follow-up reads
+than it saves. Switch it on from the page and watch requests per session.
 
 ## Why the prompt cache keeps working
 
@@ -41,6 +48,10 @@ So every decision is made once and remembered for the conversation: the first ti
 item is seen it is rewritten (or left alone), and on every later turn the same item
 gets the same bytes. Context is inserted at the same place with the same text. A test
 (`the cached prefix must not change`) holds this.
+
+The decisions are kept in memory. After the daemon restarts, a running conversation is
+decided again from its own content, which gives the same result unless the files changed
+in between; then that conversation pays one uncached turn.
 
 ## Failing open
 
@@ -100,7 +111,8 @@ On the page, or `daemon.json` in the data directory:
 | Setting | Default | Meaning |
 |---|---|---|
 | Add graph context | on | The evidence pack after a typed message about the code |
-| Shorten outputs | on | File skeletons, search caps, check results |
+| Shorten outputs | on | Check results, search caps, pointers for repeated output |
+| Skeletons for whole-file reads | off | Experimental, see above |
 | Index on first use | on | A git repository inside the workspace is indexed the first time the agent works in it |
 | Context budget | 1,500 tokens | Size of one added pack |
 

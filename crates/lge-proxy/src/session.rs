@@ -26,8 +26,12 @@ pub struct Graph<'a> {
 pub struct Options {
     /// Add the evidence pack after a message the user typed.
     pub inject_context: bool,
-    /// Shorten file reads, search results and check runs.
+    /// Shorten search results and check runs, and point a repeated output
+    /// back to its first copy.
     pub shorten_outputs: bool,
+    /// Send a skeleton for a whole-file read. Off by default: a shortened read
+    /// can cost more in follow-up reads than it saves.
+    pub shorten_reads: bool,
     /// Tokens of one injected pack.
     pub context_budget: usize,
     /// Packs added per conversation at most.
@@ -39,6 +43,7 @@ impl Default for Options {
         Options {
             inject_context: true,
             shorten_outputs: true,
+            shorten_reads: false,
             context_budget: 1500,
             max_contexts: 6,
         }
@@ -78,6 +83,8 @@ pub struct Session {
     relevant_files: BTreeSet<String>,
     /// Seeds of the packs already added, so the same pack is not added twice.
     seeds_shown: BTreeSet<String>,
+    /// Outputs replaced by a pointer to their earlier copy, so each is counted once.
+    pointers: BTreeSet<String>,
     /// Words of what the user typed, lower-cased.
     words: BTreeSet<String>,
     pub saved: Saved,
@@ -193,7 +200,7 @@ impl Session {
         if let Some(known) = self.outputs.get(&id) {
             return known.clone();
         }
-        let decided = self.decide_output(graph, command, cwd, output);
+        let decided = self.decide_output(graph, command, cwd, output, opts);
         if let Some(text) = &decided {
             self.saved.outputs_shortened += 1;
             self.saved.tokens_before += count(output);
@@ -203,12 +210,23 @@ impl Session {
         decided
     }
 
+    /// Count an output that was replaced by a pointer to its earlier copy.
+    /// The same item comes back on every turn; it is counted once.
+    pub fn count_pointer(&mut self, id: &str, before: &str, after: &str) {
+        if self.pointers.insert(id.to_string()) {
+            self.saved.outputs_shortened += 1;
+            self.saved.tokens_before += count(before);
+            self.saved.tokens_after += count(after);
+        }
+    }
+
     fn decide_output(
         &mut self,
         graph: Option<&Graph>,
         command: &str,
         cwd: Option<&Path>,
         output: &str,
+        opts: &Options,
     ) -> Option<String> {
         match purpose(command) {
             Purpose::Check { tool } => failures_only(&tool, output),
@@ -218,11 +236,11 @@ impl Session {
             }
             // A range that starts at the top is looking around; a range further
             // down is fetching known lines and is never touched.
-            Purpose::ReadWhole { path } => self.file_skeleton(graph?, &path, cwd, output),
+            Purpose::ReadWhole { path } if opts.shorten_reads => self.file_skeleton(graph?, &path, cwd, output),
             Purpose::ReadRange {
                 path, from_top: true, ..
-            } => self.file_skeleton(graph?, &path, cwd, output),
-            Purpose::ReadRange { .. } | Purpose::Other => None,
+            } if opts.shorten_reads => self.file_skeleton(graph?, &path, cwd, output),
+            Purpose::ReadWhole { .. } | Purpose::ReadRange { .. } | Purpose::Other => None,
         }
     }
 

@@ -34,6 +34,9 @@ struct Ran {
     workdir: Option<String>,
 }
 
+/// An output smaller than this is cheaper to repeat than to point at.
+const REPEAT_MIN_BYTES: usize = 2000;
+
 const SHELLS: [&str; 6] = ["bash", "zsh", "sh", "/bin/bash", "/bin/zsh", "/bin/sh"];
 
 /// The command line of a shell-type tool call, from its arguments object.
@@ -197,6 +200,8 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
     }
 
     let mut out: Vec<Value> = Vec::with_capacity(items.len() + 2);
+    // Text of large outputs sent in full so far in this request -> the command that produced it.
+    let mut sent_in_full: HashMap<String, String> = HashMap::new();
     for mut item in std::mem::take(items) {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         match kind.as_str() {
@@ -215,6 +220,29 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                     if let Some(shorter) = session.rewrite_output(graph, &call.command, dir.as_deref(), &text, opts) {
                         item["output"] = Value::String(reframe(framed, shorter));
                         seen.outputs_replaced += 1;
+                    } else if opts.shorten_outputs && text.len() >= REPEAT_MIN_BYTES {
+                        // The same large output again (a file read twice, a command
+                        // rerun with nothing changed): point to the first copy, which
+                        // is still in this request. Decided from the request alone, so
+                        // it is the same on every turn and right after a compaction.
+                        let hash = lge_core::content_hash(text.as_bytes());
+                        match sent_in_full.get(&hash) {
+                            Some(earlier) => {
+                                let first: String = earlier.chars().take(120).collect();
+                                let pointer = format!(
+                                    "lge: identical to the output of `{first}` earlier in this conversation ({} lines, unchanged); it is not repeated here.
+",
+                                    text.lines().count()
+                                );
+                                let id = item.get("call_id").and_then(Value::as_str).unwrap_or(&hash).to_string();
+                                session.count_pointer(&id, &text, &pointer);
+                                item["output"] = Value::String(reframe(framed, pointer));
+                                seen.outputs_replaced += 1;
+                            }
+                            None => {
+                                sent_in_full.insert(hash, call.command.clone());
+                            }
+                        }
                     }
                 }
                 out.push(item);
@@ -404,6 +432,54 @@ mod tests {
         transform(&mut again, &mut session, None, &Options::default());
         assert_eq!(again["input"][4], body["input"][4]);
         assert_eq!(session.saved.outputs_shortened, 1, "decided once");
+    }
+
+    #[test]
+    fn a_repeated_output_points_to_its_first_copy_while_that_copy_is_there() {
+        let file: String = (0..120)
+            .map(|i| format!("line {i}: some source text that is long enough to matter\n"))
+            .collect();
+        let mut body = json!({ "input": [
+            call("c1", "cat src/app.py"), output("c1", &file),
+            call("c2", "sed -n '1,200p' src/app.py"), output("c2", &file),
+            call("c3", "cat small.txt"), output("c3", "short"),
+            call("c4", "cat small.txt"), output("c4", "short"),
+        ] });
+        let mut session = Session::default();
+        let seen = transform(&mut body, &mut session, None, &Options::default());
+        assert_eq!(seen.outputs_replaced, 1);
+        assert_eq!(body["input"][1]["output"], file, "the first copy stays whole");
+        assert_eq!(
+            body["input"][3]["output"],
+            "lge: identical to the output of `cat src/app.py` earlier in this conversation (120 lines, unchanged); it is not repeated here.\n"
+        );
+        assert_eq!(
+            body["input"][7]["output"], "short",
+            "a small output is cheaper to repeat"
+        );
+        // Resent on the next turn: the same bytes, and counted once.
+        let first = body.clone();
+        let mut again = json!({ "input": [call("c1", "cat src/app.py"), output("c1", &file), call("c2", "sed -n '1,200p' src/app.py"), output("c2", &file)] });
+        transform(&mut again, &mut session, None, &Options::default());
+        assert_eq!(again["input"][3], first["input"][3]);
+        assert_eq!(session.saved.outputs_shortened, 1);
+        // The agent compacted its history and the first copy is gone: the content is sent again.
+        let mut compacted = json!({ "input": [call("c2", "sed -n '1,200p' src/app.py"), output("c2", &file)] });
+        transform(&mut compacted, &mut session, None, &Options::default());
+        assert_eq!(compacted["input"][1]["output"], file);
+        // Switched off.
+        let mut off =
+            json!({ "input": [call("c1", "cat a"), output("c1", &file), call("c2", "cat a"), output("c2", &file)] });
+        transform(
+            &mut off,
+            &mut Session::default(),
+            None,
+            &Options {
+                shorten_outputs: false,
+                ..Options::default()
+            },
+        );
+        assert_eq!(off["input"][3]["output"], file);
     }
 
     #[test]
