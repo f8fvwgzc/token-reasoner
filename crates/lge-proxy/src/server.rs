@@ -781,7 +781,7 @@ impl Daemon {
             saved.context_tokens += s.context_tokens;
         }
         let mut recent: Vec<&UsageRecord> = records.iter().filter(|r| r.mode == "proxy").collect();
-        recent.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        recent.sort_by_key(|r| std::cmp::Reverse(r.finished_at));
         let sessions: Vec<Value> = recent
             .iter()
             .take(50)
