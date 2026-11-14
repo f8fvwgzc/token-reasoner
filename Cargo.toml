@@ -6,6 +6,7 @@ members = [
     "crates/lge-resolve",
     "crates/lge-store",
     "crates/lge-retrieve",
+    "crates/lge-memory",
     "crates/lge-router",
     "crates/lge-usage",
     "crates/lge-filter",

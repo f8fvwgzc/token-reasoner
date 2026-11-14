@@ -1,0 +1,16 @@
+[package]
+name = "lge-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+lge-core = { path = "../lge-core" }
+lge-store = { path = "../lge-store" }
+lge-retrieve = { path = "../lge-retrieve" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

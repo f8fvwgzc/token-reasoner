@@ -602,6 +602,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lge-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-retrieve",
+ "lge-store",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "lge-resolve"
 version = "0.1.0"
 dependencies = [

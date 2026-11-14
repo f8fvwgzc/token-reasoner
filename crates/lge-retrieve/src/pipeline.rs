@@ -131,3 +131,52 @@ pub fn resolve_edges(store: &dyn GraphStore, commit: &str, now: i64) -> Result<E
     store.replace_edges(&resolved, commit, now)?;
     Ok(resolved.stats)
 }
+
+/// What the last freshness check saw, so the next one can be cheap.
+#[derive(Debug, Default)]
+pub struct Freshness {
+    checked: Option<Instant>,
+    head: String,
+    /// Changed and untracked files with their modification times.
+    dirty: Vec<(String, u64)>,
+}
+
+fn modified(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Re-index when the working tree changed since the last check. Inside git
+/// the check is `HEAD` plus the modified and untracked files with their
+/// modification times, so an unchanged tree costs no hashing. Outside git
+/// every call past `min_interval` runs the incremental index, which hashes
+/// each file. Returns the report when an index run happened.
+pub fn refresh_if_stale(
+    store: &dyn GraphStore,
+    root: &Path,
+    opts: &IndexOptions,
+    state: &mut Freshness,
+    min_interval: std::time::Duration,
+) -> Result<Option<IndexReport>> {
+    if state.checked.is_some_and(|t| t.elapsed() < min_interval) {
+        return Ok(None);
+    }
+    let head = lge_index::git::head_commit(root).unwrap_or_default();
+    let mut dirty: Vec<(String, u64)> =
+        lge_index::git::changed_files(root).unwrap_or_default().into_iter().map(|p| (p.clone(), modified(&root.join(&p)))).collect();
+    dirty.sort();
+    let first = state.checked.is_none();
+    let same = !head.is_empty() && head == state.head && dirty == state.dirty;
+    state.checked = Some(Instant::now());
+    if same && !first {
+        return Ok(None);
+    }
+    let report = index_repo(store, root, opts)?;
+    state.head = head;
+    state.dirty = dirty;
+    Ok(Some(report))
+}
