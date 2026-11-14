@@ -64,6 +64,31 @@ Its limits, which lge must not repeat:
 | Routing by tag: component, concept, convention, decision, feature-work | hindsight | seeded pages |
 | Search-first injection: return ranked 280-character snippets, never a list of titles | hindsight | `recall` and `search_pages` tools |
 
+### The proxy
+
+Studied later, for `lge serve` (see `docs/PROXY.md`): [headroom](https://github.com/chopratejas/headroom)
+(Apache-2.0), a context-optimizing proxy, and [rtk](https://github.com/rtk-ai/rtk), a
+command-output condenser (Apache-2.0 at the root; its `engine` and `proxy` directories
+are BUSL-1.1, so only ideas were taken). The request format was checked against the
+[Codex](https://github.com/openai/codex) source (Apache-2.0).
+
+| Mechanism | From | In lge |
+|---|---|---|
+| Decide each rewrite once and replay the same bytes on later turns, so the provider's prefix cache keeps hitting | headroom | `lge-proxy::session` |
+| Forward a body that was not changed as the exact bytes that came; relay the response stream as bytes and parse it only for usage | headroom | `lge-proxy::server` |
+| Point a repeated output to its first copy | headroom | `lge-proxy::responses` |
+| Leave file reads alone by default; outlining a read is opt-in | headroom, rtk | `shorten_reads` setting, off |
+| Test, lint and type-check runs reduced to failures and summary | rtk, headroom | `lge-filter` through the proxy |
+| Never send a result that is not smaller; never summarise an unknown format | rtk (`never_worse`), headroom | `lge-proxy::shorten` |
+| No truncation notice without a way back: each marker names the exact command that returns what was left out | rtk | skeleton and search markers |
+| Count a saving once per conversation, not once per request | headroom | the page's "removed" figure |
+| Fail open | both | the proxy forwards the original on any error |
+
+Both projects report that the saving on whole requests is far below the saving on the
+compressed parts (rtk: "a 90% cut in command output is not a 90% cut in cost";
+headroom: 0% on plain source files, and a net loss when small results are compressed).
+lge's page therefore shows provider-reported tokens per session next to what was removed.
+
 ## Deliberately not adopted
 
 - LLM extraction, contradiction and consolidation calls (graphiti, hindsight): they spend
