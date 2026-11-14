@@ -31,6 +31,7 @@ fn usage(id: &str, task_id: &str, attempt: i64, started_at: i64) -> UsageRecord 
             "orders_api/repo, with comma.py".to_string(),
         ],
         services: vec!["orders_api".to_string()],
+        ..UsageRecord::default()
     }
 }
 

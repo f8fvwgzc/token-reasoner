@@ -77,6 +77,7 @@ pub(crate) fn list_usage(conn: &Connection, since: i64) -> Result<Vec<UsageRecor
             escalated: col_b(r, 17),
             files: col_list(r, 18),
             services: col_list(r, 19),
+            ..UsageRecord::default()
         })
         .collect())
 }

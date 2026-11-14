@@ -1,10 +1,10 @@
 //! The storage contract. Every other crate reaches the database through this
 //! trait; only `lge-store` imports `lbug`.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use lge_core::{
-    Direction, EdgeRec, EdgeType, FileInfo, HandoffNote, Hit, IndexRun, NodeLabel, NodeRec, ParsedFile, ResolveInput,
-    Resolved, UsageRecord,
+    Direction, EdgeRec, EdgeType, FileInfo, HandoffNote, Hit, IndexRun, MemoryRec, NodeLabel, NodeRec, PageRec,
+    ParsedFile, ResolveInput, Resolved, SymbolMetrics, UsageRecord, VectorTable,
 };
 use std::collections::HashMap;
 
@@ -122,4 +122,174 @@ pub trait GraphStore: Send + Sync {
 
     /// Most recent handoff notes, newest first.
     fn latest_handoffs(&self, limit: usize) -> Result<Vec<HandoffNote>>;
+
+    // ---- ranked search and in-database traversal -------------------------
+
+    /// Like [`search`](Self::search), restricted to one service when given. The
+    /// query is split with `lge_core::split_words`, so `order handler` finds
+    /// `getOrderHandler`.
+    fn search_in(&self, text: &str, service: Option<&str>, limit: usize) -> Result<Vec<Hit>> {
+        let _ = (text, service, limit);
+        bail!("search_in is not implemented by this store")
+    }
+
+    /// Nodes reachable from `ids` over `types` in one direction within `depth`
+    /// hops (1..=6), with the lowest hop count, nearest first, at most `limit`.
+    /// The start nodes are not returned. Placeholders are not returned.
+    fn reach(
+        &self,
+        ids: &[String],
+        types: &[EdgeType],
+        dir: Direction,
+        depth: u8,
+        limit: usize,
+    ) -> Result<Vec<(NodeRec, u8)>> {
+        let _ = (ids, types, dir, depth, limit);
+        bail!("reach is not implemented by this store")
+    }
+
+    /// One shortest path from `from` to `to` following `types` along their
+    /// direction, at most `max_depth` hops, as its edges in order. `None` when
+    /// there is none.
+    fn shortest_path(&self, from: &str, to: &str, types: &[EdgeType], max_depth: u8) -> Result<Option<Vec<EdgeRec>>> {
+        let _ = (from, to, types, max_depth);
+        bail!("shortest_path is not implemented by this store")
+    }
+
+    /// Every stored edge between two Symbols that is not CONTAINS and not
+    /// unresolved, as (from, to, type, confidence). Input of the ranking step.
+    fn symbol_graph(&self) -> Result<Vec<(String, String, EdgeType, f64)>> {
+        bail!("symbol_graph is not implemented by this store")
+    }
+
+    /// Store rank, community and degree on symbols. Unknown ids are skipped;
+    /// symbols not listed keep rank 0, community -1, degree 0.
+    fn set_metrics(&self, metrics: &[SymbolMetrics]) -> Result<()> {
+        let _ = metrics;
+        bail!("set_metrics is not implemented by this store")
+    }
+
+    /// Stored metrics of the given symbols. Unknown ids are skipped.
+    fn metrics(&self, ids: &[String]) -> Result<Vec<SymbolMetrics>> {
+        let _ = ids;
+        bail!("metrics is not implemented by this store")
+    }
+
+    /// Symbols by stored rank, highest first, optionally within one service or
+    /// one community. Modules, tests and placeholders are excluded. `score` is the rank.
+    fn top_ranked(&self, service: Option<&str>, community: Option<i64>, limit: usize) -> Result<Vec<Hit>> {
+        let _ = (service, community, limit);
+        bail!("top_ranked is not implemented by this store")
+    }
+
+    /// Fact sites of the given kind attached to the given symbols.
+    fn facts_of(&self, symbol_ids: &[String], kind: &str) -> Result<Vec<lge_core::FactSite>> {
+        let _ = (symbol_ids, kind);
+        bail!("facts_of is not implemented by this store")
+    }
+
+    // ---- long-term memory -----------------------------------------------
+
+    /// Insert or replace a fact by id, with its MENTIONS edges to the nodes in
+    /// `links` that exist.
+    fn put_memory(&self, m: &MemoryRec) -> Result<()> {
+        let _ = m;
+        bail!("put_memory is not implemented by this store")
+    }
+
+    /// Facts by id. Unknown ids are skipped.
+    fn get_memories(&self, ids: &[String]) -> Result<Vec<MemoryRec>> {
+        let _ = ids;
+        bail!("get_memories is not implemented by this store")
+    }
+
+    /// Keyword search over fact text, key and tags, best first with a score.
+    /// Expired facts are returned only when `include_expired` is set.
+    fn search_memories(&self, text: &str, limit: usize, include_expired: bool) -> Result<Vec<(MemoryRec, f64)>> {
+        let _ = (text, limit, include_expired);
+        bail!("search_memories is not implemented by this store")
+    }
+
+    /// Current facts that mention any of the given nodes, with the number of
+    /// those nodes each fact mentions, most shared first.
+    fn memories_mentioning(&self, node_ids: &[String], limit: usize) -> Result<Vec<(MemoryRec, i64)>> {
+        let _ = (node_ids, limit);
+        bail!("memories_mentioning is not implemented by this store")
+    }
+
+    /// Current facts, newest `valid_at` first, optionally of one kind or
+    /// carrying any of the given tags.
+    fn recent_memories(&self, kind: Option<&str>, tags: &[String], limit: usize) -> Result<Vec<MemoryRec>> {
+        let _ = (kind, tags, limit);
+        bail!("recent_memories is not implemented by this store")
+    }
+
+    /// Current facts with exactly this key.
+    fn memories_by_key(&self, key: &str) -> Result<Vec<MemoryRec>> {
+        let _ = key;
+        bail!("memories_by_key is not implemented by this store")
+    }
+
+    /// Number of stored facts: (current, expired).
+    fn memory_counts(&self) -> Result<(i64, i64)> {
+        bail!("memory_counts is not implemented by this store")
+    }
+
+    // ---- pages ------------------------------------------------------------
+
+    /// Insert or replace a page by slug.
+    fn put_page(&self, page: &PageRec) -> Result<()> {
+        let _ = page;
+        bail!("put_page is not implemented by this store")
+    }
+
+    fn get_page(&self, slug: &str) -> Result<Option<PageRec>> {
+        let _ = slug;
+        bail!("get_page is not implemented by this store")
+    }
+
+    /// Every page, ordered by slug.
+    fn list_pages(&self) -> Result<Vec<PageRec>> {
+        bail!("list_pages is not implemented by this store")
+    }
+
+    /// Keyword search over page title and body, best first with a score.
+    fn search_pages(&self, text: &str, limit: usize) -> Result<Vec<(PageRec, f64)>> {
+        let _ = (text, limit);
+        bail!("search_pages is not implemented by this store")
+    }
+
+    fn delete_page(&self, slug: &str) -> Result<()> {
+        let _ = slug;
+        bail!("delete_page is not implemented by this store")
+    }
+
+    // ---- vectors (optional) ---------------------------------------------
+
+    /// Store embeddings for rows of `table` by id. All vectors of one table
+    /// must have the same length. Unknown ids are skipped.
+    fn set_embeddings(&self, table: VectorTable, items: &[(String, Vec<f32>)]) -> Result<()> {
+        let _ = (table, items);
+        bail!("set_embeddings is not implemented by this store")
+    }
+
+    /// Ids of rows in `table` that have no embedding yet, at most `limit`,
+    /// with the text to embed.
+    fn missing_embeddings(&self, table: VectorTable, limit: usize) -> Result<Vec<(String, String)>> {
+        let _ = (table, limit);
+        bail!("missing_embeddings is not implemented by this store")
+    }
+
+    /// Rows of `table` nearest to `query` by cosine similarity, as (id, similarity),
+    /// best first, similarity >= `min_similarity`. Empty when the table has no embeddings.
+    fn vector_search(
+        &self,
+        table: VectorTable,
+        query: &[f32],
+        limit: usize,
+        min_similarity: f64,
+    ) -> Result<Vec<(String, f64)>> {
+        let _ = (table, query, limit, min_similarity);
+        bail!("vector_search is not implemented by this store")
+    }
 }

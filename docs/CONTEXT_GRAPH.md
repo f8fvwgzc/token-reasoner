@@ -111,3 +111,29 @@ task text
 - `lge pack "<task>"`: print the evidence pack only, for use with any agent.
 - `lge usage report`: tokens per task by class, cached share, by mode, plus what the
   shadow router would have chosen.
+
+## Long-term memory and pages (lge-memory)
+
+Modelled on hindsight and graphiti (see `docs/PRIOR_ART.md`), without an LLM in the loop.
+
+- **retain(text, kind, key, tags, source)**: the agent writes a fact at the end of a
+  task. Entity links are found by matching identifiers, qualified names and paths in the
+  text against the graph. Dedup ladder: normalized exact match, entropy gate, MinHash
+  (32 hashes, 3-character shingles) at Jaccard >= 0.9; a repeat raises `proof_count`.
+  A fact with a key supersedes current facts with the same key (`invalid_at = new.valid_at`,
+  `expired_at = now`); nothing is deleted.
+- **recall(query, budget)**: four arms, each a ranked id list: keyword (BM25), entity
+  overlap with the code symbols the query hits (`tanh(0.5 x shared)`), recent, and vector
+  when embeddings exist. Fused with `sum 1/(60 + rank)`; rank score `1 - 0.9 x rank/(n-1)`
+  multiplied by `(1 + 0.2 (recency - 0.5))` with `recency = clamp(1 - days/365, 0.1, 1)`
+  and `(1 + 0.1 (proof - 0.5))` with `proof = clamp(0.5 + ln(proof_count)/10, 0, 1)`.
+  Packed in rank order to the token budget: an oversized fact is skipped, packing
+  continues, the top fact is always returned.
+- **Pages**: markdown views. Memory pages are seeded by tag (`component`, `concept`,
+  `convention`, `decision`, `feature-work`) and rebuilt, deterministically, only when a
+  newer in-scope fact exists (`last_memory_seen_at` watermark). Graph pages
+  (`graph-overview`, one per community) are rebuilt after each index run. Pages are
+  exported to `.lge/pages/<slug>.md` with YAML front matter and searched by keyword;
+  a search returns 280-character snippets, never a list of titles.
+- **Vectors** are optional. The store keeps embeddings and answers cosine search; an
+  embedder is plugged in behind a trait. Without one, recall and search use the other arms.

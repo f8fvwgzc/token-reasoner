@@ -185,6 +185,10 @@ pub mod fact {
     /// The symbol is its file's default export (TypeScript and JavaScript).
     /// key = symbol name. Used to resolve `import x from "./file"`.
     pub const DEFAULT_EXPORT: &str = "default_export";
+    /// A comment that says why (`NOTE:`, `WHY:`, `HACK:`, `IMPORTANT:`, `TODO:`,
+    /// `FIXME:`) inside the symbol. key = the comment text, at most 200 chars.
+    /// Produces no edge; it is indexed for search and shown in evidence packs.
+    pub const RATIONALE: &str = "rationale";
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +687,11 @@ pub struct UsageRecord {
     pub escalated: bool,
     pub files: Vec<String>,
     pub services: Vec<String>,
+    /// The level the router would have chosen. Equal to `level` in routed mode;
+    /// in fixed mode it shows what routing would have done.
+    pub recommended_level: String,
+    /// Which levers were on, for comparison: `baseline`, `pack`, `pack+mcp`, ...
+    pub mode: String,
 }
 
 /// Short note written at the end of a task, read at the start of the next.
@@ -694,6 +703,150 @@ pub struct HandoffNote {
     /// Unix seconds.
     pub created_at: i64,
     pub text: String,
+}
+
+// ---------------------------------------------------------------------------
+// Graph metrics, long-term memory, pages
+// ---------------------------------------------------------------------------
+
+/// Numbers computed over the whole symbol graph after each resolve.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SymbolMetrics {
+    pub id: String,
+    /// Global PageRank over calls, references and inheritance; sums to 1 over symbols.
+    pub rank: f64,
+    /// Community id, 0 = the largest; -1 = none.
+    pub community: i64,
+    /// Number of distinct neighbours over non-CONTAINS edges between symbols.
+    pub degree: i64,
+}
+
+/// Kinds of [`MemoryRec`].
+pub mod memory_kind {
+    /// A fact about the system or the codebase.
+    pub const WORLD: &str = "world";
+    /// What was done in a task, and how it went.
+    pub const EXPERIENCE: &str = "experience";
+    /// A choice that was made, with its reason.
+    pub const DECISION: &str = "decision";
+    /// How things are done in this repository.
+    pub const CONVENTION: &str = "convention";
+    /// A consolidated statement derived from several facts.
+    pub const OBSERVATION: &str = "observation";
+    pub const ALL: [&str; 5] = [WORLD, EXPERIENCE, DECISION, CONVENTION, OBSERVATION];
+}
+
+/// One remembered fact. Facts are superseded, never deleted: a newer fact with
+/// the same key sets `invalid_at` and `expired_at` on the older one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRec {
+    pub id: String,
+    /// One of [`memory_kind`].
+    pub kind: String,
+    pub text: String,
+    /// What the fact is about, as a stable key (`auth.token-expiry`). A newer fact
+    /// with the same non-empty key supersedes this one. "" = never superseded.
+    pub key: String,
+    pub tags: Vec<String>,
+    /// Where it came from: a task id, a session id, a file path or `user`.
+    pub source: String,
+    /// When it was stored. Unix seconds, like every time below.
+    pub created_at: i64,
+    /// When it became true.
+    pub valid_at: i64,
+    /// When it stopped being true; 0 while it holds.
+    pub invalid_at: i64,
+    /// When the store learned it was superseded; 0 while current.
+    pub expired_at: i64,
+    /// How often it was asserted. A repeat raises this instead of inserting.
+    pub proof_count: i64,
+    /// Ids of the Symbol, File and Service nodes the text mentions.
+    pub links: Vec<String>,
+}
+
+/// A markdown page: a curated view over tagged facts, or a generated view of the graph.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageRec {
+    pub id: String,
+    /// File-name-safe unique name: `decisions`, `graph-overview`.
+    pub slug: String,
+    pub title: String,
+    /// Markdown.
+    pub body: String,
+    /// Facts carrying any of these tags belong to the page.
+    pub tags: Vec<String>,
+    /// `memory` (built from facts), `graph` (built from the code graph) or `manual`.
+    pub kind: String,
+    pub updated_at: i64,
+    /// `created_at` of the newest fact the body includes. The page is stale when
+    /// a newer in-scope fact exists.
+    pub last_memory_seen_at: i64,
+}
+
+/// Which table a vector belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VectorTable {
+    Symbol,
+    Memory,
+}
+
+// ---------------------------------------------------------------------------
+// Search text
+// ---------------------------------------------------------------------------
+
+/// Lower-cased words of an identifier, path or sentence, in order.
+///
+/// Splits on every non-alphanumeric character, on a lower-to-upper case change
+/// (`createOrder` -> `create order`), at the end of an acronym (`HTTPServer` ->
+/// `http server`) and between letters and digits (`sha256sum` -> `sha 256 sum`).
+/// One-character words are dropped. The index side and the query side both use
+/// this function, so `getOrderHandler` is found by "order handler".
+pub fn split_words(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            flush_word(&mut cur, &mut words);
+            continue;
+        }
+        if let Some(&prev) = i.checked_sub(1).and_then(|j| chars.get(j)) {
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            let boundary = (prev.is_lowercase() && c.is_uppercase())
+                || (prev.is_uppercase() && c.is_uppercase() && next_is_lower)
+                || (prev.is_alphabetic() && c.is_numeric())
+                || (prev.is_numeric() && c.is_alphabetic());
+            if boundary {
+                flush_word(&mut cur, &mut words);
+            }
+        }
+        cur.extend(c.to_lowercase());
+    }
+    flush_word(&mut cur, &mut words);
+    words
+}
+
+fn flush_word(cur: &mut String, words: &mut Vec<String>) {
+    if cur.chars().count() > 1 {
+        words.push(std::mem::take(cur));
+    } else {
+        cur.clear();
+    }
+}
+
+/// The text the full-text index stores for a symbol besides its raw fields: the
+/// distinct words of the name, the qualified name, the file path, the signature
+/// and the doc line, in that order, at most 120 words.
+pub fn search_text(name: &str, qualified_name: &str, file_path: &str, signature: &str, doc: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for part in [name, qualified_name, file_path, signature, doc] {
+        for w in split_words(part) {
+            if out.len() < 120 && !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    }
+    out.join(" ")
 }
 
 #[cfg(test)]
@@ -742,5 +895,29 @@ mod tests {
         assert_eq!(EdgeType::Contains.from_depends_on_to(), None);
         assert_eq!(Level::Low.escalate(), Some(Level::Medium));
         assert_eq!(Level::Top.escalate(), None);
+    }
+
+    #[test]
+    fn identifiers_split_into_words() {
+        assert_eq!(split_words("createOrderHandler"), ["create", "order", "handler"]);
+        assert_eq!(split_words("save_task"), ["save", "task"]);
+        assert_eq!(split_words("HTTPServer"), ["http", "server"]);
+        assert_eq!(split_words("sha256sum"), ["sha", "256", "sum"]);
+        assert_eq!(
+            split_words("web_gateway/src/ordersClient.ts"),
+            ["web", "gateway", "src", "orders", "client", "ts"]
+        );
+        assert_eq!(split_words("a b  -- x"), Vec::<String>::new());
+        assert_eq!(split_words("Ünïcode Straße"), ["ünïcode", "straße"]);
+        assert_eq!(
+            search_text(
+                "getOrder",
+                "web.routes.getOrder",
+                "web/routes.ts",
+                "function getOrder(id: string)",
+                "Fetch one order."
+            ),
+            "get order web routes ts function id string fetch one"
+        );
     }
 }
