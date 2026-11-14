@@ -622,6 +622,7 @@ dependencies = [
  "anyhow",
  "lbug",
  "lge-core",
+ "serde_json",
  "tempfile",
 ]
 

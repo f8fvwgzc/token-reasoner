@@ -105,7 +105,7 @@ fn node_insert(label: NodeLabel) -> &'static str {
         // Only placeholders reach this point, see `check`.
         _ => {
             "CREATE (:Symbol {id:$id, name:$name, qualified_name:$qn, kind:$kind, signature:$sig, doc:$doc, \
-             body:'', file_path:$fp, service:$svc, start_line:$sl, end_line:$el, is_test:$t});"
+             body:'', file_path:$fp, service:$svc, start_line:$sl, end_line:$el, is_test:$t, search_text:''});"
         }
     }
 }

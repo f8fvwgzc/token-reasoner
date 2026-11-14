@@ -262,8 +262,12 @@ fn replace_edges_restores_a_missing_or_wrong_full_text_index() {
         assert!(fts_indexes(&store).is_empty());
         return;
     }
-    let expected = vec!["Symbol|sym_fts|[name,qualified_name,signature,doc]".to_string()];
-    assert_eq!(fts_indexes(&store), expected, "created when the store was opened");
+    let expected = vec!["Symbol|sym_fts|[name,qualified_name,signature,doc,search_text]".to_string()];
+    assert_eq!(
+        fts_indexes(&store),
+        expected,
+        "created when the first symbols were stored"
+    );
     let bm25 = store.search("create order", 5).unwrap();
 
     // Dropped behind the store's back: search still answers (substring), and

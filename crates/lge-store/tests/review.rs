@@ -958,7 +958,7 @@ fn another_process_cannot_open_the_database() {
 
 #[test]
 fn schema_versions_below_the_current_one_are_migrated() {
-    for old in ["0", "1", "-5", " 1 "] {
+    for old in ["0", "1", "2", "-5", " 1 "] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("graph.lbug");
         let note = HandoffNote {
@@ -992,7 +992,7 @@ fn schema_versions_below_the_current_one_are_migrated() {
         assert_eq!(
             count(
                 &store,
-                "MATCH (m:Meta) WHERE m.key = 'schema_version' AND m.value = '2' RETURN count(m);"
+                "MATCH (m:Meta) WHERE m.key = 'schema_version' AND m.value = '3' RETURN count(m);"
             ),
             1
         );
