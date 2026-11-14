@@ -22,6 +22,8 @@ pub(crate) enum Found<'a> {
 pub(crate) struct Resolver<'r, 'a> {
     pub ix: &'r Index<'a>,
     pub imports: &'r Imports<'a>,
+    /// Class id -> base names as written in its `extends` clause or base list.
+    pub bases: &'r std::collections::HashMap<&'a str, Vec<&'a str>>,
 }
 
 impl<'a> Resolver<'_, 'a> {
@@ -32,6 +34,50 @@ impl<'a> Resolver<'_, 'a> {
         let (class, _) = owner.qualified_name.rsplit_once('.')?;
         self.ix.member(&owner.file_path, class, Want::Class)?;
         self.ix.member(&owner.file_path, &format!("{class}.{name}"), want)
+    }
+
+    /// `self.name` or `this.name` where the member is defined on a base class.
+    /// The chain of bases is followed only through bases the source resolves
+    /// (same file or import). The result is the member when exactly one is
+    /// found: with several bases defining it, which one wins is the language's
+    /// resolution order, and that is not guessed here.
+    pub fn inherited_member(&self, owner: &SymbolRec, name: &str, want: Want) -> Option<&'a SymbolRec> {
+        let (class, _) = owner.qualified_name.rsplit_once('.')?;
+        let class = self.ix.member(&owner.file_path, class, Want::Class)?;
+        let mut found: Vec<&'a SymbolRec> = Vec::new();
+        self.members_of_bases(class, name, want, 8, &mut found);
+        match found.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    fn members_of_bases(
+        &self,
+        class: &'a SymbolRec,
+        name: &str,
+        want: Want,
+        depth: u8,
+        found: &mut Vec<&'a SymbolRec>,
+    ) {
+        // The depth bound also ends a cycle of bases.
+        if depth == 0 {
+            return;
+        }
+        let Some(bases) = self.bases.get(class.id.as_str()) else {
+            return;
+        };
+        for base_name in bases {
+            let Some((base, _)) = self.bare(&class.file_path, base_name, Want::Class) else {
+                continue;
+            };
+            let member = format!("{}.{}", base.qualified_name, name);
+            match self.ix.member(&base.file_path, &member, want) {
+                Some(m) if !found.iter().any(|f| f.id == m.id) => found.push(m),
+                Some(_) => {}
+                None => self.members_of_bases(base, name, want, depth - 1, found),
+            }
+        }
     }
 
     /// A bare `name` used in `file`: defined in that file, or bound by an import.

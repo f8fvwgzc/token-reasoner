@@ -30,9 +30,16 @@ pub fn resolve(input: &ResolveInput) -> Resolved {
     let ix = symbols::Index::new(input);
     let mut out = edges::Output::default();
     let imports = imports::Imports::resolve(&ix, input, &mut out);
+    // Class id -> the base names it extends, as written. Lets `self.method()`
+    // reach a method defined on a base class.
+    let mut bases: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for f in input.facts.iter().filter(|f| f.kind == lge_core::fact::INHERITS) {
+        bases.entry(f.symbol_id.as_str()).or_default().push(f.key.as_str());
+    }
     let resolver = lookup::Resolver {
         ix: &ix,
         imports: &imports,
+        bases: &bases,
     };
     calls::resolve(&resolver, &input.calls, &mut out);
     facts::resolve(&resolver, &input.facts, &mut out);

@@ -82,6 +82,12 @@ fn find<'a>(resolver: &Resolver<'_, 'a>, caller: &SymbolRec, call: &CallSite, fi
         resolver
             .own_member(caller, name, Want::CallTarget)
             .map(|callee| (callee, Prov::SAME_FILE))
+            // Not on the class itself: a method a base class defines.
+            .or_else(|| {
+                resolver
+                    .inherited_member(caller, name, Want::CallTarget)
+                    .map(|callee| (callee, Prov::IMPORTED))
+            })
     } else if bare {
         resolver.bare(file, name, Want::Callable)
     } else {
