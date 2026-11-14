@@ -1,0 +1,10 @@
+shop/orders.py:14: error: Incompatible return value type (got "None", expected
+"Order")  [return-value]
+            return None
+                   ^~~~
+shop/pricing.py:8: error: Unsupported operand types for / ("float" and
+"None")  [operator]
+        return price * (1 - percent / rate)
+                            ^~~~~~~~~~~~~~
+shop/pricing.py:8: note: Right operand is of type "float | None"
+Found 2 errors in 2 files (checked 14 source files)

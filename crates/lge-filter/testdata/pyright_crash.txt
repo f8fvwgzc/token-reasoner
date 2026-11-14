@@ -1,0 +1,2 @@
+Pyproject file "/home/dev/shop/pyproject.toml" could not be parsed. Verify that format is correct.
+No source files found.

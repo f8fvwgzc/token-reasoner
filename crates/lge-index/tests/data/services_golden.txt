@@ -1,0 +1,52 @@
+FILE Some(FileRec { id: "ed5dc90546ecd5ad", path: "auth_svc/__init__.py", service: "auth_svc", lang: "python", content_hash: "af1349b9f5f9a1a6a0404dea36dcc949" })
+SYM 77e7de67ae746cae auth_svc auth_svc module sig="" doc="" auth_svc/__init__.py auth_svc 1-1 test=false
+FILE Some(FileRec { id: "702d09276c62a16d", path: "auth_svc/tokens.py", service: "auth_svc", lang: "python", content_hash: "a0602b2d81a4f0481e5979a5ee44a17b" })
+SYM 7d520530586abbdd tokens auth_svc.tokens module sig="" doc="Token checks." auth_svc/tokens.py auth_svc 1-16 test=false
+SYM b746f12ff71737fe verify_token auth_svc.tokens.verify_token function sig="def verify_token(token)" doc="Reject an invalid token." auth_svc/tokens.py auth_svc 4-6 test=false
+SYM 3fb66eac6cf9a69c decode auth_svc.tokens.decode function sig="def decode(token)" doc="" auth_svc/tokens.py auth_svc 9-10 test=false
+SYM 80b1d4600f47c01d rotate_signing_key auth_svc.tokens.rotate_signing_key function sig="def rotate_signing_key()" doc="Replace the signing key." auth_svc/tokens.py auth_svc 13-15 test=false
+CALL CallSite { id: "e1f937dbb858436c", caller_id: "b746f12ff71737fe", file_path: "auth_svc/tokens.py", name: "decode", receiver: "", line: 6 }
+FILE Some(FileRec { id: "e3647cde3ba10b60", path: "shared/util.py", service: "shared", lang: "python", content_hash: "e43908d11dec72bbb15ad49b878e231e" })
+SYM 63ff08ec4de52910 util shared.util module sig="" doc="" shared/util.py shared 1-4 test=false
+SYM addc295c7f0ab661 slugify shared.util.slugify function sig="def slugify(text)" doc="Lowercase and dash-join a title." shared/util.py shared 1-3 test=false
+CALL CallSite { id: "5603e8070b7aca7e", caller_id: "addc295c7f0ab661", file_path: "shared/util.py", name: "replace", receiver: "text.lower()", line: 3 }
+CALL CallSite { id: "f754673928495f50", caller_id: "addc295c7f0ab661", file_path: "shared/util.py", name: "lower", receiver: "text", line: 3 }
+FILE Some(FileRec { id: "1ff0c245f36b1f1e", path: "work_svc/__init__.py", service: "work_svc", lang: "python", content_hash: "af1349b9f5f9a1a6a0404dea36dcc949" })
+SYM 0e6f39dcfdf6cf16 work_svc work_svc module sig="" doc="" work_svc/__init__.py work_svc 1-1 test=false
+FILE Some(FileRec { id: "8afbed264f4d7f5a", path: "work_svc/controller.py", service: "work_svc", lang: "python", content_hash: "fafe7b69e15bbeb60ce5d05ae1b2a480" })
+SYM bd6d23643c469cff controller work_svc.controller module sig="" doc="HTTP handlers for tasks." work_svc/controller.py work_svc 1-14 test=false
+SYM 2ebdff6b2d786b5a create_task_handler work_svc.controller.create_task_handler function sig="def create_task_handler(request)" doc="Handle a task-creation request." work_svc/controller.py work_svc 6-9 test=false
+SYM 810970abed55e4ec list_tasks_handler work_svc.controller.list_tasks_handler function sig="def list_tasks_handler(request)" doc="" work_svc/controller.py work_svc 12-13 test=false
+CALL CallSite { id: "78e6a2ccc7ec8995", caller_id: "2ebdff6b2d786b5a", file_path: "work_svc/controller.py", name: "verify_token", receiver: "", line: 8 }
+CALL CallSite { id: "89ccff922c189e2d", caller_id: "2ebdff6b2d786b5a", file_path: "work_svc/controller.py", name: "create_task", receiver: "TaskService()", line: 9 }
+CALL CallSite { id: "07b79f182791cc02", caller_id: "2ebdff6b2d786b5a", file_path: "work_svc/controller.py", name: "TaskService", receiver: "", line: 9 }
+CALL CallSite { id: "ebd790a1ecd3d401", caller_id: "810970abed55e4ec", file_path: "work_svc/controller.py", name: "list_tasks", receiver: "TaskService()", line: 13 }
+CALL CallSite { id: "816ed7ba97de4a01", caller_id: "810970abed55e4ec", file_path: "work_svc/controller.py", name: "TaskService", receiver: "", line: 13 }
+IMP ImportSite { id: "b5c1db20f861fd63", file_path: "work_svc/controller.py", module: "work_svc.service", name: "TaskService", alias: "TaskService" }
+IMP ImportSite { id: "d99fd7ad0ca16200", file_path: "work_svc/controller.py", module: "auth_svc.tokens", name: "verify_token", alias: "verify_token" }
+FILE Some(FileRec { id: "740fa3578f0c60af", path: "work_svc/repository.py", service: "work_svc", lang: "python", content_hash: "1c960b952e5218e026de56c305052314" })
+SYM 51738be2da0fd2e0 repository work_svc.repository module sig="" doc="Task persistence." work_svc/repository.py work_svc 1-11 test=false
+SYM 00cfaa340089e307 TaskRepository work_svc.repository.TaskRepository class sig="class TaskRepository" doc="" work_svc/repository.py work_svc 4-10 test=false
+SYM 4f29aa03ebfa953a save_task work_svc.repository.TaskRepository.save_task method sig="def save_task(self, slug)" doc="Insert a task row." work_svc/repository.py work_svc 5-7 test=false
+SYM b316c8813f5898f1 find_all work_svc.repository.TaskRepository.find_all method sig="def find_all(self)" doc="" work_svc/repository.py work_svc 9-10 test=false
+FILE Some(FileRec { id: "b21da8ba230bd7da", path: "work_svc/service.py", service: "work_svc", lang: "python", content_hash: "d10b2e523b2561a75cb633400e4a61cd" })
+SYM 881daa2f88a87648 service work_svc.service module sig="" doc="Task business logic." work_svc/service.py work_svc 1-19 test=false
+SYM a8dc2aaba2911ebb TaskService work_svc.service.TaskService class sig="class TaskService" doc="" work_svc/service.py work_svc 6-18 test=false
+SYM 72231a1af62ff143 create_task work_svc.service.TaskService.create_task method sig="def create_task(self, title)" doc="Validate and store a new task." work_svc/service.py work_svc 7-11 test=false
+SYM 59abf5f9a7ed40a5 list_tasks work_svc.service.TaskService.list_tasks method sig="def list_tasks(self)" doc="" work_svc/service.py work_svc 13-14 test=false
+SYM 478c76a310db2003 validate_title work_svc.service.TaskService.validate_title method sig="def validate_title(self, title)" doc="" work_svc/service.py work_svc 16-18 test=false
+CALL CallSite { id: "4688a822bc410d58", caller_id: "72231a1af62ff143", file_path: "work_svc/service.py", name: "validate_title", receiver: "self", line: 9 }
+CALL CallSite { id: "8b5a0bd9156c49f1", caller_id: "72231a1af62ff143", file_path: "work_svc/service.py", name: "slugify", receiver: "util", line: 10 }
+CALL CallSite { id: "272852bbc6137030", caller_id: "72231a1af62ff143", file_path: "work_svc/service.py", name: "save_task", receiver: "TaskRepository()", line: 11 }
+CALL CallSite { id: "c945bea4f173130e", caller_id: "72231a1af62ff143", file_path: "work_svc/service.py", name: "TaskRepository", receiver: "", line: 11 }
+CALL CallSite { id: "512058aa289c72ed", caller_id: "59abf5f9a7ed40a5", file_path: "work_svc/service.py", name: "find_all", receiver: "TaskRepository()", line: 14 }
+CALL CallSite { id: "f3028b74ba8ce47b", caller_id: "59abf5f9a7ed40a5", file_path: "work_svc/service.py", name: "TaskRepository", receiver: "", line: 14 }
+CALL CallSite { id: "0b1da77509114539", caller_id: "478c76a310db2003", file_path: "work_svc/service.py", name: "ValueError", receiver: "", line: 18 }
+IMP ImportSite { id: "208ede55c0b9e8ae", file_path: "work_svc/service.py", module: ".repository", name: "TaskRepository", alias: "TaskRepository" }
+IMP ImportSite { id: "959ce5b3740f5f2f", file_path: "work_svc/service.py", module: "shared", name: "util", alias: "util" }
+FILE Some(FileRec { id: "23d02c61de65446d", path: "work_svc/tests/test_service.py", service: "work_svc", lang: "python", content_hash: "7d058d474b005d3c48b7952e64513299" })
+SYM 2c3a9272a6c4dc44 test_service work_svc.tests.test_service module sig="" doc="" work_svc/tests/test_service.py work_svc 1-6 test=true
+SYM 50659355803b0c00 test_create_task work_svc.tests.test_service.test_create_task function sig="def test_create_task()" doc="" work_svc/tests/test_service.py work_svc 4-5 test=true
+CALL CallSite { id: "3a556ad1bf979c74", caller_id: "50659355803b0c00", file_path: "work_svc/tests/test_service.py", name: "create_task", receiver: "TaskService()", line: 5 }
+CALL CallSite { id: "cd2348022968b64b", caller_id: "50659355803b0c00", file_path: "work_svc/tests/test_service.py", name: "TaskService", receiver: "", line: 5 }
+IMP ImportSite { id: "6a26d155051f509e", file_path: "work_svc/tests/test_service.py", module: "work_svc.service", name: "TaskService", alias: "TaskService" }

@@ -1,0 +1,25 @@
+
+ RUN  v2.1.4 /home/dev/web
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/orders.test.ts [ src/orders.test.ts ]
+Error: Failed to resolve import "./orderz" from "src/orders.test.ts". Does the file exist?
+  Plugin: vite:import-analysis
+  File: /home/dev/web/src/orders.test.ts:2:28
+  1  |  import { describe, expect, it } from "vitest";
+  2  |  import { createOrder } from "./orderz";
+     |                               ^
+  3  |  
+ ❯ TransformPluginContext._formatError node_modules/vite/dist/node/chunks/dep-CB_7IfJ-.js:49258:41
+ ❯ TransformPluginContext.error node_modules/vite/dist/node/chunks/dep-CB_7IfJ-.js:49253:16
+ ❯ normalizeUrl node_modules/vite/dist/node/chunks/dep-CB_7IfJ-.js:64307:23
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  no tests
+   Start at  10:24:55
+   Duration  288ms (transform 12ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 61ms)
+

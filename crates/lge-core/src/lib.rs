@@ -546,17 +546,27 @@ pub struct EdgeStats {
 
 impl EdgeStats {
     pub fn add(&mut self, edge_type: EdgeType, method: &str) {
-        *self.counts.entry(format!("{}/{}", edge_type.as_str(), method)).or_insert(0) += 1;
+        *self
+            .counts
+            .entry(format!("{}/{}", edge_type.as_str(), method))
+            .or_insert(0) += 1;
     }
 
     pub fn get(&self, edge_type: EdgeType, method: &str) -> usize {
-        self.counts.get(&format!("{}/{}", edge_type.as_str(), method)).copied().unwrap_or(0)
+        self.counts
+            .get(&format!("{}/{}", edge_type.as_str(), method))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Total over all methods for one edge type.
     pub fn total(&self, edge_type: EdgeType) -> usize {
         let prefix = format!("{}/", edge_type.as_str());
-        self.counts.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).sum()
+        self.counts
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| *v)
+            .sum()
     }
 }
 
@@ -695,7 +705,10 @@ mod tests {
         assert_eq!(stable_id(&["a", "b"]), stable_id(&["a", "b"]));
         assert_ne!(stable_id(&["a", "b"]), stable_id(&["ab", ""]));
         assert_eq!(file_id("x/y.py"), stable_id(&["file", "x/y.py"]));
-        assert_eq!(symbol_id("x.py", "x.f", "function"), stable_id(&["symbol", "x.py", "x.f", "function"]));
+        assert_eq!(
+            symbol_id("x.py", "x.f", "function"),
+            stable_id(&["symbol", "x.py", "x.f", "function"])
+        );
         assert_eq!(table_id("Orders"), table_id("orders"));
     }
 

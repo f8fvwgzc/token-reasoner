@@ -9,4 +9,9 @@ rust-version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Reads the `[prices]` table of `lge.toml`. Parsing only: nothing is written back.
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 lge-core = { path = "../lge-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

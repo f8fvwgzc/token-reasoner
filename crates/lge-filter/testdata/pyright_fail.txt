@@ -1,0 +1,11 @@
+/home/dev/shop/shop/orders.py
+  /home/dev/shop/shop/orders.py:14:12 - error: Type "None" is not assignable to return type "Order"
+    "None" is not assignable to "Order" (reportReturnType)
+  /home/dev/shop/shop/orders.py:31:12 - error: Argument of type "str" cannot be assigned to parameter "amount" of type "int" in function "charge"
+    "str" is not assignable to "int" (reportArgumentType)
+  /home/dev/shop/shop/orders.py:40:9 - warning: Import "yaml" could not be resolved from source (reportMissingModuleSource)
+/home/dev/shop/shop/pricing.py
+  /home/dev/shop/shop/pricing.py:8:25 - error: Operator "/" not supported for "None" (reportOptionalOperand)
+/home/dev/shop/tests/test_cart.py
+  /home/dev/shop/tests/test_cart.py:5:23 - error: "Basket" is unknown import symbol (reportAttributeAccessIssue)
+4 errors, 1 warning, 0 informations 

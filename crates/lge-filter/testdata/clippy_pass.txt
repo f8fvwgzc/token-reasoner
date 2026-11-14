@@ -1,0 +1,2 @@
+    Checking shop v0.1.0 (/home/dev/shop)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s

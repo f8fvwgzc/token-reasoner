@@ -1,591 +1,390 @@
-//! LadybugDB adapter. No other crate talks to `lbug` directly.
+//! Storage for the code graph: the [`GraphStore`] contract and its LadybugDB
+//! adapter. No other crate talks to `lbug` directly.
 
 mod graph_store;
+mod index;
+mod meta;
+mod nodes;
+mod resolved;
+mod schema;
+mod search;
+mod traverse;
+mod usage;
+mod values;
+
 pub use graph_store::GraphStore;
+pub use schema::SCHEMA_VERSION;
+pub use search::tokens;
 
-use anyhow::{anyhow, Result};
-use lbug::{Connection, Database, SystemConfig, Value};
-use lge_core::{method, Hit, ParsedFile};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use lbug::{Connection, Database, SystemConfig};
+use lge_core::{
+    Direction, EdgeRec, EdgeType, FileInfo, HandoffNote, Hit, IndexRun, NodeLabel, NodeRec, ParsedFile, ResolveInput,
+    Resolved, UsageRecord,
+};
+use resolved::EdgeLoad;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Database files that are open in this process.
+///
+/// LadybugDB locks its file against other processes only. A second `Database`
+/// on the same file in the same process is let in, does not see what the first
+/// one commits, and the two overwrite each other's pages. The store refuses
+/// the second open instead.
+static OPEN_FILES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
-const SCHEMA: &[&str] = &[
-    "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key));",
-    "CREATE NODE TABLE IF NOT EXISTS File(id STRING, path STRING, service STRING, lang STRING, content_hash STRING, indexed_at INT64, PRIMARY KEY(id));",
-    "CREATE NODE TABLE IF NOT EXISTS Symbol(id STRING, name STRING, qualified_name STRING, kind STRING, signature STRING, doc STRING, file_path STRING, service STRING, start_line INT64, end_line INT64, is_test BOOLEAN, PRIMARY KEY(id));",
-    "CREATE NODE TABLE IF NOT EXISTS CallSite(id STRING, caller_id STRING, file_path STRING, name STRING, receiver STRING, line INT64, PRIMARY KEY(id));",
-    "CREATE NODE TABLE IF NOT EXISTS ImportSite(id STRING, file_path STRING, module STRING, name STRING, alias STRING, PRIMARY KEY(id));",
-    "CREATE REL TABLE IF NOT EXISTS CONTAINS(FROM File TO Symbol);",
-    "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM File TO File, confidence DOUBLE, method STRING);",
-    "CREATE REL TABLE IF NOT EXISTS CALLS(FROM Symbol TO Symbol, confidence DOUBLE, method STRING, evidence_file STRING, line INT64);",
-];
+/// The entry of one open database file in [`OPEN_FILES`], removed when dropped.
+/// `None` for an in-memory database, which is never shared.
+struct FileClaim(Option<PathBuf>);
 
-const HIT_COLS: &str = "s.id, s.name, s.qualified_name, s.kind, s.file_path, s.service, s.start_line, s.end_line, s.is_test";
-
-/// Method names too common to match by name alone (`x.get()` is usually a dict).
-const COMMON_METHODS: &[&str] = &[
-    "get", "set", "add", "append", "extend", "update", "items", "keys", "values", "format", "join", "split", "strip",
-    "read", "write", "close", "open", "pop", "copy", "count", "index", "sort", "filter", "all", "first", "encode",
-    "decode", "lower", "upper", "replace", "startswith", "endswith", "json", "dict", "run", "start", "stop",
-];
-
-const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "when", "add", "fix", "update", "change", "make",
-    "new", "bug", "feature", "implement", "support", "should", "need", "use", "not", "are", "can", "all", "any",
-];
-
-#[derive(Debug, Default, Clone)]
-pub struct EdgeStats {
-    pub calls_static: usize,
-    pub calls_inferred: usize,
-    pub calls_unresolved: usize,
-    pub calls_external: usize,
-    pub imports_resolved: usize,
-    pub imports_external: usize,
+impl FileClaim {
+    fn new(path: &Path) -> Result<Self> {
+        if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+            return Ok(FileClaim(None));
+        }
+        let key = canonical(path);
+        let mut open = OPEN_FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !open.insert(key.clone()) {
+            bail!(
+                "the database at {} is already open in this process; share the one store instead of opening it again",
+                path.display()
+            );
+        }
+        Ok(FileClaim(Some(key)))
+    }
 }
 
-pub struct Store {
+impl Drop for FileClaim {
+    fn drop(&mut self) {
+        if let Some(key) = &self.0 {
+            OPEN_FILES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(key);
+        }
+    }
+}
+
+/// One spelling per file, so `a/../graph.lbug`, a relative path and a symlink
+/// to the directory all name the same claim. The file itself may not exist yet.
+fn canonical(path: &Path) -> PathBuf {
+    if let Ok(found) = path.canonicalize() {
+        return found;
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    match (dir.canonicalize(), path.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
+/// The LadybugDB adapter. One process owns the database file.
+pub struct LadybugStore {
     db: Database,
     /// True when the LadybugDB `fts` extension is loaded (BM25 search).
-    pub fts: bool,
+    /// Interior, because `install_fts` takes `&self`.
+    fts: AtomicBool,
+    /// LadybugDB allows one write transaction at a time. Writers queue here
+    /// instead of failing when two threads share the store.
+    write: Mutex<()>,
+    /// Edges the last `replace_edges` call left out because an endpoint was missing.
+    skipped_edges: AtomicUsize,
+    /// Why the last `replace_edges` call could not load its edges in bulk, if it could not.
+    bulk_load_error: Mutex<Option<String>>,
+    /// True when the database has a full-text index but the extension that
+    /// maintains it is not loaded. LadybugDB then refuses every change to the
+    /// Symbol table; the store refuses first, in words that say what to do.
+    index_needs_fts: AtomicBool,
+    /// Declared after `db`, so the file is released only once the database is closed.
+    _claim: FileClaim,
 }
 
-fn vs(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Null(_) => String::new(),
-        o => o.to_string(),
-    }
-}
-fn vi(v: &Value) -> i64 {
-    match v {
-        Value::Int64(i) => *i,
-        Value::Int32(i) => *i as i64,
-        Value::UInt64(i) => *i as i64,
-        _ => 0,
-    }
-}
-fn vb(v: &Value) -> bool {
-    matches!(v, Value::Bool(true))
-}
-fn vf(v: &Value) -> f64 {
-    match v {
-        Value::Double(f) => *f,
-        Value::Float(f) => *f as f64,
-        o => vi(o) as f64,
-    }
-}
-fn st(s: &str) -> Value {
-    Value::String(s.to_string())
-}
+/// The name the other crates use.
+pub type Store = LadybugStore;
 
-fn hit(row: &[Value], score: f64) -> Hit {
-    Hit {
-        id: vs(&row[0]),
-        name: vs(&row[1]),
-        qualified_name: vs(&row[2]),
-        kind: vs(&row[3]),
-        file_path: vs(&row[4]),
-        service: vs(&row[5]),
-        start_line: vi(&row[6]),
-        end_line: vi(&row[7]),
-        is_test: vb(&row[8]),
-        score,
+impl std::fmt::Debug for LadybugStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LadybugStore")
+            .field("fts", &self.fts_enabled())
+            .finish_non_exhaustive()
     }
 }
 
-/// Words of a task description that are worth searching for.
-pub fn tokens(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for w in text.split(|c: char| !c.is_alphanumeric()) {
-        let w = w.to_lowercase();
-        if w.len() >= 3 && !STOPWORDS.contains(&w.as_str()) && !out.contains(&w) {
-            out.push(w);
-        }
-    }
-    out
-}
-
-struct Sym {
-    id: String,
-    name: String,
-    qn: String,
-    kind: String,
-    file: String,
-}
-
-impl Store {
+impl LadybugStore {
+    /// Open or create the database at `path`, migrate an older schema, and
+    /// load the `fts` extension when it is installed.
+    ///
+    /// A database file can be open once per process: the store is `Send + Sync`
+    /// and is meant to be shared.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        Self::open_with(path, true)
+    }
+
+    /// Open as on a machine where the `fts` extension is not installed: it is
+    /// not loaded, and search uses the substring scorer. For tests of that path.
+    #[doc(hidden)]
+    pub fn open_without_fts(path: &Path) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: &Path, load_fts: bool) -> Result<Self> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let db = Database::new(path, SystemConfig::default())?;
-        let mut store = Store { db, fts: false };
-        let fts = {
-            let conn = store.conn()?;
-            for ddl in SCHEMA {
-                conn.query(ddl)?;
-            }
-            conn.query(&format!("MERGE (m:Meta {{key:'schema_version'}}) SET m.value='{SCHEMA_VERSION}';"))?;
-            // The extension must have been installed once with `lge setup`.
-            conn.query("LOAD fts;").is_ok()
+        let claim = FileClaim::new(path)?;
+        let db = Database::new(path, SystemConfig::default())
+            .with_context(|| format!("cannot open the database at {}", path.display()))?;
+        let store = LadybugStore {
+            db,
+            fts: AtomicBool::new(false),
+            write: Mutex::new(()),
+            skipped_edges: AtomicUsize::new(0),
+            bulk_load_error: Mutex::new(None),
+            index_needs_fts: AtomicBool::new(false),
+            _claim: claim,
         };
-        store.fts = fts;
+        {
+            let conn = store.conn()?;
+            // The extension must have been installed once with `lge setup`.
+            // It is loaded before the schema is touched: a table that has a
+            // full-text index cannot be written or dropped without it.
+            let fts = load_fts && conn.query("LOAD fts;").is_ok();
+            schema::prepare(&conn, fts)?;
+            if fts {
+                search::ensure_fts_index(&conn)?;
+            } else if !schema::fts_indexes(&conn)?.is_empty() {
+                store.index_needs_fts.store(true, Ordering::Relaxed);
+            }
+            store.fts.store(fts, Ordering::Relaxed);
+        }
         Ok(store)
     }
 
-    pub fn conn(&self) -> Result<Connection<'_>> {
-        Ok(Connection::new(&self.db)?)
-    }
-
-    /// Download and install the BM25 extension (needs network once).
-    pub fn install_fts(&mut self) -> Result<()> {
-        let conn = self.conn()?;
-        conn.query("INSTALL fts;")?;
-        conn.query("LOAD fts;")?;
-        drop(conn);
-        self.fts = true;
-        self.refresh_fts()
-    }
-
-    fn refresh_fts(&self) -> Result<()> {
-        if !self.fts {
-            return Ok(());
-        }
-        let conn = self.conn()?;
-        let _ = conn.query("CALL DROP_FTS_INDEX('Symbol', 'sym_fts');");
-        conn.query("CALL CREATE_FTS_INDEX('Symbol', 'sym_fts', ['name', 'qualified_name', 'signature', 'doc']);")?;
-        Ok(())
-    }
-
-    /// path -> (file id, content hash) for every indexed file.
-    pub fn file_hashes(&self) -> Result<HashMap<String, (String, String)>> {
-        let conn = self.conn()?;
-        let mut out = HashMap::new();
-        for row in conn.query("MATCH (f:File) RETURN f.path, f.id, f.content_hash;")? {
-            out.insert(vs(&row[0]), (vs(&row[1]), vs(&row[2])));
-        }
-        Ok(out)
-    }
-
-    /// Remove a file and everything extracted from it.
-    pub fn delete_file(&self, path: &str) -> Result<()> {
-        let conn = self.conn()?;
-        for q in [
-            "MATCH (s:Symbol) WHERE s.file_path = $p DETACH DELETE s;",
-            "MATCH (c:CallSite) WHERE c.file_path = $p DELETE c;",
-            "MATCH (i:ImportSite) WHERE i.file_path = $p DELETE i;",
-            "MATCH (f:File) WHERE f.path = $p DETACH DELETE f;",
-        ] {
-            let mut stmt = conn.prepare(q)?;
-            conn.execute(&mut stmt, vec![("p", st(path))])?;
+    /// Fail before a transaction starts when the Symbol table cannot be changed.
+    fn check_symbols_writable(&self) -> Result<()> {
+        if self.index_needs_fts.load(Ordering::Relaxed) {
+            bail!(
+                "this database has a full-text index, but the fts extension is not loaded in this process, so its \
+                 symbols cannot be changed; install the extension with `lge setup` (a program must be linked with \
+                 -rdynamic to load it) or index into a new database"
+            );
         }
         Ok(())
     }
 
-    pub fn insert_parsed(&self, parsed: &ParsedFile, now: i64) -> Result<()> {
-        let file = parsed.file.as_ref().ok_or_else(|| anyhow!("parsed file without FileRec"))?;
-        let conn = self.conn()?;
-        conn.query("BEGIN TRANSACTION;")?;
-        let res = (|| -> Result<()> {
-            let mut f = conn.prepare("CREATE (:File {id:$id, path:$path, service:$service, lang:$lang, content_hash:$hash, indexed_at:$at});")?;
-            conn.execute(
-                &mut f,
-                vec![
-                    ("id", st(&file.id)),
-                    ("path", st(&file.path)),
-                    ("service", st(&file.service)),
-                    ("lang", st(&file.lang)),
-                    ("hash", st(&file.content_hash)),
-                    ("at", Value::Int64(now)),
-                ],
-            )?;
-            let mut s = conn.prepare("CREATE (:Symbol {id:$id, name:$name, qualified_name:$qn, kind:$kind, signature:$sig, doc:$doc, file_path:$fp, service:$svc, start_line:$sl, end_line:$el, is_test:$t});")?;
-            let mut link = conn.prepare("MATCH (f:File {id:$f}), (s:Symbol {id:$s}) CREATE (f)-[:CONTAINS]->(s);")?;
-            for sym in &parsed.symbols {
-                conn.execute(
-                    &mut s,
-                    vec![
-                        ("id", st(&sym.id)),
-                        ("name", st(&sym.name)),
-                        ("qn", st(&sym.qualified_name)),
-                        ("kind", st(&sym.kind)),
-                        ("sig", st(&sym.signature)),
-                        ("doc", st(&sym.doc)),
-                        ("fp", st(&sym.file_path)),
-                        ("svc", st(&sym.service)),
-                        ("sl", Value::Int64(sym.start_line)),
-                        ("el", Value::Int64(sym.end_line)),
-                        ("t", Value::Bool(sym.is_test)),
-                    ],
-                )?;
-                conn.execute(&mut link, vec![("f", st(&file.id)), ("s", st(&sym.id))])?;
-            }
-            let mut c = conn.prepare("CREATE (:CallSite {id:$id, caller_id:$caller, file_path:$fp, name:$name, receiver:$recv, line:$line});")?;
-            for call in &parsed.calls {
-                conn.execute(
-                    &mut c,
-                    vec![
-                        ("id", st(&call.id)),
-                        ("caller", st(&call.caller_id)),
-                        ("fp", st(&call.file_path)),
-                        ("name", st(&call.name)),
-                        ("recv", st(&call.receiver)),
-                        ("line", Value::Int64(call.line)),
-                    ],
-                )?;
-            }
-            let mut i = conn.prepare("CREATE (:ImportSite {id:$id, file_path:$fp, module:$m, name:$n, alias:$a});")?;
-            for imp in &parsed.imports {
-                conn.execute(
-                    &mut i,
-                    vec![("id", st(&imp.id)), ("fp", st(&imp.file_path)), ("m", st(&imp.module)), ("n", st(&imp.name)), ("a", st(&imp.alias))],
-                )?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => {
-                conn.query("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.query("ROLLBACK;");
-                Err(e)
-            }
-        }
+    /// Number of edges the last [`GraphStore::replace_edges`] call did not
+    /// store because one of their endpoints does not exist.
+    pub fn last_skipped_edges(&self) -> usize {
+        self.skipped_edges.load(Ordering::Relaxed)
     }
 
-    /// Rebuild IMPORTS and CALLS from the stored import and call sites.
-    ///
-    /// Every edge records how it was found. Calls that match several symbols
-    /// are stored as unresolved; they are never guessed.
-    pub fn rebuild_edges(&self) -> Result<EdgeStats> {
-        let conn = self.conn()?;
-        conn.query("MATCH ()-[c:CALLS]->() DELETE c;")?;
-        conn.query("MATCH ()-[i:IMPORTS]->() DELETE i;")?;
-        conn.query("MATCH (s:Symbol) WHERE s.kind = 'unresolved' DELETE s;")?;
+    /// Why the last [`GraphStore::replace_edges`] call fell back from the bulk
+    /// load to one statement per edge, or `None` when it did not. The graph is
+    /// the same either way; the fallback is only slower.
+    pub fn last_bulk_load_error(&self) -> Option<String> {
+        self.bulk_load_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 
-        let mut syms: Vec<Sym> = Vec::new();
-        for r in conn.query("MATCH (s:Symbol) RETURN s.id, s.name, s.qualified_name, s.kind, s.file_path;")? {
-            syms.push(Sym { id: vs(&r[0]), name: vs(&r[1]), qn: vs(&r[2]), kind: vs(&r[3]), file: vs(&r[4]) });
-        }
-        let mut files: BTreeMap<String, String> = BTreeMap::new(); // path -> id
-        for r in conn.query("MATCH (f:File) RETURN f.path, f.id;")? {
-            files.insert(vs(&r[0]), vs(&r[1]));
-        }
+    pub(crate) fn conn(&self) -> Result<Connection<'_>> {
+        Connection::new(&self.db).context("cannot connect to the database")
+    }
 
-        let by_id: HashMap<&str, &Sym> = syms.iter().map(|s| (s.id.as_str(), s)).collect();
-        let by_qn: HashMap<&str, &Sym> = syms.iter().map(|s| (s.qn.as_str(), s)).collect();
-        let mut by_file_name: HashMap<(&str, &str), Vec<&Sym>> = HashMap::new();
-        let mut by_name: HashMap<&str, Vec<&Sym>> = HashMap::new();
-        for s in syms.iter().filter(|s| s.kind != "module") {
-            by_file_name.entry((s.file.as_str(), s.name.as_str())).or_default().push(s);
-            by_name.entry(s.name.as_str()).or_default().push(s);
-        }
+    pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
+        // The lock guards no data, so a writer that panicked leaves nothing broken behind.
+        self.write.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
-        // Dotted module suffix -> files. "svc/app/tasks.py" answers to
-        // "svc.app.tasks", "app.tasks" and "tasks".
-        let mut modules: HashMap<String, Vec<&str>> = HashMap::new();
-        for path in files.keys() {
-            let trimmed = path.trim_end_matches(".py").trim_end_matches("/__init__");
-            let parts: Vec<&str> = trimmed.split('/').collect();
-            for i in 0..parts.len() {
-                modules.entry(parts[i..].join(".")).or_default().push(path.as_str());
+    /// Run `f` as the only writer, on its own connection, without a transaction.
+    pub(crate) fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let _writer = self.write_lock();
+        f(&self.conn()?)
+    }
+
+    /// Run `f` as the only writer inside one transaction: all of it is stored, or none.
+    pub(crate) fn write_txn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.write(|conn| {
+            values::run(conn, "BEGIN TRANSACTION;")?;
+            match f(conn) {
+                Ok(v) => {
+                    values::run(conn, "COMMIT;")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = conn.query("ROLLBACK;");
+                    Err(e)
+                }
             }
+        })
+    }
+}
+
+impl GraphStore for LadybugStore {
+    fn file_hashes(&self) -> Result<HashMap<String, (String, String)>> {
+        index::file_hashes(&self.conn()?)
+    }
+
+    fn file_info(&self, path: &str) -> Result<Option<FileInfo>> {
+        index::file_info(&self.conn()?, path)
+    }
+
+    fn delete_file(&self, path: &str) -> Result<()> {
+        self.check_symbols_writable()?;
+        self.write_txn(|conn| index::delete_file(conn, path, None))
+    }
+
+    fn insert_parsed(&self, parsed: &ParsedFile, commit: &str, now: i64) -> Result<()> {
+        self.insert_parsed_bulk(std::slice::from_ref(parsed), commit, now)
+    }
+
+    /// Same rows as the per-file path, with fewer commits: files are written
+    /// in batches, one transaction per batch.
+    fn insert_parsed_bulk(&self, parsed: &[ParsedFile], commit: &str, now: i64) -> Result<()> {
+        self.check_symbols_writable()?;
+        for batch in parsed.chunks(index::BULK_BATCH) {
+            self.write_txn(|conn| {
+                let mut writer = index::FileWriter::new(conn, commit, now)?;
+                batch.iter().try_for_each(|p| writer.write(p))
+            })?;
         }
-        let resolve_module = |importer: &str, module: &str| -> Option<String> {
-            if module.is_empty() {
-                return None;
+        Ok(())
+    }
+
+    fn load_resolve_input(&self) -> Result<ResolveInput> {
+        index::load_resolve_input(&self.conn()?)
+    }
+
+    fn replace_edges(&self, resolved: &Resolved, commit: &str, now: i64) -> Result<()> {
+        self.check_symbols_writable()?;
+        let write = |load| self.write_txn(|conn| resolved::replace(conn, resolved, commit, now, load));
+        let mut bulk_error = None;
+        let skipped = match write(EdgeLoad::Bulk) {
+            Ok(skipped) => skipped,
+            // The bulk load is only the faster way. If it fails (no room or no
+            // rights for its files, say), the transaction was rolled back and
+            // the edges are written by statements, which need the database alone.
+            Err(e) if resolved.edges.len() >= resolved::BULK_EDGES => {
+                bulk_error = Some(format!("{e:#}"));
+                write(EdgeLoad::Statements)?
             }
-            if module.starts_with('.') {
-                let dots = module.chars().take_while(|c| *c == '.').count();
-                let rest = &module[dots..];
-                let mut dir: Vec<&str> = importer.split('/').collect();
-                dir.pop();
-                for _ in 1..dots {
-                    dir.pop();
-                }
-                let mut base = dir.join("/");
-                if !rest.is_empty() {
-                    if !base.is_empty() {
-                        base.push('/');
-                    }
-                    base.push_str(&rest.replace('.', "/"));
-                }
-                for cand in [format!("{base}.py"), format!("{base}/__init__.py")] {
-                    if files.contains_key(&cand) {
-                        return Some(cand);
-                    }
-                }
-                return None;
-            }
-            let cands = modules.get(module)?;
-            if cands.len() == 1 {
-                return Some(cands[0].to_string());
-            }
-            let svc = importer.split('/').next().unwrap_or("");
-            let same: Vec<&&str> = cands.iter().filter(|c| c.split('/').next() == Some(svc)).collect();
-            if same.len() == 1 {
-                Some(same[0].to_string())
-            } else {
-                None
-            }
+            Err(e) => return Err(e),
         };
-
-        let mut stats = EdgeStats::default();
-        // (file, local name) -> (target file, original name)
-        let mut name_imports: HashMap<(String, String), (String, String)> = HashMap::new();
-        // (file, local name) -> target module file
-        let mut mod_imports: HashMap<(String, String), String> = HashMap::new();
-        let mut import_edges: HashSet<(String, String)> = HashSet::new();
-        for r in conn.query("MATCH (i:ImportSite) RETURN i.file_path, i.module, i.name, i.alias;")? {
-            let (file, module, name, alias) = (vs(&r[0]), vs(&r[1]), vs(&r[2]), vs(&r[3]));
-            let mut target = None;
-            if !name.is_empty() {
-                let sub = if module.ends_with('.') { format!("{module}{name}") } else { format!("{module}.{name}") };
-                if let Some(t) = resolve_module(&file, &sub) {
-                    mod_imports.insert((file.clone(), alias.clone()), t.clone());
-                    target = Some(t);
-                } else if let Some(t) = resolve_module(&file, &module) {
-                    name_imports.insert((file.clone(), alias.clone()), (t.clone(), name.clone()));
-                    target = Some(t);
-                }
-            } else if let Some(t) = resolve_module(&file, &module) {
-                mod_imports.insert((file.clone(), alias.clone()), t.clone());
-                target = Some(t);
-            }
-            match target {
-                Some(t) if t != file => {
-                    import_edges.insert((file, t));
-                    stats.imports_resolved += 1;
-                }
-                Some(_) => {}
-                None => stats.imports_external += 1,
-            }
+        *self
+            .bulk_load_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = bulk_error;
+        self.skipped_edges.store(skipped, Ordering::Relaxed);
+        if self.fts_enabled() {
+            self.write(search::ensure_fts_index)?;
         }
-
-        let callable = |s: &&&Sym| s.kind == "function" || s.kind == "class";
-        let one = |v: Vec<&&Sym>| -> Option<String> { if v.len() == 1 { Some(v[0].id.clone()) } else { None } };
-
-        // (caller, callee) -> (confidence, method, evidence file, line)
-        let mut edges: HashMap<(String, String), (f64, &'static str, String, i64)> = HashMap::new();
-        let mut placeholders: HashSet<String> = HashSet::new();
-        for r in conn.query("MATCH (c:CallSite) RETURN c.caller_id, c.file_path, c.name, c.receiver, c.line;")? {
-            let (caller, file, name, recv, line) = (vs(&r[0]), vs(&r[1]), vs(&r[2]), vs(&r[3]), vi(&r[4]));
-            let Some(caller_sym) = by_id.get(caller.as_str()) else { continue };
-            let in_file = |f: &str, n: &str| -> Option<String> {
-                by_file_name.get(&(f, n)).and_then(|v| one(v.iter().filter(callable).collect()))
-            };
-            let method_of = |class_file: &str, class_name: &str| -> Option<String> {
-                let class = by_file_name.get(&(class_file, class_name))?.iter().find(|s| s.kind == "class")?;
-                by_qn.get(format!("{}.{}", class.qn, name).as_str()).map(|s| s.id.clone())
-            };
-
-            let mut found: Option<(String, f64, &'static str)> = None;
-            if recv == "self" {
-                if let Some((class_qn, _)) = caller_sym.qn.rsplit_once('.') {
-                    if let Some(s) = by_qn.get(format!("{class_qn}.{name}").as_str()) {
-                        found = Some((s.id.clone(), 0.95, method::STATIC));
-                    }
-                }
-            } else if recv.is_empty() {
-                if let Some(id) = in_file(&file, &name) {
-                    found = Some((id, 0.95, method::STATIC));
-                } else if let Some((t, orig)) = name_imports.get(&(file.clone(), name.clone())) {
-                    if let Some(id) = in_file(t, orig) {
-                        found = Some((id, 0.9, method::STATIC));
-                    }
-                }
-            } else {
-                let class_name = recv.trim_end_matches("()");
-                if let Some(t) = mod_imports.get(&(file.clone(), recv.clone())) {
-                    if let Some(id) = in_file(t, &name) {
-                        found = Some((id, 0.9, method::STATIC));
-                    }
-                } else if let Some((t, orig)) = name_imports.get(&(file.clone(), class_name.to_string())) {
-                    if let Some(id) = method_of(t, orig) {
-                        found = Some((id, 0.9, method::STATIC));
-                    }
-                } else if let Some(id) = method_of(&file, class_name) {
-                    found = Some((id, 0.9, method::STATIC));
-                }
-            }
-
-            if found.is_none() {
-                // Fall back to a repository-wide name match.
-                let cands: Vec<&&Sym> = by_name
-                    .get(name.as_str())
-                    .map(|v| {
-                        v.iter()
-                            .filter(|s| if recv.is_empty() { s.kind == "function" || s.kind == "class" } else { s.kind == "method" || s.kind == "function" })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let too_common = !recv.is_empty() && (name.len() < 4 || COMMON_METHODS.contains(&name.as_str()));
-                if cands.is_empty() || too_common {
-                    stats.calls_external += 1;
-                    continue;
-                }
-                if cands.len() == 1 {
-                    found = Some((cands[0].id.clone(), if recv.is_empty() { 0.5 } else { 0.4 }, method::INFERRED));
-                } else {
-                    let ph = format!("unresolved:{name}");
-                    placeholders.insert(name.clone());
-                    found = Some((ph, 0.0, method::UNRESOLVED));
-                }
-            }
-
-            let (callee, conf, how) = found.unwrap();
-            if callee == caller {
-                continue;
-            }
-            let e = edges.entry((caller, callee)).or_insert((conf, how, file.clone(), line));
-            if conf > e.0 {
-                *e = (conf, how, file, line);
-            }
-        }
-
-        conn.query("BEGIN TRANSACTION;")?;
-        let mut ph = conn.prepare("CREATE (:Symbol {id:$id, name:$name, qualified_name:$name, kind:'unresolved', signature:'', doc:'', file_path:'', service:'', start_line:0, end_line:0, is_test:false});")?;
-        for name in &placeholders {
-            conn.execute(&mut ph, vec![("id", st(&format!("unresolved:{name}"))), ("name", st(name))])?;
-        }
-        let mut imp = conn.prepare("MATCH (a:File {id:$a}), (b:File {id:$b}) CREATE (a)-[:IMPORTS {confidence:0.9, method:'static'}]->(b);")?;
-        for (a, b) in &import_edges {
-            conn.execute(&mut imp, vec![("a", st(&files[a])), ("b", st(&files[b]))])?;
-        }
-        let mut call = conn.prepare("MATCH (a:Symbol {id:$a}), (b:Symbol {id:$b}) CREATE (a)-[:CALLS {confidence:$c, method:$m, evidence_file:$f, line:$l}]->(b);")?;
-        for ((a, b), (conf, how, file, line)) in &edges {
-            conn.execute(
-                &mut call,
-                vec![("a", st(a)), ("b", st(b)), ("c", Value::Double(*conf)), ("m", st(how)), ("f", st(file)), ("l", Value::Int64(*line))],
-            )?;
-            match *how {
-                method::STATIC => stats.calls_static += 1,
-                method::INFERRED => stats.calls_inferred += 1,
-                _ => stats.calls_unresolved += 1,
-            }
-        }
-        conn.query("COMMIT;")?;
-        drop(conn);
-        self.refresh_fts()?;
-        Ok(stats)
+        Ok(())
     }
 
-    /// Seed search. BM25 through the fts extension when it is loaded,
-    /// otherwise a substring match scored in Rust.
-    pub fn search(&self, text: &str, limit: usize) -> Result<Vec<Hit>> {
-        if self.fts {
-            if let Ok(hits) = self.search_fts(text, limit) {
-                if !hits.is_empty() {
-                    return Ok(hits);
-                }
-            }
-        }
-        self.search_substring(text, limit)
+    fn set_repository(&self, path: &str, head_commit: &str) -> Result<()> {
+        self.write_txn(|conn| meta::set_repository(conn, path, head_commit))
     }
 
-    fn search_fts(&self, text: &str, limit: usize) -> Result<Vec<Hit>> {
-        let conn = self.conn()?;
-        let q = format!(
-            "CALL QUERY_FTS_INDEX('Symbol', 'sym_fts', $q) WITH node AS s, score WHERE s.kind <> 'module' AND s.kind <> 'unresolved' RETURN {HIT_COLS}, score ORDER BY score DESC LIMIT {limit};"
-        );
-        let mut stmt = conn.prepare(&q)?;
-        let rows = conn.execute(&mut stmt, vec![("q", st(&tokens(text).join(" ")))])?;
-        Ok(rows.map(|r| hit(&r, vf(&r[9]))).collect())
+    fn repository(&self) -> Result<Option<(String, String)>> {
+        meta::repository(&self.conn()?)
     }
 
-    fn search_substring(&self, text: &str, limit: usize) -> Result<Vec<Hit>> {
-        let conn = self.conn()?;
-        let q = format!(
-            "MATCH (s:Symbol) WHERE s.kind <> 'module' AND s.kind <> 'unresolved' AND (lower(s.name) CONTAINS $t OR lower(s.qualified_name) CONTAINS $t OR lower(s.doc) CONTAINS $t) RETURN {HIT_COLS}, s.doc;"
-        );
-        let mut stmt = conn.prepare(&q)?;
-        let mut scored: HashMap<String, Hit> = HashMap::new();
-        for t in tokens(text) {
-            for r in conn.execute(&mut stmt, vec![("t", st(&t))])? {
-                let name = vs(&r[1]).to_lowercase();
-                let words: Vec<&str> = name.split('_').collect();
-                let mut score = 0.0;
-                if name == t {
-                    score += 5.0;
-                } else if words.contains(&t.as_str()) {
-                    score += 4.0;
-                } else if name.contains(&t) {
-                    score += 3.0;
-                } else if vs(&r[2]).to_lowercase().contains(&t) {
-                    score += 1.5;
-                }
-                if vs(&r[9]).to_lowercase().contains(&t) {
-                    score += 1.0;
-                }
-                scored.entry(vs(&r[0])).or_insert_with(|| hit(&r, 0.0)).score += score;
-            }
-        }
-        let mut hits: Vec<Hit> = scored.into_values().collect();
-        // Prefer production code over tests when scores tie.
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.is_test.cmp(&b.is_test)).then(a.qualified_name.cmp(&b.qualified_name)));
-        hits.truncate(limit);
-        Ok(hits)
+    fn begin_run(&self, now: i64) -> Result<String> {
+        self.write_txn(|conn| meta::begin_run(conn, now))
     }
 
-    /// Symbols by exact id, qualified name or name.
-    pub fn find(&self, needle: &str) -> Result<Vec<Hit>> {
-        let conn = self.conn()?;
-        let q = format!("MATCH (s:Symbol) WHERE s.kind <> 'unresolved' AND (s.id = $n OR s.qualified_name = $n OR s.name = $n) RETURN {HIT_COLS};");
-        let mut stmt = conn.prepare(&q)?;
-        Ok(conn.execute(&mut stmt, vec![("n", st(needle))])?.map(|r| hit(&r, 0.0)).collect())
+    fn finish_run(&self, run_id: &str, now: i64, status: &str, files_changed: i64) -> Result<()> {
+        self.write(|conn| meta::finish_run(conn, run_id, now, status, files_changed))
     }
 
-    /// Reverse dependency traversal: everything that reaches `id` through
-    /// CALLS within `depth` hops. Score is the lowest hop count.
-    pub fn callers(&self, id: &str, depth: u8) -> Result<Vec<Hit>> {
-        let conn = self.conn()?;
-        let mut out: HashMap<String, Hit> = HashMap::new();
-        for d in 1..=depth.clamp(1, 6) {
-            let q = format!("MATCH (s:Symbol)-[:CALLS*{d}..{d}]->(t:Symbol) WHERE t.id = $id AND s.kind <> 'unresolved' RETURN DISTINCT {HIT_COLS};");
-            let mut stmt = conn.prepare(&q)?;
-            for r in conn.execute(&mut stmt, vec![("id", st(id))])? {
-                out.entry(vs(&r[0])).or_insert_with(|| hit(&r, d as f64));
-            }
-        }
-        let mut hits: Vec<Hit> = out.into_values().filter(|h| h.id != id).collect();
-        hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.qualified_name.cmp(&b.qualified_name)));
-        Ok(hits)
+    fn last_run(&self) -> Result<Option<IndexRun>> {
+        meta::last_run(&self.conn()?)
     }
 
-    /// Number of unresolved call edges leaving a symbol.
-    pub fn unresolved_out(&self, id: &str) -> Result<i64> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare("MATCH (s:Symbol)-[c:CALLS]->(:Symbol) WHERE s.id = $id AND c.method = 'unresolved' RETURN count(c);")?;
-        let n = conn.execute(&mut stmt, vec![("id", st(id))])?.next().map(|r| vi(&r[0])).unwrap_or(0);
-        Ok(n)
+    fn fts_enabled(&self) -> bool {
+        self.fts.load(Ordering::Relaxed)
     }
 
-    pub fn stats(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn()?;
-        let mut out = Vec::new();
-        for (label, q) in [
-            ("files", "MATCH (f:File) RETURN count(f);"),
-            ("symbols", "MATCH (s:Symbol) WHERE s.kind <> 'unresolved' RETURN count(s);"),
-            ("call_sites", "MATCH (c:CallSite) RETURN count(c);"),
-            ("calls_static", "MATCH ()-[c:CALLS]->() WHERE c.method = 'static' RETURN count(c);"),
-            ("calls_inferred", "MATCH ()-[c:CALLS]->() WHERE c.method = 'inferred' RETURN count(c);"),
-            ("calls_unresolved", "MATCH ()-[c:CALLS]->() WHERE c.method = 'unresolved' RETURN count(c);"),
-            ("imports", "MATCH ()-[i:IMPORTS]->() RETURN count(i);"),
-        ] {
-            let n = conn.query(q)?.next().map(|r| vi(&r[0])).unwrap_or(0);
-            out.push((label.to_string(), n));
-        }
-        Ok(out)
+    fn install_fts(&self) -> Result<()> {
+        self.write(|conn| {
+            values::run(conn, "INSTALL fts;")?;
+            values::run(conn, "LOAD fts;")?;
+            search::ensure_fts_index(conn)
+        })?;
+        self.fts.store(true, Ordering::Relaxed);
+        self.index_needs_fts.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
-    /// Run a raw Cypher query and return the printed result table.
-    pub fn raw(&self, cypher: &str) -> Result<String> {
-        let conn = self.conn()?;
-        Ok(conn.query(cypher)?.to_string())
+    fn search(&self, text: &str, limit: usize) -> Result<Vec<Hit>> {
+        search::search(&self.conn()?, self.fts_enabled(), text, limit)
+    }
+
+    fn find(&self, needle: &str) -> Result<Vec<Hit>> {
+        search::find(&self.conn()?, needle)
+    }
+
+    fn find_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<Hit>> {
+        search::find_prefix(&self.conn()?, prefix, limit)
+    }
+
+    fn nodes(&self, ids: &[String]) -> Result<Vec<NodeRec>> {
+        nodes::by_ids(&self.conn()?, ids)
+    }
+
+    fn nodes_by_label(&self, label: NodeLabel, limit: usize) -> Result<Vec<NodeRec>> {
+        nodes::by_label(&self.conn()?, label, limit)
+    }
+
+    fn symbols_in_file(&self, path: &str) -> Result<Vec<NodeRec>> {
+        nodes::symbols_in_file(&self.conn()?, path)
+    }
+
+    fn symbol_body(&self, id: &str) -> Result<Option<String>> {
+        nodes::symbol_body(&self.conn()?, id)
+    }
+
+    fn edges(&self, ids: &[String], types: &[EdgeType], dir: Direction) -> Result<Vec<EdgeRec>> {
+        traverse::edges(&self.conn()?, ids, types, dir)
+    }
+
+    fn callers(&self, id: &str, depth: u8) -> Result<Vec<Hit>> {
+        traverse::callers(&self.conn()?, id, depth)
+    }
+
+    fn unresolved_out(&self, id: &str) -> Result<i64> {
+        traverse::unresolved_out(&self.conn()?, id)
+    }
+
+    fn stats(&self) -> Result<Vec<(String, i64)>> {
+        meta::stats(&self.conn()?)
+    }
+
+    fn raw(&self, cypher: &str) -> Result<String> {
+        // The query may write, so it waits its turn like any other writer.
+        self.write(|conn| Ok(conn.query(cypher)?.to_string()))
+    }
+
+    fn put_usage(&self, rec: &UsageRecord) -> Result<()> {
+        self.write(|conn| usage::put_usage(conn, rec))
+    }
+
+    fn list_usage(&self, since: i64) -> Result<Vec<UsageRecord>> {
+        usage::list_usage(&self.conn()?, since)
+    }
+
+    fn put_handoff(&self, note: &HandoffNote) -> Result<()> {
+        self.write(|conn| usage::put_handoff(conn, note))
+    }
+
+    fn latest_handoffs(&self, limit: usize) -> Result<Vec<HandoffNote>> {
+        usage::latest_handoffs(&self.conn()?, limit)
     }
 }

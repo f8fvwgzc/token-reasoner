@@ -1,0 +1,4 @@
+shop/orders.py:1:1: F401 'os' imported but unused
+shop/orders.py:22:5: E722 do not use bare 'except'
+shop/pricing.py:3:80: E501 line too long (104 > 79 characters)
+tests/test_cart.py:9:23: E999 SyntaxError: '(' was never closed

@@ -1,0 +1,8 @@
+shop/orders.py:14: error: Incompatible return value type (got "None", expected "Order")  [return-value]
+shop/orders.py:31: error: Argument 1 to "charge" has incompatible type "str"; expected "int"  [arg-type]
+shop/pricing.py:8: error: Unsupported operand types for / ("float" and "None")  [operator]
+shop/pricing.py:8: note: Right operand is of type "float | None"
+shop/pricing.py:19: error: Function is missing a return type annotation  [no-untyped-def]
+shop/pricing.py:19: note: Use "-> None" if function does not return a value
+tests/test_cart.py:5:23: error: Module "shop.cart" has no attribute "Basket"; maybe "Cart"?  [attr-defined]
+Found 5 errors in 3 files (checked 14 source files)

@@ -1,0 +1,10 @@
+   Compiling shop v0.1.0 (/home/dev/shop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (target/debug/deps/shop-d2bb84bc74e9c3da)
+
+running 2 tests
+test pricing::tests::ten_percent ... ok
+test pricing::tests::zz_aborts ... error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/home/dev/shop/target/debug/deps/shop-d2bb84bc74e9c3da --test-threads=1` (signal: 6, SIGABRT: process abort signal)

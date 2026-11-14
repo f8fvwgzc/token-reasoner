@@ -1,0 +1,93 @@
+   Compiling shop v0.1.0 (/home/dev/shop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running unittests src/lib.rs (target/debug/deps/shop-d2bb84bc74e9c3da)
+
+running 6 tests
+test cart::tests::starts_empty ... ok
+test pricing::tests::must_panic - should panic ... FAILED
+test pricing::tests::zero_percent ... ok
+test pricing::tests::parses ... FAILED
+test pricing::tests::ten_percent ... FAILED
+test cart::tests::totals_items ... FAILED
+
+failures:
+
+---- pricing::tests::must_panic stdout ----
+note: test did not panic as expected at src/pricing.rs:30:8
+---- pricing::tests::parses stdout ----
+Error: "bad percent \"ten\": invalid digit found in string"
+
+---- pricing::tests::ten_percent stdout ----
+
+thread 'pricing::tests::ten_percent' (108541179) panicked at src/pricing.rs:2:5:
+attempt to divide by zero
+
+---- cart::tests::totals_items stdout ----
+cart has 1 items
+
+thread 'cart::tests::totals_items' (108541176) panicked at src/cart.rs:31:9:
+assertion `left == right` failed
+  left: 1.0
+ right: 1.01
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cart::tests::totals_items
+    pricing::tests::must_panic
+    pricing::tests::parses
+    pricing::tests::ten_percent
+
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+     Running tests/orders.rs (target/debug/deps/orders-2228ba909191c071)
+
+running 1 test
+test order_total_matches_cart ... FAILED
+
+failures:
+
+---- order_total_matches_cart stdout ----
+
+thread 'order_total_matches_cart' (108541555) panicked at tests/orders.rs:7:5:
+total was 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    order_total_matches_cart
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test orders`
+   Doc-tests shop
+
+running 1 test
+test src/lib.rs - add_one (line 6) ... FAILED
+
+failures:
+
+---- src/lib.rs - add_one (line 6) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (108541602) panicked at src/lib.rs:5:1:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    src/lib.rs - add_one (line 6)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+error: doctest failed, to rerun pass `--doc`
+error: 3 targets failed:
+    `--lib`
+    `--test orders`
+    `--doc`

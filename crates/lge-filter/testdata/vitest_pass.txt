@@ -1,0 +1,11 @@
+
+ RUN  v2.1.4 /home/dev/web
+
+ ✓ src/orders.test.ts (4 tests) 3ms
+ ✓ src/cart.test.ts (3 tests) 5ms
+
+ Test Files  2 passed (2)
+      Tests  7 passed (7)
+   Start at  10:21:07
+   Duration  412ms (transform 45ms, setup 0ms, collect 61ms, tests 8ms, environment 0ms, prepare 98ms)
+

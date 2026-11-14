@@ -1,0 +1,24 @@
+{
+  "name": "notifier",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sends an email when an order is created.",
+  "main": "dist/consumer.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/consumer.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "nodemailer": "^6.9.13",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/jest": "^29.5.12",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.4.5"
+  }
+}

@@ -1,0 +1,7 @@
+shop/orders.py:1:8: F401 [*] `os` imported but unused
+shop/orders.py:22:5: E722 Do not use bare `except`
+shop/pricing.py:3:89: E501 Line too long (104 > 88)
+shop/pricing.py:12:31: B008 Do not perform function call `default_rate` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+tests/test_cart.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+Found 5 errors.
+[*] 2 fixable with the `--fix` option.

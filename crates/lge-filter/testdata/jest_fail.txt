@@ -1,0 +1,67 @@
+PASS src/orders.test.ts
+FAIL src/cart.test.ts
+  ● Console
+
+    console.log
+      cart has 1 items
+
+      at Cart.total (src/cart.ts:14:13)
+
+  ● Cart › totals items
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1.01
+    Received: 1
+
+      10 |     cart.add("apple", 0.335, 3);
+      11 |
+    > 12 |     expect(cart.total()).toBe(1.01);
+         |                          ^
+      13 |   });
+      14 |
+
+      at Object.<anonymous> (src/cart.test.ts:12:26)
+
+  ● Cart › applyDiscount › handles ten percent
+
+    TypeError: Cannot read properties of undefined (reading 'percent')
+
+      4 | export function applyDiscount(price: number, rule: Rule): number {
+    > 5 |   return price * (1 - rule.percent / 100);
+        |                            ^
+      6 | }
+      7 |
+
+      at applyDiscount (src/pricing.ts:5:28)
+      at Object.<anonymous> (src/cart.test.ts:22:12)
+      at Promise.then.completed (node_modules/jest-circus/build/utils.js:298:28)
+      at new Promise (<anonymous>)
+      at callAsyncCircusFn (node_modules/jest-circus/build/utils.js:231:10)
+
+FAIL src/views.test.tsx
+  ● render › shows the order id
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+    -   "id": "o-1",
+    +   "id": undefined,
+        "total": 12,
+      }
+
+      15 |   it("shows the order id", () => {
+    > 16 |     expect(render(order)).toEqual({ id: "o-1", total: 12 });
+         |                           ^
+      17 |   });
+
+      at Object.<anonymous> (src/views.test.tsx:16:27)
+
+Test Suites: 2 failed, 1 passed, 3 total
+Tests:       3 failed, 5 passed, 8 total
+Snapshots:   0 total
+Time:        2.107 s
+Ran all test suites.

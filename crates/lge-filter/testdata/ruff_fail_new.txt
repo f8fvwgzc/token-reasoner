@@ -1,0 +1,29 @@
+F401 [*] `os` imported but unused
+ --> shop/orders.py:1:8
+  |
+1 | import os
+  |        ^^
+2 | import json
+  |
+help: Remove unused import: `os`
+
+E722 Do not use bare `except`
+  --> shop/orders.py:22:5
+   |
+20 |     try:
+21 |         charge(order)
+22 |     except:
+   |     ^^^^^^
+23 |         pass
+   |
+
+invalid-syntax: Expected an indented block after function definition
+ --> shop/pricing.py:7:1
+  |
+6 | def apply_discount(price, percent):
+7 | return price * (1 - percent / 100)
+  | ^
+  |
+
+Found 3 errors.
+[*] 1 fixable with the `--fix` option.

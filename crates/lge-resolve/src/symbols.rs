@@ -1,0 +1,324 @@
+//! Lookup tables over the files and symbols of one resolver run.
+//!
+//! Every table is built from sorted, de-duplicated input, so a lookup gives the
+//! same answer whatever order the store returned the records in.
+
+use lge_core::{kind, lang, FileRec, ResolveInput, SymbolRec};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Extensions a TypeScript or JavaScript import may leave out, in the order they are tried.
+pub(crate) const SCRIPT_EXTENSIONS: [&str; 6] = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+
+/// The import systems the resolver knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lang {
+    Python,
+    /// TypeScript and JavaScript share one module system.
+    Script,
+    Other,
+}
+
+impl Lang {
+    pub fn of(file: &FileRec) -> Lang {
+        match file.lang.as_str() {
+            lang::PYTHON => Lang::Python,
+            lang::TYPESCRIPT | lang::JAVASCRIPT => Lang::Script,
+            // A record without a language: the extension says the same thing.
+            "" if file.path.ends_with(".py") => Lang::Python,
+            "" if SCRIPT_EXTENSIONS.iter().any(|ext| file.path.ends_with(ext)) => Lang::Script,
+            _ => Lang::Other,
+        }
+    }
+}
+
+/// Which symbol kinds a lookup accepts. Module symbols are in no lookup table, so
+/// no lookup by name can make a module a call, inheritance or reference target.
+/// The one way to a module symbol is a default export the indexer marked on it
+/// (`export default { ... }`): a reference to that import mentions the module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Want {
+    /// What a bare call `f()` can reach: a function or a class (its constructor).
+    Callable,
+    /// What `x.f()` can reach by name alone: a method or a function.
+    Member,
+    /// What `self.f()` or `Class.f()` can reach inside a known class.
+    CallTarget,
+    Class,
+    /// What a class can extend or implement.
+    Base,
+    /// What a bare identifier can name: anything but a method.
+    Nameable,
+    Any,
+}
+
+impl Want {
+    pub fn admits(self, k: &str) -> bool {
+        match self {
+            Want::Callable => k == kind::FUNCTION || k == kind::CLASS,
+            Want::Member => k == kind::METHOD || k == kind::FUNCTION,
+            Want::CallTarget => k == kind::FUNCTION || k == kind::METHOD || k == kind::CLASS,
+            Want::Class => k == kind::CLASS,
+            Want::Base => k == kind::CLASS || k == kind::INTERFACE,
+            Want::Nameable => k != kind::METHOD,
+            Want::Any => true,
+        }
+    }
+
+    /// True for the lookups that look for something to call.
+    fn is_call(self) -> bool {
+        matches!(self, Want::Callable | Want::Member | Want::CallTarget)
+    }
+}
+
+pub(crate) struct Index<'a> {
+    files: BTreeMap<&'a str, &'a FileRec>,
+    files_by_id: HashMap<&'a str, &'a FileRec>,
+    by_id: HashMap<&'a str, &'a SymbolRec>,
+    modules: HashMap<&'a str, &'a SymbolRec>,
+    by_file_name: HashMap<(&'a str, &'a str), Vec<&'a SymbolRec>>,
+    by_file_qn: HashMap<(&'a str, &'a str), Vec<&'a SymbolRec>>,
+    by_name: HashMap<&'a str, Vec<&'a SymbolRec>>,
+    /// Members declared inside an interface or a type: signatures with no body,
+    /// so nothing to call.
+    signatures: HashSet<&'a str>,
+}
+
+/// Every field of a symbol that can change the output, so that two records with
+/// the same id are told apart the same way on every run.
+fn symbol_order(s: &SymbolRec) -> (&str, &str, &str, &str, &str, &str, bool) {
+    (
+        &s.id,
+        &s.file_path,
+        &s.qualified_name,
+        &s.kind,
+        &s.name,
+        &s.service,
+        s.is_test,
+    )
+}
+
+impl<'a> Index<'a> {
+    pub fn new(input: &'a ResolveInput) -> Index<'a> {
+        let mut files: Vec<&FileRec> = input.files.iter().collect();
+        files.sort_by(|a, b| (&a.path, &a.id, &a.service, &a.lang).cmp(&(&b.path, &b.id, &b.service, &b.lang)));
+        let mut symbols: Vec<&SymbolRec> = input.symbols.iter().collect();
+        symbols.sort_by(|a, b| symbol_order(a).cmp(&symbol_order(b)));
+
+        let mut ix = Index {
+            files: BTreeMap::new(),
+            files_by_id: HashMap::new(),
+            by_id: HashMap::new(),
+            modules: HashMap::new(),
+            by_file_name: HashMap::new(),
+            by_file_qn: HashMap::new(),
+            by_name: HashMap::new(),
+            signatures: HashSet::new(),
+        };
+        for f in files {
+            if !ix.files.contains_key(f.path.as_str()) {
+                ix.files.insert(&f.path, f);
+                ix.files_by_id.entry(&f.id).or_insert(f);
+            }
+        }
+        for s in symbols {
+            // Placeholders of an earlier run are derived data, not input.
+            if s.kind == kind::UNRESOLVED || ix.by_id.contains_key(s.id.as_str()) {
+                continue;
+            }
+            ix.by_id.insert(&s.id, s);
+            if s.kind == kind::MODULE {
+                ix.modules.entry(&s.file_path).or_insert(s);
+                continue;
+            }
+            ix.by_file_name.entry((&s.file_path, &s.name)).or_default().push(s);
+            ix.by_file_qn
+                .entry((&s.file_path, &s.qualified_name))
+                .or_default()
+                .push(s);
+            ix.by_name.entry(&s.name).or_default().push(s);
+        }
+        // A member's scope is its qualified name without the last segment. A
+        // class merged with an interface of the same name still defines its
+        // members, so every declaration of the scope must be signature-only.
+        for ((file, qualified_name), members) in &ix.by_file_qn {
+            let scope = qualified_name
+                .rsplit_once('.')
+                .and_then(|(scope, _)| ix.by_file_qn.get(&(*file, scope)));
+            if scope.is_some_and(|outer| outer.iter().all(|s| declares_only(s))) {
+                ix.signatures.extend(members.iter().map(|s| s.id.as_str()));
+            }
+        }
+        ix
+    }
+
+    pub fn file(&self, path: &str) -> Option<&'a FileRec> {
+        self.files.get(path).copied()
+    }
+
+    pub fn file_by_id(&self, id: &str) -> Option<&'a FileRec> {
+        self.files_by_id.get(id).copied()
+    }
+
+    /// All files, sorted by path.
+    pub fn files(&self) -> impl Iterator<Item = &'a FileRec> + '_ {
+        self.files.values().copied()
+    }
+
+    pub fn lang(&self, path: &str) -> Lang {
+        self.file(path).map(Lang::of).unwrap_or(Lang::Other)
+    }
+
+    /// Any symbol, module symbols included (they own top-level calls and facts).
+    pub fn sym(&self, id: &str) -> Option<&'a SymbolRec> {
+        self.by_id.get(id).copied()
+    }
+
+    /// The module symbol of `file`: the owner of its top-level code.
+    pub fn module_of(&self, file: &str) -> Option<&'a SymbolRec> {
+        self.modules.get(file).copied()
+    }
+
+    /// Symbols called `name` that are defined in `file`.
+    pub fn in_file(&self, file: &str, name: &str, want: Want) -> Vec<&'a SymbolRec> {
+        self.admitted(self.by_file_name.get(&(file, name)), want)
+    }
+
+    /// The symbol called `name` in `file`, when there is exactly one.
+    pub fn one_in_file(&self, file: &str, name: &str, want: Want) -> Option<&'a SymbolRec> {
+        one(self.in_file(file, name, want))
+    }
+
+    /// The symbol with this qualified name in `file`, when there is exactly one.
+    ///
+    /// The file is part of the key because qualified names are not unique across
+    /// files (`a.py` and `a/__init__.py`, `util.ts` and `util/index.ts`).
+    pub fn member(&self, file: &str, qualified_name: &str, want: Want) -> Option<&'a SymbolRec> {
+        one(self.admitted(self.by_file_qn.get(&(file, qualified_name)), want))
+    }
+
+    /// Symbols called `name` anywhere in the repository, sorted by id.
+    pub fn named(&self, name: &str, want: Want) -> Vec<&'a SymbolRec> {
+        self.admitted(self.by_name.get(name), want)
+    }
+
+    fn admitted(&self, found: Option<&Vec<&'a SymbolRec>>, want: Want) -> Vec<&'a SymbolRec> {
+        let fits =
+            |s: &&'a SymbolRec| want.admits(&s.kind) && !(want.is_call() && self.signatures.contains(s.id.as_str()));
+        found
+            .map(|v| v.iter().copied().filter(fits).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// An interface or a type alias: it declares members, it does not define them.
+fn declares_only(s: &SymbolRec) -> bool {
+    s.kind == kind::INTERFACE || s.kind == kind::TYPE
+}
+
+/// Several candidates are never narrowed down to one.
+pub(crate) fn one<T>(mut found: Vec<T>) -> Option<T> {
+    if found.len() == 1 {
+        found.pop()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(file: &str, qn: &str, k: &str) -> SymbolRec {
+        SymbolRec {
+            id: lge_core::symbol_id(file, qn, k),
+            name: qn.rsplit('.').next().unwrap_or(qn).to_string(),
+            qualified_name: qn.to_string(),
+            kind: k.to_string(),
+            file_path: file.to_string(),
+            ..SymbolRec::default()
+        }
+    }
+
+    #[test]
+    fn modules_and_placeholders_are_in_no_lookup_table() {
+        let input = ResolveInput {
+            symbols: vec![
+                sym("a/tasks.py", "a.tasks", kind::MODULE),
+                sym("", "tasks", kind::UNRESOLVED),
+                sym("a/tasks.py", "a.tasks.tasks", kind::FUNCTION),
+            ],
+            ..ResolveInput::default()
+        };
+        let ix = Index::new(&input);
+        assert_eq!(ix.named("tasks", Want::Any).len(), 1);
+        assert_eq!(ix.named("tasks", Want::Any)[0].kind, kind::FUNCTION);
+        assert!(ix.sym(&input.symbols[0].id).is_some(), "a module can still own calls");
+        assert_eq!(
+            ix.module_of("a/tasks.py").map(|s| s.id.as_str()),
+            Some(input.symbols[0].id.as_str())
+        );
+        assert!(ix.module_of("a/other.py").is_none());
+        assert!(ix.sym(&input.symbols[1].id).is_none());
+        assert!(ix.member("a/tasks.py", "a.tasks", Want::Any).is_none());
+    }
+
+    #[test]
+    fn several_matches_are_not_one() {
+        let input = ResolveInput {
+            symbols: vec![
+                sym("m.py", "m.A.run", kind::METHOD),
+                sym("m.py", "m.B.run", kind::METHOD),
+            ],
+            ..ResolveInput::default()
+        };
+        let ix = Index::new(&input);
+        assert_eq!(ix.in_file("m.py", "run", Want::Member).len(), 2);
+        assert!(ix.one_in_file("m.py", "run", Want::Member).is_none());
+        assert!(ix.member("m.py", "m.A.run", Want::CallTarget).is_some());
+        assert!(ix.member("other.py", "m.A.run", Want::CallTarget).is_none());
+        assert!(
+            ix.one_in_file("m.py", "run", Want::Callable).is_none(),
+            "a method is not a bare callable"
+        );
+    }
+
+    #[test]
+    fn members_of_an_interface_or_type_are_not_call_targets() {
+        let input = ResolveInput {
+            symbols: vec![
+                sym("m.ts", "m.Mailer", kind::INTERFACE),
+                sym("m.ts", "m.Mailer.send", kind::METHOD),
+                sym("m.ts", "m.Handlers", kind::TYPE),
+                sym("m.ts", "m.Handlers.send", kind::METHOD),
+                sym("m.ts", "m.Smtp", kind::CLASS),
+                sym("m.ts", "m.Smtp.send", kind::METHOD),
+            ],
+            ..ResolveInput::default()
+        };
+        let ix = Index::new(&input);
+        let called: Vec<&str> = ix
+            .named("send", Want::Member)
+            .iter()
+            .map(|s| s.qualified_name.as_str())
+            .collect();
+        assert_eq!(called, ["m.Smtp.send"]);
+        assert!(ix.member("m.ts", "m.Mailer.send", Want::CallTarget).is_none());
+        assert_eq!(ix.named("send", Want::Any).len(), 3, "they can still be mentioned");
+    }
+
+    #[test]
+    fn language_comes_from_the_record_then_the_extension() {
+        let file = |path: &str, lang: &str| FileRec {
+            path: path.into(),
+            lang: lang.into(),
+            ..FileRec::default()
+        };
+        assert_eq!(Lang::of(&file("a.py", "python")), Lang::Python);
+        assert_eq!(Lang::of(&file("a.ts", "typescript")), Lang::Script);
+        assert_eq!(Lang::of(&file("a.mjs", "javascript")), Lang::Script);
+        assert_eq!(Lang::of(&file("a.py", "")), Lang::Python);
+        assert_eq!(Lang::of(&file("a.tsx", "")), Lang::Script);
+        assert_eq!(Lang::of(&file("a.go", "go")), Lang::Other);
+        assert_eq!(Lang::of(&file("a.txt", "")), Lang::Other);
+    }
+}

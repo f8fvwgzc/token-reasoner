@@ -1,0 +1,19 @@
+{
+  "name": "web-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Public HTTP gateway in front of the orders service.",
+  "main": "dist/routes.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/routes.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "typescript": "^5.4.5"
+  }
+}

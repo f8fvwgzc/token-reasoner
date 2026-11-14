@@ -7,7 +7,16 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+# Local repositories only: no openssl, https or ssh. The bundled libgit2 is
+# compiled with `cc` (no cmake) and linked statically, whatever the system has.
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ignore = "0.4.34"
 lge-core = { path = "../lge-core" }
+rayon = "1.12.0"
 tree-sitter = "0.27.2"
+tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

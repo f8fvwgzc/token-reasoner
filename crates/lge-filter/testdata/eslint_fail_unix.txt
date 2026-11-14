@@ -1,0 +1,6 @@
+/home/dev/web/src/app.ts:12:7: 'unused' is assigned a value but never used [Error/@typescript-eslint/no-unused-vars]
+/home/dev/web/src/app.ts:30:15: Unexpected any. Specify a different type [Warning/@typescript-eslint/no-explicit-any]
+/home/dev/web/src/app.ts:41:3: Unexpected console statement [Error/no-console]
+/home/dev/web/src/routes.ts:5:1: Parsing error: Declaration or statement expected [Error]
+
+4 problems

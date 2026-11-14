@@ -1,0 +1,7 @@
+
+/home/dev/web/src/app.ts
+  30:15  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+✖ 1 problem (0 errors, 1 warning)
+
+ESLint found too many warnings (maximum: 0).

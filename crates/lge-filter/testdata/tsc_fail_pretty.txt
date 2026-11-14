@@ -1,0 +1,32 @@
+[96msrc/ordersClient.ts[0m:[93m2[0m:[93m25[0m - [91merror[0m[90m TS2307: [0mCannot find module './nope' or its corresponding type declarations.
+
+[7m2[0m import { missing } from "./nope";
+[7m [0m [91m                        ~~~~~~~~[0m
+
+[96msrc/ordersClient.ts[0m:[93m9[0m:[93m17[0m - [91merror[0m[90m TS2345: [0mArgument of type '{ id: string; }' is not assignable to parameter of type 'Order'.
+  Property 'total' is missing in type '{ id: string; }' but required in type 'Order'.
+
+[7m9[0m   return submit({ id });
+[7m [0m [91m                ~~~~~~[0m
+
+  [96msrc/types.ts[0m:[93m3[0m:[93m3[0m
+    [7m3[0m   total: number;
+    [7m [0m [96m  ~~~~~[0m
+    'total' is declared here.
+
+[96msrc/routes.ts[0m:[93m4[0m:[93m9[0m - [91merror[0m[90m TS2322: [0mType 'string' is not assignable to type 'number'.
+
+[7m4[0m   const total: number = params.id;
+[7m [0m [91m        ~~~~~[0m
+
+[96msrc/routes.ts[0m:[93m9[0m:[93m10[0m - [91merror[0m[90m TS2304: [0mCannot find name 'orders'.
+
+[7m9[0m   return orders;
+[7m [0m [91m         ~~~~~~[0m
+
+
+Found 4 errors in 2 files.
+
+Errors  Files
+     2  src/ordersClient.ts[90m:2[0m
+     2  src/routes.ts[90m:4[0m

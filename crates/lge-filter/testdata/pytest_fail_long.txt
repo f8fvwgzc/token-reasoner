@@ -1,0 +1,94 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.9, pytest-8.2.2, pluggy-1.5.0
+rootdir: /home/dev/shop
+configfile: pyproject.toml
+plugins: cov-5.0.0, anyio-4.4.0
+collected 8 items
+
+tests/test_cart.py .F.                                                   [ 37%]
+tests/test_orders.py F.FFE                                               [100%]
+
+==================================== ERRORS ====================================
+______________________ ERROR at setup of test_list_orders ______________________
+file /home/dev/shop/tests/test_orders.py, line 52
+  def test_list_orders(db):
+E       fixture 'db' not found
+>       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, client, cov, doctest_namespace, monkeypatch, no_cover, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/home/dev/shop/tests/test_orders.py:52
+=================================== FAILURES ===================================
+______________________________ test_total_rounds _______________________________
+
+    def test_total_rounds():
+        cart = Cart()
+        cart.add("apple", 0.335, qty=3)
+>       assert cart.total() == 1.01
+E       assert 1.0 == 1.01
+E        +  where 1.0 = <bound method Cart.total of <shop.cart.Cart object at 0x7f3c1a2b4d10>>()
+E        +    where <bound method Cart.total of <shop.cart.Cart object at 0x7f3c1a2b4d10>> = <shop.cart.Cart object at 0x7f3c1a2b4d10>.total
+
+tests/test_cart.py:14: AssertionError
+____________________ TestCheckout.test_rejects_empty_cart _____________________
+
+self = <tests.test_orders.TestCheckout object at 0x7f3c1a2c9e50>
+client = <FlaskClient <Flask 'shop'>>
+
+    def test_rejects_empty_cart(self, client):
+        resp = client.post("/orders", json={"items": []})
+>       assert resp.status_code == 400
+E       assert 201 == 400
+E        +  where 201 = <WrapperTestResponse streamed [201 CREATED]>.status_code
+
+tests/test_orders.py:21: AssertionError
+----------------------------- Captured stdout call -----------------------------
+created order 17 with 0 items
+------------------------------ Captured log call -------------------------------
+WARNING  shop.orders:orders.py:44 order 17 has no items
+____________________________ test_discount[10-90.0] ____________________________
+
+percent = 10, expected = 90.0
+
+    @pytest.mark.parametrize("percent,expected", [(0, 100.0), (10, 90.0), (50, 50.0)])
+    def test_discount(percent, expected):
+>       assert apply_discount(100.0, percent) == expected
+
+tests/test_orders.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+price = 100.0, percent = 10
+
+    def apply_discount(price, percent):
+        if percent == 0:
+            return price
+>       return price * (1 - percent / RATES[percent])
+E       KeyError: 10
+
+shop/pricing.py:8: KeyError
+____________________________ test_discount[50-50.0] ____________________________
+
+percent = 50, expected = 50.0
+
+    @pytest.mark.parametrize("percent,expected", [(0, 100.0), (10, 90.0), (50, 50.0)])
+    def test_discount(percent, expected):
+>       assert apply_discount(100.0, percent) == expected
+
+tests/test_orders.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+price = 100.0, percent = 50
+
+    def apply_discount(price, percent):
+        if percent == 0:
+            return price
+>       return price * (1 - percent / RATES[percent])
+E       KeyError: 50
+
+shop/pricing.py:8: KeyError
+=========================== short test summary info ============================
+FAILED tests/test_cart.py::test_total_rounds - assert 1.0 == 1.01
+FAILED tests/test_orders.py::TestCheckout::test_rejects_empty_cart - assert 201 == 400
+FAILED tests/test_orders.py::test_discount[10-90.0] - KeyError: 10
+FAILED tests/test_orders.py::test_discount[50-50.0] - KeyError: 50
+ERROR tests/test_orders.py::test_list_orders
+==================== 4 failed, 3 passed, 1 error in 0.42s =====================

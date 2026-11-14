@@ -7,17 +7,10 @@
 
 use anyhow::Result;
 use lge_core::Hit;
-use lge_store::Store;
+pub use lge_core::Level;
+use lge_store::GraphStore;
 use serde::Serialize;
 use std::collections::BTreeSet;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Level {
-    Low,
-    Medium,
-    Top,
-}
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -31,7 +24,11 @@ pub struct RouterConfig {
 
 impl Default for RouterConfig {
     fn default() -> Self {
-        RouterConfig { max_seeds: 3, depth: 2, seed_score_ratio: 0.6 }
+        RouterConfig {
+            max_seeds: 3,
+            depth: 2,
+            seed_score_ratio: 0.6,
+        }
     }
 }
 
@@ -48,7 +45,7 @@ pub struct Route {
     pub unresolved_edges: i64,
 }
 
-pub fn route(store: &Store, task: &str, cfg: &RouterConfig) -> Result<Route> {
+pub fn route(store: &dyn GraphStore, task: &str, cfg: &RouterConfig) -> Result<Route> {
     let mut seeds = store.search(task, cfg.max_seeds * 3)?;
     seeds.retain(|h| !h.is_test);
     if let Some(best) = seeds.first().map(|h| h.score) {
@@ -75,13 +72,22 @@ pub fn route(store: &Store, task: &str, cfg: &RouterConfig) -> Result<Route> {
     }
 
     let (level, reason) = if seeds.is_empty() {
-        (Level::Top, "no matching symbols in the graph; cannot bound the change".to_string())
+        (
+            Level::Top,
+            "no matching symbols in the graph; cannot bound the change".to_string(),
+        )
     } else if services.len() > 1 {
         (Level::Top, format!("change reaches {} services", services.len()))
     } else if unresolved > 0 {
         // Safety rule: when the graph is unsure around the seeds, go one level up.
         let base = if files.len() > 1 { Level::Top } else { Level::Medium };
-        (base, format!("{} file(s), raised one level because {unresolved} call(s) near the seeds are unresolved", files.len()))
+        (
+            base,
+            format!(
+                "{} file(s), raised one level because {unresolved} call(s) near the seeds are unresolved",
+                files.len()
+            ),
+        )
     } else if files.len() > 1 {
         (Level::Medium, format!("{} files in one service", files.len()))
     } else {

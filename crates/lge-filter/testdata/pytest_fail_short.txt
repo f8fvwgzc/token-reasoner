@@ -1,0 +1,33 @@
+.F.F.FF.                                                                 [100%]
+=================================== FAILURES ===================================
+______________________________ test_total_rounds _______________________________
+tests/test_cart.py:14: in test_total_rounds
+    assert cart.total() == 1.01
+E   assert 1.0 == 1.01
+E    +  where 1.0 = total()
+E    +    where total = <shop.cart.Cart object at 0x7f3c1a2b4d10>.total
+____________________ TestCheckout.test_rejects_empty_cart _____________________
+tests/test_orders.py:21: in test_rejects_empty_cart
+    assert resp.status_code == 400
+E   assert 201 == 400
+E    +  where 201 = <WrapperTestResponse streamed [201 CREATED]>.status_code
+----------------------------- Captured stdout call -----------------------------
+created order 17 with 0 items
+____________________________ test_discount[10-90.0] ____________________________
+tests/test_orders.py:35: in test_discount
+    assert apply_discount(100.0, percent) == expected
+shop/pricing.py:8: in apply_discount
+    return price * (1 - percent / RATES[percent])
+E   KeyError: 10
+____________________________ test_discount[50-50.0] ____________________________
+tests/test_orders.py:35: in test_discount
+    assert apply_discount(100.0, percent) == expected
+shop/pricing.py:8: in apply_discount
+    return price * (1 - percent / RATES[percent])
+E   KeyError: 50
+=========================== short test summary info ============================
+FAILED tests/test_cart.py::test_total_rounds - assert 1.0 == 1.01
+FAILED tests/test_orders.py::TestCheckout::test_rejects_empty_cart - assert 201 == 400
+FAILED tests/test_orders.py::test_discount[10-90.0] - KeyError: 10
+FAILED tests/test_orders.py::test_discount[50-50.0] - KeyError: 50
+4 failed, 4 passed in 0.38s

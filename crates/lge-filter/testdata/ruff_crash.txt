@@ -1,0 +1,8 @@
+ruff failed
+  Cause: Failed to parse /home/dev/shop/pyproject.toml
+  Cause: TOML parse error at line 14, column 19
+   |
+14 | select = ["E", "F"
+   |                   ^
+invalid array
+expected `]`

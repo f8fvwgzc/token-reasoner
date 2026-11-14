@@ -10,5 +10,7 @@ serde.workspace = true
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
 
+lge-retrieve = { path = "../lge-retrieve" }
+
 [dev-dependencies]
-lge-index = { path = "../lge-index" }
+tempfile = "3.27.0"

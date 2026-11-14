@@ -11,6 +11,7 @@ lge-core = { path = "../lge-core" }
 lge-index = { path = "../lge-index" }
 lge-store = { path = "../lge-store" }
 lge-router = { path = "../lge-router" }
+lge-retrieve = { path = "../lge-retrieve" }
 clap = { version = "4.6.7", features = ["derive"] }
 
 [[bin]]

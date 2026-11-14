@@ -8,4 +8,15 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+# Reads the `scripts` table of `package.json` when detecting checks.
 serde_json.workspace = true
+regex = "1.13.1"
+# Reads the `[[check]]` tables of `lge.toml` and `[tool.*]` of `pyproject.toml`. Parsing only.
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+
+[target.'cfg(unix)'.dependencies]
+# `killpg`: a check that times out is killed together with everything it started.
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile = "3.27.0"

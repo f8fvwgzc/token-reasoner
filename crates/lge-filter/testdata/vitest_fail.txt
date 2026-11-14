@@ -1,0 +1,75 @@
+
+ RUN  v2.1.4 /home/dev/web
+
+ ✓ src/orders.test.ts (4 tests) 3ms
+ ❯ src/cart.test.ts (3 tests | 2 failed) 9ms
+   ✓ Cart > starts empty
+   × Cart > totals items 4ms
+     → expected 1 to be 1.01 // Object.is equality
+   × Cart > applyDiscount > handles ten percent 1ms
+     → Cannot read properties of undefined (reading 'percent')
+ ❯ src/views.test.tsx (1 test | 1 failed) 6ms
+   × render > shows the order id 5ms
+     → expected { id: undefined, total: 12 } to deeply equal { id: 'o-1', total: 12 }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/cart.test.ts > Cart > totals items
+AssertionError: expected 1 to be 1.01 // Object.is equality
+
+- Expected
++ Received
+
+- 1.01
++ 1
+
+ ❯ src/cart.test.ts:12:26
+     10|     cart.add("apple", 0.335, 3);
+     11| 
+     12|     expect(cart.total()).toBe(1.01);
+       |                          ^
+     13|   });
+     14| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/cart.test.ts > Cart > applyDiscount > handles ten percent
+TypeError: Cannot read properties of undefined (reading 'percent')
+ ❯ applyDiscount src/pricing.ts:5:28
+      3| 
+      4| export function applyDiscount(price: number, rule: Rule): number {
+      5|   return price * (1 - rule.percent / 100);
+       |                            ^
+      6| }
+      7| 
+ ❯ src/cart.test.ts:22:12
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/views.test.tsx > render > shows the order id
+AssertionError: expected { id: undefined, total: 12 } to deeply equal { id: 'o-1', total: 12 }
+
+- Expected
++ Received
+
+  Object {
+-   "id": "o-1",
++   "id": undefined,
+    "total": 12,
+  }
+
+ ❯ src/views.test.tsx:16:27
+     14| 
+     15|   it("shows the order id", () => {
+     16|     expect(render(order)).toEqual({ id: "o-1", total: 12 });
+       |                           ^
+     17|   });
+     18| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+ Test Files  2 failed | 1 passed (3)
+      Tests  3 failed | 5 passed (8)
+   Start at  10:21:07
+   Duration  431ms (transform 52ms, setup 0ms, collect 70ms, tests 18ms, environment 0ms, prepare 101ms)
+

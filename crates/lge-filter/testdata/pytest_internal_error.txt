@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.9, pytest-8.2.2, pluggy-1.5.0
+rootdir: /home/dev/shop
+configfile: pyproject.toml
+collected 12 items
+INTERNALERROR> Traceback (most recent call last):
+INTERNALERROR>   File "/home/dev/shop/.venv/lib/python3.11/site-packages/_pytest/main.py", line 285, in wrap_session
+INTERNALERROR>     session.exitstatus = doit(config, session) or 0
+INTERNALERROR>                          ^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "/home/dev/shop/conftest.py", line 12, in pytest_collection_modifyitems
+INTERNALERROR>     items.sort(key=lambda item: item.priority)
+INTERNALERROR> AttributeError: 'Function' object has no attribute 'priority'
+
+============================ no tests ran in 0.05s =============================
