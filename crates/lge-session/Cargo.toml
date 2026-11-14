@@ -8,6 +8,15 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Reads the `[session]` table of `lge.toml`. Parsing only.
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
+lge-retrieve = { path = "../lge-retrieve" }
+lge-router = { path = "../lge-router" }
+lge-memory = { path = "../lge-memory" }
+lge-usage = { path = "../lge-usage" }
+lge-filter = { path = "../lge-filter" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

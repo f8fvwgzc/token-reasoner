@@ -8,6 +8,14 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Reads the benchmark task file. Parsing only.
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
+lge-retrieve = { path = "../lge-retrieve" }
+lge-router = { path = "../lge-router" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+serde_json.workspace = true
+lge-mcp = { path = "../lge-mcp" }

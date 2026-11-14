@@ -533,9 +533,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lge-core",
+ "lge-mcp",
+ "lge-retrieve",
+ "lge-router",
  "lge-store",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -544,11 +549,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "lge-bench",
  "lge-core",
+ "lge-filter",
  "lge-index",
+ "lge-mcp",
+ "lge-memory",
  "lge-retrieve",
  "lge-router",
+ "lge-session",
  "lge-store",
+ "lge-usage",
  "serde_json",
 ]
 
@@ -659,9 +670,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lge-core",
+ "lge-filter",
+ "lge-memory",
+ "lge-retrieve",
+ "lge-router",
  "lge-store",
+ "lge-usage",
  "serde",
- "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
