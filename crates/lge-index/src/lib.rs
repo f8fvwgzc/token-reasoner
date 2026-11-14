@@ -107,11 +107,68 @@ pub fn hash_file(path: &Path) -> Result<(Vec<u8>, String)> {
 /// Parse one file with the extractor for its language. `Ok(None)` means the
 /// language is not supported.
 pub fn parse_file(rel_path: &str, service: &str, src: &[u8], hash: &str) -> Result<Option<ParsedFile>> {
-    match lang_of(rel_path) {
-        Some(lang::PYTHON) => parse_python(rel_path, service, src, hash).map(Some),
-        Some(lang::TYPESCRIPT | lang::JAVASCRIPT) => parse_typescript(rel_path, service, src, hash).map(Some),
-        _ => Ok(None),
+    let (mut parsed, comment) = match lang_of(rel_path) {
+        Some(lang::PYTHON) => (parse_python(rel_path, service, src, hash)?, "#"),
+        Some(lang::TYPESCRIPT | lang::JAVASCRIPT) => (parse_typescript(rel_path, service, src, hash)?, "//"),
+        _ => return Ok(None),
+    };
+    add_rationale(&mut parsed, rel_path, src, comment);
+    Ok(Some(parsed))
+}
+
+/// Comment prefixes that say why code is the way it is. Such a comment is
+/// worth more to a reader than the lines around it, so it is kept with the symbol.
+const RATIONALE_MARKERS: [&str; 7] = ["NOTE:", "WHY:", "HACK:", "IMPORTANT:", "RATIONALE:", "TODO:", "FIXME:"];
+
+/// Attach every rationale comment to the innermost symbol that contains its
+/// line, as a `rationale` fact. Works on source lines, so it is the same for
+/// every language: a comment token, optional spaces, then a marker.
+fn add_rationale(parsed: &mut ParsedFile, rel_path: &str, src: &[u8], comment: &str) {
+    let text = String::from_utf8_lossy(src);
+    for (i, line) in text.lines().enumerate() {
+        let Some(note) = rationale_in(line, comment) else {
+            continue;
+        };
+        let line_no = i as i64 + 1;
+        // The innermost symbol is the one with the smallest range that holds the line.
+        let owner = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.start_line <= line_no && line_no <= s.end_line)
+            .min_by_key(|s| (s.end_line - s.start_line, s.start_line));
+        let Some(owner) = owner else { continue };
+        parsed.facts.push(facts::fact_site(
+            rel_path,
+            &owner.id,
+            lge_core::fact::RATIONALE,
+            &note,
+            "",
+            (line_no, line_no),
+            true,
+        ));
     }
+    unique_ids(parsed);
+}
+
+/// The rationale text of a line, when it has a comment that starts with a
+/// marker: `# NOTE: ...`, `// WHY: ...`, ` * HACK: ...`. At most 200 chars.
+fn rationale_in(line: &str, comment: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // A block-comment line (`* NOTE:` or `/* NOTE:`), a whole-line comment, or
+    // a trailing comment after code.
+    let after = if let Some(rest) = trimmed.strip_prefix("/*").or_else(|| trimmed.strip_prefix('*')) {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(comment) {
+        rest
+    } else {
+        let at = line.find(&format!(" {comment}"))?;
+        &line[at + 1 + comment.len()..]
+    };
+    let after = after.trim_start_matches(['/', '#', '*', '!']).trim_start();
+    RATIONALE_MARKERS
+        .iter()
+        .any(|m| after.starts_with(m))
+        .then(|| after.trim_end_matches("*/").trim().chars().take(200).collect())
 }
 
 /// Read, hash and parse `files` in parallel. The result keeps the order of
@@ -166,6 +223,56 @@ pub(crate) fn unique_ids(parsed: &mut ParsedFile) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn rationale_comments_belong_to_the_innermost_symbol() {
+        let src = b"# NOTE: module-level reason\nclass Repo:\n    def save(self, row):\n        # WHY: the unique index makes a second insert fail loudly\n        x = 1  # HACK: until the driver is fixed\n        return \"# NOTE: not a comment\"\n\ndef other():\n    # just a comment\n    pass\n";
+        let parsed = parse_file("svc/repo.py", "svc", src, "h").unwrap().unwrap();
+        let notes: Vec<(String, &str, i64)> = parsed
+            .facts
+            .iter()
+            .filter(|f| f.kind == lge_core::fact::RATIONALE)
+            .map(|f| {
+                (
+                    parsed
+                        .symbols
+                        .iter()
+                        .find(|s| s.id == f.symbol_id)
+                        .unwrap()
+                        .qualified_name
+                        .clone(),
+                    f.key.as_str(),
+                    f.line,
+                )
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("svc.repo".to_string(), "NOTE: module-level reason", 1),
+                (
+                    "svc.repo.Repo.save".to_string(),
+                    "WHY: the unique index makes a second insert fail loudly",
+                    4
+                ),
+                ("svc.repo.Repo.save".to_string(), "HACK: until the driver is fixed", 5),
+            ]
+        );
+        let ts = b"/**\n * IMPORTANT: callers rely on the order of the result.\n */\nexport function list() {\n  // TODO: paginate\n  return [];\n}\n";
+        let parsed = parse_file("web/list.ts", "web", ts, "h").unwrap().unwrap();
+        let keys: Vec<&str> = parsed
+            .facts
+            .iter()
+            .filter(|f| f.kind == lge_core::fact::RATIONALE)
+            .map(|f| f.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["IMPORTANT: callers rely on the order of the result.", "TODO: paginate"]
+        );
+        assert_eq!(rationale_in("x = 'NOTE: in a string'", "#"), None);
+        assert_eq!(rationale_in("    #   note: lower case is prose", "#"), None);
+    }
 
     #[test]
     fn languages_come_from_the_extension() {
