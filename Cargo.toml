@@ -12,6 +12,7 @@ members = [
     "crates/lge-filter",
     "crates/lge-session",
     "crates/lge-mcp",
+    "crates/lge-proxy",
     "crates/lge-bench",
     "crates/lge-cli",
 ]

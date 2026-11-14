@@ -628,6 +628,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lge-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lge-core",
+ "lge-filter",
+ "lge-retrieve",
+ "lge-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "lge-resolve"
 version = "0.1.0"
 dependencies = [
