@@ -11,3 +11,8 @@ serde.workspace = true
 serde_json.workspace = true
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
+lge-retrieve = { path = "../lge-retrieve" }
+lge-memory = { path = "../lge-memory" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

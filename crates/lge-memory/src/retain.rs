@@ -50,7 +50,11 @@ pub struct Retained {
 }
 
 fn clean_tags(tags: &[String]) -> Vec<String> {
-    let set: BTreeSet<String> = tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect();
+    let set: BTreeSet<String> = tags
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     set.into_iter().collect()
 }
 
@@ -71,11 +75,20 @@ pub fn entity_links(store: &dyn GraphStore, text: &str) -> Result<Vec<String>> {
         }
         // Plain words are too often ordinary language: only shaped names
         // (snake_case, camelCase, dotted) link to symbols.
-        let shaped = name.contains('_') || name.contains('.') || name.chars().zip(name.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase());
+        let shaped = name.contains('_')
+            || name.contains('.')
+            || name
+                .chars()
+                .zip(name.chars().skip(1))
+                .any(|(a, b)| a.is_lowercase() && b.is_uppercase());
         if !shaped {
             continue;
         }
-        let hits: Vec<_> = store.find(&name)?.into_iter().filter(|h| h.kind != kind::MODULE && !h.is_test).collect();
+        let hits: Vec<_> = store
+            .find(&name)?
+            .into_iter()
+            .filter(|h| h.kind != kind::MODULE && !h.is_test)
+            .collect();
         if !hits.is_empty() && hits.len() <= MAX_LINKS_PER_NAME {
             links.extend(hits.into_iter().map(|h| h.id));
         }
@@ -92,7 +105,11 @@ pub fn retain(store: &dyn GraphStore, input: &RetainInput, now: i64) -> Result<R
     if text.chars().count() > MAX_FACT_CHARS {
         bail!("a fact is one statement of at most {MAX_FACT_CHARS} characters; split it or store a page");
     }
-    let fact_kind = if input.kind.is_empty() { memory_kind::WORLD } else { input.kind.as_str() };
+    let fact_kind = if input.kind.is_empty() {
+        memory_kind::WORLD
+    } else {
+        input.kind.as_str()
+    };
     if !memory_kind::ALL.contains(&fact_kind) {
         bail!("unknown kind `{fact_kind}`; use one of {}", memory_kind::ALL.join(", "));
     }
@@ -102,19 +119,35 @@ pub fn retain(store: &dyn GraphStore, input: &RetainInput, now: i64) -> Result<R
     let valid_at = input.valid_at.unwrap_or(now);
 
     // The same fact again: raise its proof count and keep the older record.
-    let same_key = if key.is_empty() { Vec::new() } else { store.memories_by_key(&key)? };
+    let same_key = if key.is_empty() {
+        Vec::new()
+    } else {
+        store.memories_by_key(&key)?
+    };
     let mut candidates: Vec<MemoryRec> = same_key.clone();
     candidates.extend(store.search_memories(&text, 20, false)?.into_iter().map(|(m, _)| m));
-    if let Some(existing) = candidates.iter().find(|m| m.kind == fact_kind && same_fact(&text, &m.text)) {
+    if let Some(existing) = candidates
+        .iter()
+        .find(|m| m.kind == fact_kind && same_fact(&text, &m.text))
+    {
         let mut updated = existing.clone();
         updated.proof_count = existing.proof_count.max(1) + 1;
         updated.tags = clean_tags(&[existing.tags.clone(), tags].concat());
-        updated.links = [existing.links.clone(), links].concat().into_iter().collect::<BTreeSet<_>>().into_iter().collect();
+        updated.links = [existing.links.clone(), links]
+            .concat()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         if updated.key.is_empty() {
             updated.key = key;
         }
         store.put_memory(&updated)?;
-        return Ok(Retained { id: updated.id.clone(), outcome: Outcome::Repeated, links: updated.links });
+        return Ok(Retained {
+            id: updated.id.clone(),
+            outcome: Outcome::Repeated,
+            links: updated.links,
+        });
     }
 
     // A different fact about the same thing: close the old ones, never delete.
@@ -142,6 +175,14 @@ pub fn retain(store: &dyn GraphStore, input: &RetainInput, now: i64) -> Result<R
         links,
     };
     store.put_memory(&rec)?;
-    let outcome = if replaced.is_empty() { Outcome::Stored } else { Outcome::Superseded(replaced) };
-    Ok(Retained { id, outcome, links: rec.links })
+    let outcome = if replaced.is_empty() {
+        Outcome::Stored
+    } else {
+        Outcome::Superseded(replaced)
+    };
+    Ok(Retained {
+        id,
+        outcome,
+        links: rec.links,
+    })
 }

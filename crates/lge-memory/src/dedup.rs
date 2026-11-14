@@ -69,17 +69,32 @@ mod tests {
 
     #[test]
     fn exact_after_normalization() {
-        assert!(same_fact("Tokens expire  after 15 minutes.", "tokens expire after 15 minutes"));
+        assert!(same_fact(
+            "Tokens expire  after 15 minutes.",
+            "tokens expire after 15 minutes"
+        ));
         assert_eq!(normalize("  A\tB\n c;  "), "a b c");
     }
 
     #[test]
     fn near_duplicates_match_and_different_facts_do_not() {
         let base = "The orders service publishes order.created to RabbitMQ after the row is committed";
-        assert!(same_fact(base, "The orders service publishes order.created to RabbitMQ after the row is committed."));
-        assert!(same_fact(base, "The orders service publishes order.created to RabbitMQ after the row is commited"));
-        assert!(!same_fact(base, "The orders service consumes order.created from RabbitMQ before the row is committed"));
-        assert!(!same_fact("Tokens expire after 15 minutes", "Tokens expire after 45 minutes"), "one changed number is a different fact");
+        assert!(same_fact(
+            base,
+            "The orders service publishes order.created to RabbitMQ after the row is committed."
+        ));
+        assert!(same_fact(
+            base,
+            "The orders service publishes order.created to RabbitMQ after the row is commited"
+        ));
+        assert!(!same_fact(
+            base,
+            "The orders service consumes order.created from RabbitMQ before the row is committed"
+        ));
+        assert!(
+            !same_fact("Tokens expire after 15 minutes", "Tokens expire after 45 minutes"),
+            "one changed number is a different fact"
+        );
         assert!(!same_fact(base, "Use pnpm, not npm, in web_gateway"));
     }
 

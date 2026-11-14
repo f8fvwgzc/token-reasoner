@@ -166,8 +166,11 @@ pub fn refresh_if_stale(
         return Ok(None);
     }
     let head = lge_index::git::head_commit(root).unwrap_or_default();
-    let mut dirty: Vec<(String, u64)> =
-        lge_index::git::changed_files(root).unwrap_or_default().into_iter().map(|p| (p.clone(), modified(&root.join(&p)))).collect();
+    let mut dirty: Vec<(String, u64)> = lge_index::git::changed_files(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.clone(), modified(&root.join(&p))))
+        .collect();
     dirty.sort();
     let first = state.checked.is_none();
     let same = !head.is_empty() && head == state.head && dirty == state.dirty;

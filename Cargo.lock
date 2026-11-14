@@ -596,9 +596,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lge-core",
+ "lge-memory",
+ "lge-retrieve",
  "lge-store",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

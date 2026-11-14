@@ -37,7 +37,13 @@ pub struct RecallOptions {
 
 impl Default for RecallOptions {
     fn default() -> Self {
-        RecallOptions { budget: 800, limit: 20, kinds: Vec::new(), tags: Vec::new(), now: 0 }
+        RecallOptions {
+            budget: 800,
+            limit: 20,
+            kinds: Vec::new(),
+            tags: Vec::new(),
+            now: 0,
+        }
     }
 }
 
@@ -103,7 +109,12 @@ pub fn date(unix: i64) -> String {
 }
 
 /// Facts relevant to `query`, best first, packed to the budget.
-pub fn recall(store: &dyn GraphStore, query: &str, opts: &RecallOptions, embedder: Option<&dyn Embedder>) -> Result<Recall> {
+pub fn recall(
+    store: &dyn GraphStore,
+    query: &str,
+    opts: &RecallOptions,
+    embedder: Option<&dyn Embedder>,
+) -> Result<Recall> {
     let wide = opts.limit.max(1) * 2;
     let mut by_id: HashMap<String, MemoryRec> = HashMap::new();
     let mut lists: Vec<(f64, Vec<String>)> = Vec::new();
@@ -116,20 +127,47 @@ pub fn recall(store: &dyn GraphStore, query: &str, opts: &RecallOptions, embedde
     };
 
     // Keyword arm.
-    arm(1.0, store.search_memories(query, wide, false)?.into_iter().map(|(m, _)| m).collect(), &mut by_id);
+    arm(
+        1.0,
+        store
+            .search_memories(query, wide, false)?
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect(),
+        &mut by_id,
+    );
 
     // Entity arm: facts that mention the code the query is about.
-    let seeds = find_seeds(store, query, &SeedOptions { max_seeds: 5, ..SeedOptions::default() })?;
+    let seeds = find_seeds(
+        store,
+        query,
+        &SeedOptions {
+            max_seeds: 5,
+            ..SeedOptions::default()
+        },
+    )?;
     let mut node_ids: Vec<String> = seeds.iter().map(|s| s.hit.id.clone()).collect();
     node_ids.extend(seeds.iter().map(|s| lge_core::file_id(&s.hit.file_path)));
     node_ids.sort();
     node_ids.dedup();
     if !node_ids.is_empty() {
-        arm(1.0, store.memories_mentioning(&node_ids, wide)?.into_iter().map(|(m, _)| m).collect(), &mut by_id);
+        arm(
+            1.0,
+            store
+                .memories_mentioning(&node_ids, wide)?
+                .into_iter()
+                .map(|(m, _)| m)
+                .collect(),
+            &mut by_id,
+        );
     }
 
     // Recent arm, at half weight: being new is not being relevant.
-    arm(0.5, store.recent_memories(None, &opts.tags, opts.limit.max(1))?, &mut by_id);
+    arm(
+        0.5,
+        store.recent_memories(None, &opts.tags, opts.limit.max(1))?,
+        &mut by_id,
+    );
 
     // Vector arm, when an embedder is plugged in and the table has vectors.
     if let Some(e) = embedder {
@@ -145,9 +183,14 @@ pub fn recall(store: &dyn GraphStore, query: &str, opts: &RecallOptions, embedde
     }
 
     let keep = |m: &MemoryRec| {
-        (opts.kinds.is_empty() || opts.kinds.contains(&m.kind)) && (opts.tags.is_empty() || m.tags.iter().any(|t| opts.tags.contains(t)))
+        (opts.kinds.is_empty() || opts.kinds.contains(&m.kind))
+            && (opts.tags.is_empty() || m.tags.iter().any(|t| opts.tags.contains(t)))
     };
-    let fused: Vec<MemoryRec> = rrf(&lists, RRF_K).into_iter().filter_map(|(id, _)| by_id.remove(&id)).filter(keep).collect();
+    let fused: Vec<MemoryRec> = rrf(&lists, RRF_K)
+        .into_iter()
+        .filter_map(|(id, _)| by_id.remove(&id))
+        .filter(keep)
+        .collect();
 
     // Rank-seeded score with small boosts, then the final order.
     let n = fused.len();
@@ -155,8 +198,14 @@ pub fn recall(store: &dyn GraphStore, query: &str, opts: &RecallOptions, embedde
         .into_iter()
         .enumerate()
         .map(|(rank, memory)| {
-            let base = if n > 1 { 1.0 - 0.9 * rank as f64 / (n - 1) as f64 } else { 1.0 };
-            let score = base * (1.0 + 0.2 * (recency(memory.valid_at, opts.now) - 0.5)) * (1.0 + 0.1 * (proof(memory.proof_count) - 0.5));
+            let base = if n > 1 {
+                1.0 - 0.9 * rank as f64 / (n - 1) as f64
+            } else {
+                1.0
+            };
+            let score = base
+                * (1.0 + 0.2 * (recency(memory.valid_at, opts.now) - 0.5))
+                * (1.0 + 0.1 * (proof(memory.proof_count) - 0.5));
             Recalled { memory, score }
         })
         .collect();
@@ -209,8 +258,16 @@ mod tests {
             proof_count: 3,
             ..MemoryRec::default()
         };
-        assert_eq!(fact_line(&m), "- [decision] Use pnpm in web_gateway (web_gateway.package-manager; 2026-11-12; x3)");
-        let bare = MemoryRec { kind: "world".into(), text: "t".into(), proof_count: 1, ..MemoryRec::default() };
+        assert_eq!(
+            fact_line(&m),
+            "- [decision] Use pnpm in web_gateway (web_gateway.package-manager; 2026-11-12; x3)"
+        );
+        let bare = MemoryRec {
+            kind: "world".into(),
+            text: "t".into(),
+            proof_count: 1,
+            ..MemoryRec::default()
+        };
         assert_eq!(fact_line(&bare), "- [world] t (1970-01-01)");
     }
 }

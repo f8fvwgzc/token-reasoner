@@ -46,7 +46,11 @@ fn render(title: &str, facts: &[MemoryRec]) -> String {
             out.push_str("## Other\n");
         }
         for m in list {
-            let seen = if m.proof_count > 1 { format!(", confirmed {} times", m.proof_count) } else { String::new() };
+            let seen = if m.proof_count > 1 {
+                format!(", confirmed {} times", m.proof_count)
+            } else {
+                String::new()
+            };
             out.push_str(&format!("- {} _(since {}{seen})_\n", m.text, date(m.valid_at)));
         }
         out.push('\n');
@@ -95,7 +99,12 @@ pub fn refresh_pages(store: &dyn GraphStore, now: i64) -> Result<Vec<String>> {
 
 /// A page as a markdown file with YAML front matter.
 pub fn to_markdown(page: &PageRec) -> String {
-    let tags = page.tags.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(", ");
+    let tags = page
+        .tags
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "---\ntitle: \"{}\"\nslug: {}\nkind: {}\ntags: [{}]\nupdated: {}\n---\n\n{}",
         page.title.replace('"', "'"),
@@ -115,7 +124,12 @@ pub fn export_pages(store: &dyn GraphStore, dir: &Path) -> Result<usize> {
     let mut written = 0;
     for page in store.list_pages()? {
         // A slug is a file name: anything else stays in the database only.
-        if page.slug.is_empty() || !page.slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if page.slug.is_empty()
+            || !page
+                .slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
             continue;
         }
         let path = dir.join(format!("{}.md", page.slug));
@@ -141,7 +155,11 @@ pub struct PageHit {
 /// The stretch of `body` around the first word of `query` found in it.
 pub fn snippet(body: &str, query: &str, max_chars: usize) -> String {
     let lower = body.to_lowercase();
-    let at = lge_core::split_words(query).iter().filter_map(|w| lower.find(w.as_str())).min().unwrap_or(0);
+    let at = lge_core::split_words(query)
+        .iter()
+        .filter_map(|w| lower.find(w.as_str()))
+        .min()
+        .unwrap_or(0);
     // Start at the beginning of the line that holds the match.
     let mut start = lower[..at.min(lower.len())].rfind('\n').map(|i| i + 1).unwrap_or(0);
     while !body.is_char_boundary(start) {
@@ -163,7 +181,12 @@ pub fn search_pages(store: &dyn GraphStore, query: &str, limit: usize) -> Result
     Ok(store
         .search_pages(query, limit)?
         .into_iter()
-        .map(|(p, score)| PageHit { snippet: snippet(&p.body, query, SNIPPET_CHARS), slug: p.slug, title: p.title, score })
+        .map(|(p, score)| PageHit {
+            snippet: snippet(&p.body, query, SNIPPET_CHARS),
+            slug: p.slug,
+            title: p.title,
+            score,
+        })
         .collect())
 }
 
@@ -172,7 +195,14 @@ mod tests {
     use super::*;
 
     fn fact(text: &str, key: &str, valid_at: i64, proof_count: i64) -> MemoryRec {
-        MemoryRec { id: text.to_string(), text: text.to_string(), key: key.to_string(), valid_at, proof_count, ..MemoryRec::default() }
+        MemoryRec {
+            id: text.to_string(),
+            text: text.to_string(),
+            key: key.to_string(),
+            valid_at,
+            proof_count,
+            ..MemoryRec::default()
+        }
     }
 
     #[test]
@@ -180,7 +210,12 @@ mod tests {
         let facts = [
             fact("Use pnpm, not npm", "web_gateway.package-manager", 1_794_441_600, 3),
             fact("Handlers stay thin; logic lives in services", "", 1_794_355_200, 1),
-            fact("Routes are registered in src/routes.ts", "web_gateway.routes", 1_794_528_000, 1),
+            fact(
+                "Routes are registered in src/routes.ts",
+                "web_gateway.routes",
+                1_794_528_000,
+                1,
+            ),
         ];
         let body = render("Conventions", &facts);
         assert_eq!(
@@ -197,8 +232,12 @@ mod tests {
 
     #[test]
     fn snippets_start_at_the_matching_line() {
-        let body = "# Decisions\n\n## auth\n- Tokens expire after 15 minutes _(since 2026-11-12)_\n- Refresh tokens rotate\n";
-        assert_eq!(snippet(body, "token expiry", 40), "- Tokens expire after 15 minutes _(since ...");
+        let body =
+            "# Decisions\n\n## auth\n- Tokens expire after 15 minutes _(since 2026-11-12)_\n- Refresh tokens rotate\n";
+        assert_eq!(
+            snippet(body, "token expiry", 40),
+            "- Tokens expire after 15 minutes _(since ..."
+        );
         assert_eq!(snippet(body, "nothing matches", 12), "# Decisions ...");
         assert_eq!(snippet("ünï ß short", "ß", 280), "ünï ß short");
         assert_eq!(snippet("", "x", 10), "");

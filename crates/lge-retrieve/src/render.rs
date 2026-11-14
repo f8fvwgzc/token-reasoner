@@ -16,7 +16,11 @@ struct Out {
 
 impl Out {
     fn new(budget_tokens: usize, title: &str) -> Out {
-        let mut out = Out { text: String::new(), budget: Budget::new(budget_tokens), dropped: 0 };
+        let mut out = Out {
+            text: String::new(),
+            budget: Budget::new(budget_tokens),
+            dropped: 0,
+        };
         // Kept back for the "not shown" notice and the commit line.
         out.budget.force(40usize.min(budget_tokens / 4));
         out.force(title);
@@ -70,7 +74,12 @@ fn describe(n: &NodeRec, full: bool) -> String {
 }
 
 fn reached_line(r: &Reached, full: bool) -> String {
-    format!("hop {}  {}{}", r.hops, describe(&r.node, full), provenance(&r.method, r.confidence))
+    format!(
+        "hop {}  {}{}",
+        r.hops,
+        describe(&r.node, full),
+        provenance(&r.method, r.confidence)
+    )
 }
 
 fn site(e: &EdgeRec) -> String {
@@ -83,7 +92,17 @@ fn site(e: &EdgeRec) -> String {
 
 /// Who is affected by a change, nearest first, tests and resources apart.
 pub fn render_impact(i: &Impact, commit: &str, budget_tokens: usize) -> String {
-    let targets: Vec<&str> = i.targets.iter().map(|n| if n.qualified_name.is_empty() { n.name.as_str() } else { n.qualified_name.as_str() }).collect();
+    let targets: Vec<&str> = i
+        .targets
+        .iter()
+        .map(|n| {
+            if n.qualified_name.is_empty() {
+                n.name.as_str()
+            } else {
+                n.qualified_name.as_str()
+            }
+        })
+        .collect();
     let mut out = Out::new(budget_tokens, &format!("# Impact of changing {}", targets.join(", ")));
     out.force(&format!(
         "{} symbol(s) affected in {} file(s), {} service(s); {} test(s).",
@@ -98,9 +117,30 @@ pub fn render_impact(i: &Impact, commit: &str, budget_tokens: usize) -> String {
             i.unresolved_edges, i.inferred_paths
         ));
     }
-    out.section("## Affected code", i.affected.iter().map(|r| format!("{}{}", reached_line(r, r.hops == 1), if r.hops == 1 { site(&r.via) } else { String::new() })).collect());
-    out.section("## Tests to run", i.tests.iter().map(|r| reached_line(r, false)).collect());
-    let resources: Vec<String> = i.endpoints.iter().chain(&i.tables).chain(&i.queues).map(|r| reached_line(r, false)).collect();
+    out.section(
+        "## Affected code",
+        i.affected
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}{}",
+                    reached_line(r, r.hops == 1),
+                    if r.hops == 1 { site(&r.via) } else { String::new() }
+                )
+            })
+            .collect(),
+    );
+    out.section(
+        "## Tests to run",
+        i.tests.iter().map(|r| reached_line(r, false)).collect(),
+    );
+    let resources: Vec<String> = i
+        .endpoints
+        .iter()
+        .chain(&i.tables)
+        .chain(&i.queues)
+        .map(|r| reached_line(r, false))
+        .collect();
     out.section("## APIs, tables and queues", resources);
     if !i.services.is_empty() {
         out.line(&format!("services: {}", i.services.join(", ")));
@@ -113,8 +153,15 @@ pub fn render_impact(i: &Impact, commit: &str, budget_tokens: usize) -> String {
 
 /// The execution flow from or to a symbol, one step per line with its call site.
 pub fn render_trace(t: &Trace, commit: &str, budget_tokens: usize) -> String {
-    let direction = if t.downstream { "what runs after" } else { "what leads to" };
-    let mut out = Out::new(budget_tokens, &format!("# Flow: {direction} {}", describe(&t.root, false)));
+    let direction = if t.downstream {
+        "what runs after"
+    } else {
+        "what leads to"
+    };
+    let mut out = Out::new(
+        budget_tokens,
+        &format!("# Flow: {direction} {}", describe(&t.root, false)),
+    );
     if t.steps.is_empty() {
         out.force("No steps found in the graph.");
     }
@@ -122,7 +169,11 @@ pub fn render_trace(t: &Trace, commit: &str, budget_tokens: usize) -> String {
         out.line(&format!("{}{}", reached_line(r, false), site(&r.via)));
     }
     for e in &t.unresolved {
-        out.line(&format!("unresolved: {} (several candidates){}", e.to.strip_prefix("unresolved:").unwrap_or(&e.to), site(e)));
+        out.line(&format!(
+            "unresolved: {} (several candidates){}",
+            e.to.strip_prefix("unresolved:").unwrap_or(&e.to),
+            site(e)
+        ));
     }
     if t.truncated {
         out.line("The walk stopped at the node limit.");
@@ -133,7 +184,15 @@ pub fn render_trace(t: &Trace, commit: &str, budget_tokens: usize) -> String {
 /// One-hop neighbours in both directions with the edge type and provenance.
 pub fn render_deps(d: &Deps, commit: &str, budget_tokens: usize) -> String {
     let mut out = Out::new(budget_tokens, &format!("# Dependencies of {}", describe(&d.node, true)));
-    let line = |(e, n): &(EdgeRec, NodeRec)| format!("{}  {}{}{}", e.edge_type, describe(n, false), provenance(&e.method, e.confidence), site(e));
+    let line = |(e, n): &(EdgeRec, NodeRec)| {
+        format!(
+            "{}  {}{}{}",
+            e.edge_type,
+            describe(n, false),
+            provenance(&e.method, e.confidence),
+            site(e)
+        )
+    };
     out.section("## Uses", d.uses.iter().map(line).collect());
     out.section("## Used by", d.used_by.iter().map(line).collect());
     if d.uses.is_empty() && d.used_by.is_empty() {
