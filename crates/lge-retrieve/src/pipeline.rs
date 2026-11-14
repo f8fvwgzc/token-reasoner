@@ -35,6 +35,9 @@ pub struct IndexReport {
     pub failed: Vec<(String, String)>,
     /// Edge counts of the resolve step; `None` when nothing changed.
     pub stats: Option<EdgeStats>,
+    /// Derived views (rank, communities, generated pages) that could not be
+    /// refreshed. The graph itself is complete; these catch up on the next run.
+    pub warnings: Vec<String>,
     /// HEAD of the repository, "" outside git.
     pub commit: String,
     pub seconds: f64,
@@ -113,6 +116,10 @@ fn index_inner(store: &dyn GraphStore, root: &Path, opts: &IndexOptions, now: i6
 
     if report.indexed + report.removed > 0 || opts.force_resolve {
         report.stats = Some(resolve_edges(store, &commit, now)?);
+        // Derived state may lag: a failure here must not fail the index run.
+        if let Err(e) = crate::report::refresh_graph_views(store, now) {
+            report.warnings.push(format!("graph views not refreshed: {e}"));
+        }
     }
     Ok(report)
 }

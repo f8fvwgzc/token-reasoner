@@ -13,6 +13,7 @@ lge-core = { path = "../lge-core" }
 lge-index = { path = "../lge-index" }
 lge-resolve = { path = "../lge-resolve" }
 lge-store = { path = "../lge-store" }
+tiktoken-rs = "0.12.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

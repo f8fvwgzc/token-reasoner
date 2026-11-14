@@ -1,24 +1,27 @@
-//! Reasoning router v0.
+//! Reasoning router v1.
 //!
 //! Chooses the reasoning level for a task from the graph before the session
-//! starts: one file = low, several files = medium, cross-service = top.
-//! v0 uses search seeds plus reverse call traversal. v1 (phase 2) will use
-//! the full change-impact result including API, database and queue edges.
+//! starts, from the full change impact of the task's seed symbols: one file =
+//! low, several files in one service = medium, more than one service = top.
+//!
+//! The router only recommends. Whether the recommendation is applied is the
+//! session's decision: in fixed mode (the default) the session keeps the user's
+//! reasoning level and logs what the router would have chosen.
 
 use anyhow::Result;
 use lge_core::Hit;
 pub use lge_core::Level;
+use lge_retrieve::{find_seeds, impact, SeedOptions, WalkOptions};
 use lge_store::GraphStore;
 use serde::Serialize;
-use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    /// How many search hits are treated as the place the change starts.
+    /// How many symbols are treated as the place the change starts.
     pub max_seeds: usize,
-    /// Reverse traversal depth for callers.
+    /// How far the change impact is followed.
     pub depth: u8,
-    /// Seeds scoring below this share of the best seed are dropped.
+    /// Search hits scoring below this share of the best hit are not seeds.
     pub seed_score_ratio: f64,
 }
 
@@ -32,7 +35,7 @@ impl Default for RouterConfig {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Route {
     pub level: Level,
     pub reason: String,
@@ -42,65 +45,104 @@ pub struct Route {
     pub services: Vec<String>,
     /// Tests that reach the seeds; run these locally after the change.
     pub tests: Vec<String>,
+    /// Endpoints, tables and queues the change reaches.
+    pub resources: Vec<String>,
+    /// Places around the seeds where the graph has several candidates and no target.
     pub unresolved_edges: i64,
+    /// Affected symbols that are only reached through a name match.
+    pub inferred_paths: usize,
+}
+
+fn one_up(level: Level) -> Level {
+    level.escalate().unwrap_or(Level::Top)
 }
 
 pub fn route(store: &dyn GraphStore, task: &str, cfg: &RouterConfig) -> Result<Route> {
-    let mut seeds = store.search(task, cfg.max_seeds * 3)?;
-    seeds.retain(|h| !h.is_test);
-    if let Some(best) = seeds.first().map(|h| h.score) {
-        seeds.retain(|h| h.score >= best * cfg.seed_score_ratio);
+    let seed_opts = SeedOptions {
+        max_seeds: cfg.max_seeds,
+        score_ratio: cfg.seed_score_ratio,
+        ..SeedOptions::default()
+    };
+    let seeds: Vec<Hit> = find_seeds(store, task, &seed_opts)?
+        .into_iter()
+        .map(|s| s.hit)
+        .filter(|h| !h.is_test)
+        .collect();
+    if seeds.is_empty() {
+        return Ok(Route {
+            level: Level::Top,
+            reason: "no matching symbols in the graph; cannot bound the change".to_string(),
+            seeds,
+            files: Vec::new(),
+            services: Vec::new(),
+            tests: Vec::new(),
+            resources: Vec::new(),
+            unresolved_edges: 0,
+            inferred_paths: 0,
+        });
     }
-    seeds.truncate(cfg.max_seeds);
+    let ids: Vec<String> = seeds.iter().map(|h| h.id.clone()).collect();
+    let found = impact(
+        store,
+        &ids,
+        &WalkOptions {
+            depth: cfg.depth,
+            ..WalkOptions::default()
+        },
+    )?;
 
-    let mut files = BTreeSet::new();
-    let mut services = BTreeSet::new();
-    let mut tests = BTreeSet::new();
-    let mut unresolved = 0;
-    for seed in &seeds {
-        files.insert(seed.file_path.clone());
-        services.insert(seed.service.clone());
-        unresolved += store.unresolved_out(&seed.id)?;
-        for c in store.callers(&seed.id, cfg.depth)? {
-            if c.is_test {
-                tests.insert(c.qualified_name);
-            } else {
-                files.insert(c.file_path);
-                services.insert(c.service);
-            }
-        }
-    }
-
-    let (level, reason) = if seeds.is_empty() {
-        (
-            Level::Top,
-            "no matching symbols in the graph; cannot bound the change".to_string(),
-        )
-    } else if services.len() > 1 {
-        (Level::Top, format!("change reaches {} services", services.len()))
-    } else if unresolved > 0 {
-        // Safety rule: when the graph is unsure around the seeds, go one level up.
-        let base = if files.len() > 1 { Level::Top } else { Level::Medium };
-        (
-            base,
-            format!(
-                "{} file(s), raised one level because {unresolved} call(s) near the seeds are unresolved",
-                files.len()
-            ),
-        )
-    } else if files.len() > 1 {
-        (Level::Medium, format!("{} files in one service", files.len()))
+    let (files, services) = (found.files.len(), found.services.len());
+    let (level, reason) = if services > 1 {
+        (Level::Top, format!("change reaches {services} services"))
     } else {
-        (Level::Low, "one file".to_string())
+        let (base, what) = if files > 1 {
+            (Level::Medium, format!("{files} files in one service"))
+        } else {
+            (Level::Low, "one file".to_string())
+        };
+        // Safety rule: when the graph is unsure around the seeds, go one level up.
+        if found.unresolved_edges > 0 {
+            (
+                one_up(base),
+                format!(
+                    "{what}, raised one level because {} edge(s) near the seeds are unresolved",
+                    found.unresolved_edges
+                ),
+            )
+        } else if found.inferred_paths > 0 {
+            (
+                one_up(base),
+                format!(
+                    "{what}, raised one level because {} affected symbol(s) are only inferred",
+                    found.inferred_paths
+                ),
+            )
+        } else if found.truncated {
+            (
+                one_up(base),
+                format!("{what}, raised one level because the impact was cut at the node limit"),
+            )
+        } else {
+            (base, what)
+        }
     };
 
+    let mut resources: Vec<String> = found
+        .endpoints
+        .iter()
+        .map(|r| format!("endpoint {}", r.node.name))
+        .collect();
+    resources.extend(found.tables.iter().map(|r| format!("table {}", r.node.name)));
+    resources.extend(found.queues.iter().map(|r| format!("queue {}", r.node.name)));
     Ok(Route {
         level,
         reason,
         seeds,
-        files: files.into_iter().collect(),
-        services: services.into_iter().collect(),
-        tests: tests.into_iter().collect(),
-        unresolved_edges: unresolved,
+        files: found.files,
+        services: found.services,
+        tests: found.tests.into_iter().map(|r| r.node.qualified_name).collect(),
+        resources,
+        unresolved_edges: found.unresolved_edges,
+        inferred_paths: found.inferred_paths,
     })
 }

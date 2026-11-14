@@ -101,3 +101,39 @@ fn graph_impact_and_routing() {
     assert_eq!((again.indexed, again.unchanged, again.removed), (0, 8, 0));
     assert_eq!(before, store.stats().unwrap());
 }
+
+#[test]
+fn routing_uses_the_full_change_impact() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/polyglot");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("graph.lbug")).unwrap();
+    lge_retrieve::index_repo(&store, &root, &lge_retrieve::IndexOptions::default()).unwrap();
+    let cfg = RouterConfig::default();
+
+    // The handler is called from another service through its endpoint.
+    let r = route(&store, "create_order must validate the payload", &cfg).unwrap();
+    assert_eq!(r.level, Level::Top, "{r:?}");
+    assert_eq!(r.services, ["orders_api", "web_gateway"]);
+    assert!(r.resources.contains(&"endpoint POST /orders".to_string()), "{r:?}");
+    assert!(
+        r.tests
+            .contains(&"orders_api.tests.test_routes.test_create_order".to_string()),
+        "{r:?}"
+    );
+
+    // One file, but a call from it has several candidates: one level up.
+    let r = route(&store, "handleOrderCreated should retry the email", &cfg).unwrap();
+    assert!(r.unresolved_edges > 0 && r.level != Level::Low, "{r:?}");
+    assert!(r.reason.contains("unresolved"), "{}", r.reason);
+
+    // Used from one other file of the same service; every edge is verified.
+    let r = route(&store, "find_order should return None for a missing row", &cfg).unwrap();
+    assert_eq!(
+        (r.level, r.files.as_slice()),
+        (
+            Level::Medium,
+            ["orders_api/repo.py".to_string(), "orders_api/routes.py".to_string()].as_slice()
+        ),
+        "{r:?}"
+    );
+}
