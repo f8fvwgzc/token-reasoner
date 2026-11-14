@@ -8,7 +8,8 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# preserve_order: a body that is parsed and written back keeps its key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
 lge-retrieve = { path = "../lge-retrieve" }

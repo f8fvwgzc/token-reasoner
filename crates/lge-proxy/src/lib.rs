@@ -2,4 +2,6 @@
 //! provider that uses the code graph to send fewer tokens for the same work.
 
 pub mod command;
+pub mod responses;
+pub mod session;
 pub mod shorten;
