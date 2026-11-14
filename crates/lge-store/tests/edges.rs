@@ -911,8 +911,9 @@ fn stats_keep_the_old_labels_first() {
         ]
     );
     // After them, one line per other edge type and method that occurs, in edge type order.
+    let remembered = labels.len() - 3;
     assert_eq!(
-        labels[12..],
+        labels[12..remembered],
         [
             "inherits_static",
             "implements_static",
@@ -930,7 +931,16 @@ fn stats_keep_the_old_labels_first() {
             "depends_on_inferred"
         ]
     );
-    assert!(stats[12..].iter().all(|(_, n)| *n > 0));
+    assert!(stats[12..remembered].iter().all(|(_, n)| *n > 0));
+    // Last, what is remembered: nothing yet.
+    assert_eq!(
+        stats[remembered..],
+        [
+            ("memories".to_string(), 0),
+            ("memories_expired".to_string(), 0),
+            ("pages".to_string(), 0)
+        ]
+    );
 
     let get: BTreeMap<&str, i64> = stats.iter().map(|(l, n)| (l.as_str(), *n)).collect();
     assert_eq!(get["files"], fx.files.len() as i64);

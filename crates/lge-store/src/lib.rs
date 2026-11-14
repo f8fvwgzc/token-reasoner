@@ -3,14 +3,18 @@
 
 mod graph_store;
 mod index;
+mod memory;
 mod meta;
+mod metrics;
 mod nodes;
+mod pages;
 mod resolved;
 mod schema;
 mod search;
 mod traverse;
 mod usage;
 mod values;
+mod vectors;
 
 pub use graph_store::GraphStore;
 pub use schema::SCHEMA_VERSION;
@@ -19,8 +23,8 @@ pub use search::tokens;
 use anyhow::{bail, Context, Result};
 use lbug::{Connection, Database, SystemConfig};
 use lge_core::{
-    Direction, EdgeRec, EdgeType, FileInfo, HandoffNote, Hit, IndexRun, NodeLabel, NodeRec, ParsedFile, ResolveInput,
-    Resolved, UsageRecord,
+    Direction, EdgeRec, EdgeType, FactSite, FileInfo, HandoffNote, Hit, IndexRun, MemoryRec, NodeLabel, NodeRec,
+    PageRec, ParsedFile, ResolveInput, Resolved, SymbolMetrics, UsageRecord, VectorTable,
 };
 use resolved::EdgeLoad;
 use std::collections::{BTreeSet, HashMap};
@@ -97,10 +101,12 @@ pub struct LadybugStore {
     skipped_edges: AtomicUsize,
     /// Why the last `replace_edges` call could not load its edges in bulk, if it could not.
     bulk_load_error: Mutex<Option<String>>,
-    /// True when the database has a full-text index but the extension that
-    /// maintains it is not loaded. LadybugDB then refuses every change to the
-    /// Symbol table; the store refuses first, in words that say what to do.
-    index_needs_fts: AtomicBool,
+    /// Tables that have a full-text index while the extension that maintains
+    /// it is not loaded. LadybugDB then refuses to add or delete their rows
+    /// and to change an indexed column; the store refuses first, in words
+    /// that say what to do. Columns outside the index (metrics, embeddings)
+    /// are still written.
+    frozen: Mutex<BTreeSet<String>>,
     /// Declared after `db`, so the file is released only once the database is closed.
     _claim: FileClaim,
 }
@@ -146,7 +152,7 @@ impl LadybugStore {
             write: Mutex::new(()),
             skipped_edges: AtomicUsize::new(0),
             bulk_load_error: Mutex::new(None),
-            index_needs_fts: AtomicBool::new(false),
+            frozen: Mutex::new(BTreeSet::new()),
             _claim: claim,
         };
         {
@@ -157,23 +163,41 @@ impl LadybugStore {
             let fts = load_fts && conn.query("LOAD fts;").is_ok();
             schema::prepare(&conn, fts)?;
             if fts {
-                search::ensure_fts_index(&conn)?;
-            } else if !schema::fts_indexes(&conn)?.is_empty() {
-                store.index_needs_fts.store(true, Ordering::Relaxed);
+                schema::ensure_fts_indexes(&conn)?;
+            } else {
+                let indexed = schema::fts_indexes(&conn)?;
+                store.frozen().extend(indexed.into_iter().map(|(table, _, _)| table));
             }
             store.fts.store(fts, Ordering::Relaxed);
         }
         Ok(store)
     }
 
-    /// Fail before a transaction starts when the Symbol table cannot be changed.
-    fn check_symbols_writable(&self) -> Result<()> {
-        if self.index_needs_fts.load(Ordering::Relaxed) {
+    fn frozen(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        // The set is only added to or cleared, so a thread that panicked left it whole.
+        self.frozen.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Fail before a transaction starts when the rows of an indexed table
+    /// cannot be added, deleted or re-worded in this process.
+    fn check_writable(&self, index: &schema::FtsIndex) -> Result<()> {
+        if self.frozen().contains(index.table) {
             bail!(
-                "this database has a full-text index, but the fts extension is not loaded in this process, so its \
-                 symbols cannot be changed; install the extension with `lge setup` (a program must be linked with \
-                 -rdynamic to load it) or index into a new database"
+                "the {} table of this database has a full-text index, but the fts extension is not loaded in this \
+                 process, so its rows cannot be changed; install the extension with `lge setup` (a program must be \
+                 linked with -rdynamic to load it) or use a new database",
+                index.table
             );
+        }
+        Ok(())
+    }
+
+    /// Build the full-text index of a table that was just written to, unless
+    /// it is there. An index is not built for an empty table (see
+    /// [`schema::ensure_fts_indexes`]), so the first write builds it.
+    fn index_table(&self, index: &schema::FtsIndex) -> Result<()> {
+        if self.fts_enabled() {
+            self.write(|conn| schema::ensure_fts_index(conn, index))?;
         }
         Ok(())
     }
@@ -237,7 +261,7 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_file(&self, path: &str) -> Result<()> {
-        self.check_symbols_writable()?;
+        self.check_writable(&schema::SYMBOL_FTS)?;
         self.write_txn(|conn| index::delete_file(conn, path, None))
     }
 
@@ -248,12 +272,15 @@ impl GraphStore for LadybugStore {
     /// Same rows as the per-file path, with fewer commits: files are written
     /// in batches, one transaction per batch.
     fn insert_parsed_bulk(&self, parsed: &[ParsedFile], commit: &str, now: i64) -> Result<()> {
-        self.check_symbols_writable()?;
+        self.check_writable(&schema::SYMBOL_FTS)?;
         for batch in parsed.chunks(index::BULK_BATCH) {
             self.write_txn(|conn| {
                 let mut writer = index::FileWriter::new(conn, commit, now)?;
                 batch.iter().try_for_each(|p| writer.write(p))
             })?;
+        }
+        if parsed.iter().any(|p| !p.symbols.is_empty()) {
+            self.index_table(&schema::SYMBOL_FTS)?;
         }
         Ok(())
     }
@@ -263,8 +290,16 @@ impl GraphStore for LadybugStore {
     }
 
     fn replace_edges(&self, resolved: &Resolved, commit: &str, now: i64) -> Result<()> {
-        self.check_symbols_writable()?;
-        let write = |load| self.write_txn(|conn| resolved::replace(conn, resolved, commit, now, load));
+        self.check_writable(&schema::SYMBOL_FTS)?;
+        let write = |load| {
+            self.write_txn(|conn| {
+                let skipped = resolved::replace(conn, resolved, commit, now, load)?;
+                // The files that were re-indexed have their symbols again:
+                // the facts that mention them are linked back.
+                memory::restore_mentions(conn)?;
+                Ok(skipped)
+            })
+        };
         let mut bulk_error = None;
         let skipped = match write(EdgeLoad::Bulk) {
             Ok(skipped) => skipped,
@@ -283,7 +318,7 @@ impl GraphStore for LadybugStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = bulk_error;
         self.skipped_edges.store(skipped, Ordering::Relaxed);
         if self.fts_enabled() {
-            self.write(search::ensure_fts_index)?;
+            self.write(schema::ensure_fts_indexes)?;
         }
         Ok(())
     }
@@ -316,15 +351,15 @@ impl GraphStore for LadybugStore {
         self.write(|conn| {
             values::run(conn, "INSTALL fts;")?;
             values::run(conn, "LOAD fts;")?;
-            search::ensure_fts_index(conn)
+            schema::ensure_fts_indexes(conn)
         })?;
         self.fts.store(true, Ordering::Relaxed);
-        self.index_needs_fts.store(false, Ordering::Relaxed);
+        self.frozen().clear();
         Ok(())
     }
 
     fn search(&self, text: &str, limit: usize) -> Result<Vec<Hit>> {
-        search::search(&self.conn()?, self.fts_enabled(), text, limit)
+        self.search_in(text, None, limit)
     }
 
     fn find(&self, needle: &str) -> Result<Vec<Hit>> {
@@ -386,5 +421,115 @@ impl GraphStore for LadybugStore {
 
     fn latest_handoffs(&self, limit: usize) -> Result<Vec<HandoffNote>> {
         usage::latest_handoffs(&self.conn()?, limit)
+    }
+
+    fn search_in(&self, text: &str, service: Option<&str>, limit: usize) -> Result<Vec<Hit>> {
+        search::search_in(&self.conn()?, self.fts_enabled(), text, service, limit)
+    }
+
+    fn reach(
+        &self,
+        ids: &[String],
+        types: &[EdgeType],
+        dir: Direction,
+        depth: u8,
+        limit: usize,
+    ) -> Result<Vec<(NodeRec, u8)>> {
+        traverse::reach(&self.conn()?, ids, types, dir, depth, limit)
+    }
+
+    fn shortest_path(&self, from: &str, to: &str, types: &[EdgeType], max_depth: u8) -> Result<Option<Vec<EdgeRec>>> {
+        traverse::shortest_path(&self.conn()?, from, to, types, max_depth)
+    }
+
+    fn symbol_graph(&self) -> Result<Vec<(String, String, EdgeType, f64)>> {
+        traverse::symbol_graph(&self.conn()?)
+    }
+
+    fn set_metrics(&self, metrics: &[SymbolMetrics]) -> Result<()> {
+        self.write_txn(|conn| metrics::set_metrics(conn, metrics))
+    }
+
+    fn metrics(&self, ids: &[String]) -> Result<Vec<SymbolMetrics>> {
+        metrics::metrics(&self.conn()?, ids)
+    }
+
+    fn top_ranked(&self, service: Option<&str>, community: Option<i64>, limit: usize) -> Result<Vec<Hit>> {
+        metrics::top_ranked(&self.conn()?, service, community, limit)
+    }
+
+    fn facts_of(&self, symbol_ids: &[String], kind: &str) -> Result<Vec<FactSite>> {
+        index::facts_of(&self.conn()?, symbol_ids, kind)
+    }
+
+    fn put_memory(&self, m: &MemoryRec) -> Result<()> {
+        self.check_writable(&schema::MEMORY_FTS)?;
+        self.write_txn(|conn| memory::put(conn, m))?;
+        self.index_table(&schema::MEMORY_FTS)
+    }
+
+    fn get_memories(&self, ids: &[String]) -> Result<Vec<MemoryRec>> {
+        memory::get(&self.conn()?, ids)
+    }
+
+    fn search_memories(&self, text: &str, limit: usize, include_expired: bool) -> Result<Vec<(MemoryRec, f64)>> {
+        memory::search(&self.conn()?, self.fts_enabled(), text, limit, include_expired)
+    }
+
+    fn memories_mentioning(&self, node_ids: &[String], limit: usize) -> Result<Vec<(MemoryRec, i64)>> {
+        memory::mentioning(&self.conn()?, node_ids, limit)
+    }
+
+    fn recent_memories(&self, kind: Option<&str>, tags: &[String], limit: usize) -> Result<Vec<MemoryRec>> {
+        memory::recent(&self.conn()?, kind, tags, limit)
+    }
+
+    fn memories_by_key(&self, key: &str) -> Result<Vec<MemoryRec>> {
+        memory::by_key(&self.conn()?, key)
+    }
+
+    fn memory_counts(&self) -> Result<(i64, i64)> {
+        memory::counts(&self.conn()?)
+    }
+
+    fn put_page(&self, page: &PageRec) -> Result<()> {
+        self.check_writable(&schema::PAGE_FTS)?;
+        self.write(|conn| pages::put(conn, page))?;
+        self.index_table(&schema::PAGE_FTS)
+    }
+
+    fn get_page(&self, slug: &str) -> Result<Option<PageRec>> {
+        pages::get(&self.conn()?, slug)
+    }
+
+    fn list_pages(&self) -> Result<Vec<PageRec>> {
+        pages::list(&self.conn()?)
+    }
+
+    fn search_pages(&self, text: &str, limit: usize) -> Result<Vec<(PageRec, f64)>> {
+        pages::search(&self.conn()?, self.fts_enabled(), text, limit)
+    }
+
+    fn delete_page(&self, slug: &str) -> Result<()> {
+        self.check_writable(&schema::PAGE_FTS)?;
+        self.write(|conn| pages::delete(conn, slug))
+    }
+
+    fn set_embeddings(&self, table: VectorTable, items: &[(String, Vec<f32>)]) -> Result<()> {
+        self.write_txn(|conn| vectors::set_embeddings(conn, table, items))
+    }
+
+    fn missing_embeddings(&self, table: VectorTable, limit: usize) -> Result<Vec<(String, String)>> {
+        vectors::missing(&self.conn()?, table, limit)
+    }
+
+    fn vector_search(
+        &self,
+        table: VectorTable,
+        query: &[f32],
+        limit: usize,
+        min_similarity: f64,
+    ) -> Result<Vec<(String, f64)>> {
+        vectors::search(&self.conn()?, table, query, limit, min_similarity)
     }
 }

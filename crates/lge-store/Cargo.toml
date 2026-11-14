@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 lbug.workspace = true
 lge-core = { path = "../lge-core" }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -1,11 +1,36 @@
 //! What the indexer writes and the resolver reads: files, symbols and the
 //! staged call, import and fact sites.
 
-use crate::values::{col_b, col_i, col_s, count, int, rows, st, Prepared};
+use crate::nodes::{distinct, ID_CHUNK};
+use crate::values::{col_b, col_i, col_s, count, int, rows, st, strings, Prepared, Row};
 use anyhow::{anyhow, Result};
 use lbug::{Connection, Value};
-use lge_core::{service_id, CallSite, FactSite, FileInfo, FileRec, ImportSite, ParsedFile, ResolveInput, SymbolRec};
+use lge_core::{
+    fact, service_id, CallSite, FactSite, FileInfo, FileRec, ImportSite, ParsedFile, ResolveInput, SymbolRec,
+};
 use std::collections::{HashMap, HashSet};
+
+/// Columns of a fact site, in the order [`fact_site`] expects them.
+const FACT_COLS: &str = "x.id, x.symbol_id, x.file_path, x.kind, x.key, x.detail, x.line, x.end_line, x.literal";
+
+fn fact_site(r: &Row) -> FactSite {
+    FactSite {
+        id: col_s(r, 0),
+        symbol_id: col_s(r, 1),
+        file_path: col_s(r, 2),
+        kind: col_s(r, 3),
+        key: col_s(r, 4),
+        detail: col_s(r, 5),
+        line: col_i(r, 6),
+        end_line: col_i(r, 7),
+        literal: col_b(r, 8),
+    }
+}
+
+/// Source order: by file, then line, with the id as the last word so the order is total.
+fn sort_facts(facts: &mut [FactSite]) {
+    facts.sort_by(|a, b| (&a.file_path, a.line, &a.id).cmp(&(&b.file_path, b.line, &b.id)));
+}
 
 /// Files written per transaction by a bulk insert. A commit costs a few
 /// milliseconds, so batching is what makes a first index of a large
@@ -116,9 +141,11 @@ impl<'c, 'db> FileWriter<'c, 'db> {
                  indexed_commit:$commit, indexed_at:$at});",
             )?,
             service_file: prepare("MATCH (s:Service {id:$s}), (f:File {id:$f}) CREATE (s)-[:CONTAINS]->(f);")?,
+            // rank, community and degree start at their column defaults: not computed yet.
             symbol: prepare(
                 "CREATE (:Symbol {id:$id, name:$name, qualified_name:$qn, kind:$kind, signature:$sig, doc:$doc, \
-                 body:$body, file_path:$fp, service:$svc, start_line:$sl, end_line:$el, is_test:$t});",
+                 body:$body, file_path:$fp, service:$svc, start_line:$sl, end_line:$el, is_test:$t, \
+                 search_text:$words});",
             )?,
             file_symbol: prepare("MATCH (f:File {id:$f}), (s:Symbol {id:$s}) CREATE (f)-[:CONTAINS]->(s);")?,
             call: prepare(
@@ -158,9 +185,11 @@ impl<'c, 'db> FileWriter<'c, 'db> {
 
         // An id is a hash of what the row is, so a second row with the same id
         // is the same row (a redefinition, an overload): the first one is kept.
+        let rationale = rationale_words(parsed);
         let mut seen: HashSet<&str> = HashSet::new();
         for s in parsed.symbols.iter().filter(|s| seen.insert(s.id.as_str())) {
-            self.symbol.run(symbol_params(s))?;
+            let words = rationale.get(s.id.as_str()).map(Vec::as_slice).unwrap_or_default();
+            self.symbol.run(symbol_params(s, words))?;
             self.file_symbol.run(vec![("f", st(&file.id)), ("s", st(&s.id))])?;
         }
         seen.clear();
@@ -234,7 +263,37 @@ impl<'c, 'db> FileWriter<'c, 'db> {
     }
 }
 
-fn symbol_params(s: &SymbolRec) -> Vec<(&'static str, Value)> {
+/// The words of the rationale comments (`NOTE:`, `WHY:`, ...) of a file, by
+/// the symbol they sit in: a comment that says why is searched for by its
+/// words and found as the symbol it explains.
+fn rationale_words(parsed: &ParsedFile) -> HashMap<&str, Vec<String>> {
+    let mut out: HashMap<&str, Vec<String>> = HashMap::new();
+    // The same facts that are staged: a repeated id counts once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let staged = parsed.facts.iter().filter(|f| seen.insert(f.id.as_str()));
+    for f in staged.filter(|f| f.kind == fact::RATIONALE) {
+        out.entry(f.symbol_id.as_str())
+            .or_default()
+            .extend(lge_core::split_words(&f.key));
+    }
+    out
+}
+
+/// What the full-text index reads for a symbol besides its raw columns: the
+/// words of its names, path, signature and doc, followed by those of its
+/// rationale comments.
+fn search_text(s: &SymbolRec, rationale: &[String]) -> String {
+    let mut text = lge_core::search_text(&s.name, &s.qualified_name, &s.file_path, &s.signature, &s.doc);
+    for word in rationale {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(word);
+    }
+    text
+}
+
+fn symbol_params(s: &SymbolRec, rationale: &[String]) -> Vec<(&'static str, Value)> {
     vec![
         ("id", st(&s.id)),
         ("name", st(&s.name)),
@@ -248,6 +307,7 @@ fn symbol_params(s: &SymbolRec) -> Vec<(&'static str, Value)> {
         ("sl", int(s.start_line)),
         ("el", int(s.end_line)),
         ("t", Value::Bool(s.is_test)),
+        ("words", st(&search_text(s, rationale))),
     ]
 }
 
@@ -318,24 +378,8 @@ pub(crate) fn load_resolve_input(conn: &Connection) -> Result<ResolveInput> {
             alias: col_s(&r, 4),
         });
     }
-    for r in rows(
-        conn,
-        "MATCH (x:FactSite) \
-         RETURN x.id, x.symbol_id, x.file_path, x.kind, x.key, x.detail, x.line, x.end_line, x.literal;",
-        vec![],
-    )? {
-        input.facts.push(FactSite {
-            id: col_s(&r, 0),
-            symbol_id: col_s(&r, 1),
-            file_path: col_s(&r, 2),
-            kind: col_s(&r, 3),
-            key: col_s(&r, 4),
-            detail: col_s(&r, 5),
-            line: col_i(&r, 6),
-            end_line: col_i(&r, 7),
-            literal: col_b(&r, 8),
-        });
-    }
+    let facts = rows(conn, &format!("MATCH (x:FactSite) RETURN {FACT_COLS};"), vec![])?;
+    input.facts = facts.iter().map(fact_site).collect();
     input.files.sort_by(|a, b| a.path.cmp(&b.path));
     input
         .symbols
@@ -346,8 +390,27 @@ pub(crate) fn load_resolve_input(conn: &Connection) -> Result<ResolveInput> {
     input.imports.sort_by(|a, b| {
         (&a.file_path, &a.module, &a.name, &a.alias, &a.id).cmp(&(&b.file_path, &b.module, &b.name, &b.alias, &b.id))
     });
-    input
-        .facts
-        .sort_by(|a, b| (&a.file_path, a.line, &a.id).cmp(&(&b.file_path, b.line, &b.id)));
+    sort_facts(&mut input.facts);
     Ok(input)
+}
+
+/// Fact sites of one kind attached to the given symbols, in source order.
+///
+/// The ids are joined against the staged table instead of being tested row by
+/// row, so the cost is one scan per chunk however many ids are asked for.
+pub(crate) fn facts_of(conn: &Connection, symbol_ids: &[String], kind: &str) -> Result<Vec<FactSite>> {
+    let ids = distinct(symbol_ids);
+    let mut out = Vec::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let q =
+        format!("UNWIND $ids AS id MATCH (x:FactSite) WHERE x.symbol_id = id AND x.kind = $kind RETURN {FACT_COLS};");
+    let mut stmt = Prepared::new(conn, &q)?;
+    for chunk in ids.chunks(ID_CHUNK) {
+        let found = stmt.rows(vec![("ids", strings(chunk)), ("kind", st(kind))])?;
+        out.extend(found.iter().map(fact_site));
+    }
+    sort_facts(&mut out);
+    Ok(out)
 }

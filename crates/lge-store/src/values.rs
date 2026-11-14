@@ -86,6 +86,38 @@ pub(crate) fn strings<S: AsRef<str>>(items: &[S]) -> Value {
     Value::List(LogicalType::String, items.iter().map(|s| st(s.as_ref())).collect())
 }
 
+/// A `STRING[][]` parameter of (a, b) pairs; a query reads one as `p[1]`, `p[2]`.
+pub(crate) fn pairs<A: AsRef<str>, B: AsRef<str>>(items: &[(A, B)]) -> Value {
+    let pair = |(a, b): &(A, B)| Value::List(LogicalType::String, vec![st(a.as_ref()), st(b.as_ref())]);
+    let of_strings = LogicalType::List {
+        child_type: Box::new(LogicalType::String),
+    };
+    Value::List(of_strings, items.iter().map(pair).collect())
+}
+
+/// A `FLOAT[]` parameter: one embedding.
+pub(crate) fn floats(items: &[f32]) -> Value {
+    Value::List(LogicalType::Float, items.iter().map(|f| Value::Float(*f)).collect())
+}
+
+/// A list of strings as the JSON text a STRING column stores.
+pub(crate) fn json_list<S: AsRef<str>>(items: &[S]) -> String {
+    let items: Vec<&str> = items.iter().map(AsRef::as_ref).collect();
+    // Serializing strings cannot fail; the empty list is what a failure would mean.
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// One string as it stands inside the text [`json_list`] writes, quotes included.
+pub(crate) fn json_text(item: &str) -> String {
+    serde_json::to_string(item).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// The list a JSON column holds. Text that is not a JSON list of strings
+/// reads as empty, like any other value of an unexpected shape.
+pub(crate) fn parse_json_list(text: &str) -> Vec<String> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
 /// Run a statement without parameters and drop its result.
 pub(crate) fn run(conn: &Connection, q: &str) -> Result<()> {
     conn.query(q).with_context(|| format!("query failed: {q}"))?;

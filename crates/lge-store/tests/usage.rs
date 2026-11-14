@@ -91,6 +91,63 @@ fn usage_records_round_trip_oldest_first() {
 }
 
 #[test]
+fn the_recommended_level_and_the_mode_are_recorded() {
+    let (_dir, store) = open();
+    // A session at the fixed level, with what the router would have chosen
+    // and the levers that were on.
+    let fixed = UsageRecord {
+        level: "top".to_string(),
+        recommended_level: "low".to_string(),
+        mode: "pack+mcp".to_string(),
+        ..usage("u1", "t1", 1, 1000)
+    };
+    let baseline = UsageRecord {
+        mode: "baseline".to_string(),
+        ..usage("u2", "t2", 1, 1100)
+    };
+    // A record that says neither: both read back empty.
+    let silent = usage("u3", "t3", 1, 1200);
+    assert_eq!((silent.recommended_level.as_str(), silent.mode.as_str()), ("", ""));
+    for rec in [&baseline, &silent, &fixed] {
+        store.put_usage(rec).unwrap();
+    }
+    assert_eq!(
+        store.list_usage(0).unwrap(),
+        vec![fixed.clone(), baseline.clone(), silent.clone()]
+    );
+
+    // Replaced by id like every other field, to a value and back to nothing.
+    let routed = UsageRecord {
+        level: "low".to_string(),
+        recommended_level: "low".to_string(),
+        mode: "routed".to_string(),
+        ..fixed.clone()
+    };
+    store.put_usage(&routed).unwrap();
+    assert_eq!(store.list_usage(0).unwrap()[0], routed);
+    let cleared = UsageRecord {
+        recommended_level: String::new(),
+        mode: String::new(),
+        ..fixed.clone()
+    };
+    store.put_usage(&cleared).unwrap();
+    assert_eq!(store.list_usage(0).unwrap()[0], cleared);
+
+    // Text is stored as given.
+    let mut awkward = Vec::new();
+    for (i, text) in AWKWARD.iter().enumerate() {
+        let rec = UsageRecord {
+            recommended_level: text.to_string(),
+            mode: text.to_string(),
+            ..usage(&format!("a{i:02}"), "t9", i as i64, 5000 + i as i64)
+        };
+        store.put_usage(&rec).unwrap();
+        awkward.push(rec);
+    }
+    assert_eq!(store.list_usage(5000).unwrap(), awkward);
+}
+
+#[test]
 fn attempts_of_one_task_in_the_same_second_stay_in_attempt_order() {
     let (_dir, store) = open();
     // Ids chosen so that id order and attempt order disagree.

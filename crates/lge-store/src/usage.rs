@@ -8,7 +8,7 @@ use lge_core::{HandoffNote, UsageRecord};
 
 const USAGE_COLS: &str = "u.id, u.task_id, u.task, u.attempt, u.level, u.reason, u.runner, u.model, u.session_id, \
      u.started_at, u.finished_at, u.input_tokens, u.cached_input_tokens, u.reasoning_tokens, u.output_tokens, \
-     u.pack_tokens, u.outcome, u.escalated, u.files, u.services";
+     u.pack_tokens, u.outcome, u.escalated, u.files, u.services, u.recommended_level, u.mode";
 
 /// Insert or replace a usage record by id.
 pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
@@ -19,7 +19,8 @@ pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
          u.started_at = $started_at, u.finished_at = $finished_at, u.input_tokens = $input_tokens, \
          u.cached_input_tokens = $cached_input_tokens, u.reasoning_tokens = $reasoning_tokens, \
          u.output_tokens = $output_tokens, u.pack_tokens = $pack_tokens, u.outcome = $outcome, \
-         u.escalated = $escalated, u.files = $files, u.services = $services;",
+         u.escalated = $escalated, u.files = $files, u.services = $services, \
+         u.recommended_level = $recommended_level, u.mode = $mode;",
         vec![
             ("id", st(&rec.id)),
             ("task_id", st(&rec.task_id)),
@@ -41,6 +42,8 @@ pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
             ("escalated", Value::Bool(rec.escalated)),
             ("files", strings(&rec.files)),
             ("services", strings(&rec.services)),
+            ("recommended_level", st(&rec.recommended_level)),
+            ("mode", st(&rec.mode)),
         ],
     )?;
     Ok(())
@@ -77,7 +80,9 @@ pub(crate) fn list_usage(conn: &Connection, since: i64) -> Result<Vec<UsageRecor
             escalated: col_b(r, 17),
             files: col_list(r, 18),
             services: col_list(r, 19),
-            ..UsageRecord::default()
+            // Empty on a record written before the columns existed.
+            recommended_level: col_s(r, 20),
+            mode: col_s(r, 21),
         })
         .collect())
 }

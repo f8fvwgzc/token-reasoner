@@ -1,5 +1,6 @@
 //! The indexed repository, the index runs, and the counts.
 
+use crate::memory;
 use crate::schema::SCHEMA_VERSION;
 use crate::values::{col_i, col_s, count, int, rows, st};
 use anyhow::{bail, Result};
@@ -96,7 +97,8 @@ pub(crate) fn last_run(conn: &Connection) -> Result<Option<IndexRun>> {
 }
 
 /// Counts as (label, count). The first seven labels are the ones version 1
-/// printed, in the same order; node counts and the remaining edge types follow.
+/// printed, in the same order; node counts and the remaining edge types
+/// follow, and the counts of current facts, expired facts and pages come last.
 /// Placeholders are not counted as symbols or endpoints.
 pub(crate) fn stats(conn: &Connection) -> Result<Vec<(String, i64)>> {
     // (edge type, method) -> count, for every relationship table at once.
@@ -153,5 +155,10 @@ pub(crate) fn stats(conn: &Connection) -> Result<Vec<(String, i64)>> {
             }
         }
     }
+    // What is remembered comes last, so every line above keeps its place.
+    let (current, expired) = memory::counts(conn)?;
+    out.push(("memories".to_string(), current));
+    out.push(("memories_expired".to_string(), expired));
+    out.push(("pages".to_string(), nodes("MATCH (p:Page) RETURN count(p);")?));
     Ok(out)
 }

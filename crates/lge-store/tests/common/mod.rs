@@ -773,3 +773,146 @@ pub fn stat(store: &Store, label: &str) -> i64 {
 pub fn ids(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
+
+/// The single number a `RETURN count(...)` query prints.
+pub fn count(store: &Store, cypher: &str) -> i64 {
+    store
+        .raw(cypher)
+        .expect("count query")
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no row from {cypher}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{cypher}: {e}"))
+}
+
+/// Text that breaks a query assembled by string concatenation, a CSV line or
+/// a hand-written JSON encoder.
+pub const AWKWARD: &[&str] = &[
+    "it's",
+    "say \"hi\"",
+    "back\\slash",
+    "ends with backslash\\",
+    "line\nbreak",
+    "carriage\r\nreturn",
+    "tab\there",
+    "{braces} and ${dollar} and $param",
+    "'}) DETACH DELETE n; //",
+    "`backtick` and -- comment /* block */",
+    "[\"json\", \"list\"]",
+    "unicode \u{00e9}\u{4e2d}\u{6587} \u{1f980}",
+    "",
+    "   ",
+    "NULL",
+    "a,b",
+];
+
+/// A store that did not load the fts extension, as on a machine without it.
+pub fn open_without_fts() -> (TempDir, Store) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open_without_fts(&dir.path().join("graph.lbug")).expect("open store");
+    assert!(!store.fts_enabled());
+    (dir, store)
+}
+
+/// Index the fixture and store the hand-built resolution in `store`.
+pub fn index_fixture(store: &Store) -> (Fixture, Resolved) {
+    let fx = fixture();
+    store.set_repository("/repo/polyglot", COMMIT).expect("set repository");
+    store
+        .insert_parsed_bulk(&fx.files, COMMIT, NOW)
+        .expect("insert parsed files");
+    let resolved = resolved(&fx);
+    store.replace_edges(&resolved, COMMIT, NOW + 5).expect("replace edges");
+    (fx, resolved)
+}
+
+/// Run `check` once per search backend: BM25 when the fts extension is
+/// installed on this machine, and the substring scorer. The store it gets is
+/// empty.
+pub fn on_both_backends(check: impl Fn(&Store)) {
+    let (_dir, with_fts) = open();
+    if with_fts.fts_enabled() {
+        println!("backend: BM25");
+        check(&with_fts);
+    } else {
+        println!("the fts extension is not installed: BM25 is not tested");
+    }
+    drop(with_fts);
+    let (_dir, without_fts) = open_without_fts();
+    println!("backend: substring");
+    check(&without_fts);
+}
+
+/// A current fact with the given text; `at` is when it was stored and became true.
+pub fn memory(id: &str, text: &str, at: i64) -> lge_core::MemoryRec {
+    lge_core::MemoryRec {
+        id: id.to_string(),
+        kind: lge_core::memory_kind::WORLD.to_string(),
+        text: text.to_string(),
+        source: "test".to_string(),
+        created_at: at,
+        valid_at: at,
+        proof_count: 1,
+        ..lge_core::MemoryRec::default()
+    }
+}
+
+pub fn page(slug: &str, title: &str, body: &str) -> lge_core::PageRec {
+    lge_core::PageRec {
+        id: lge_core::stable_id(&["page", slug]),
+        slug: slug.to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+        kind: "manual".to_string(),
+        ..lge_core::PageRec::default()
+    }
+}
+
+/// `n` functions in files of 50, each calling the next one.
+pub fn call_chain(n: usize) -> (Vec<ParsedFile>, Resolved, Vec<String>) {
+    let mut files = Vec::new();
+    let mut symbol_ids = Vec::new();
+    for (i, block) in (0..n).collect::<Vec<_>>().chunks(50).enumerate() {
+        let f = file(&format!("big/part_{i}.py"), "big", lang::PYTHON);
+        let symbols: Vec<_> = block
+            .iter()
+            .map(|j| {
+                sym(
+                    &f,
+                    &format!("big.part_{i}.step_{j}"),
+                    kind::FUNCTION,
+                    *j as i64,
+                    *j as i64,
+                )
+            })
+            .collect();
+        symbol_ids.extend(symbols.iter().map(|s| s.id.clone()));
+        files.push(parsed(f, symbols));
+    }
+    let edges = symbol_ids
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            edge(
+                &w[0],
+                &w[1],
+                EdgeType::Calls,
+                0.95,
+                method::STATIC,
+                "big/part.py",
+                i as i64,
+                i as i64,
+            )
+        })
+        .collect();
+    (
+        files,
+        Resolved {
+            edges,
+            ..Resolved::default()
+        },
+        symbol_ids,
+    )
+}
