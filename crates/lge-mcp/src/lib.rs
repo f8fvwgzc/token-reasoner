@@ -127,6 +127,63 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Answer one JSON-RPC message of the protocol. `call` runs a tool by name
+/// and returns its text. `None` for a notification. The transport (stdio
+/// lines, HTTP posts) is the caller's.
+pub fn reply(message: &Value, call: &mut dyn FnMut(&str, &Value) -> Result<String>) -> Option<Value> {
+    let id = message.get("id").cloned();
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let reply = |result: Value| {
+        id.clone()
+            .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    };
+    let fail = |code: i64, text: String| {
+        Some(
+            json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null), "error": { "code": code, "message": text } }),
+        )
+    };
+    match method {
+        "initialize" => {
+            let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
+            let version = if PROTOCOLS.contains(&asked) {
+                asked
+            } else {
+                PROTOCOLS[1]
+            };
+            reply(json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "lge", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": INSTRUCTIONS,
+            }))
+        }
+        "ping" => reply(json!({})),
+        "tools/list" => {
+            let list: Vec<Value> = tools()
+                .into_iter()
+                .map(|t| json!({ "name": t.name, "description": t.description, "inputSchema": t.input_schema }))
+                .collect();
+            reply(json!({ "tools": list }))
+        }
+        "tools/call" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let (text, is_error) = match call(&name, &args) {
+                Ok(text) => (text, false),
+                Err(e) => (format!("error: {e}\n"), true),
+            };
+            reply(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
+        }
+        "resources/list" => reply(json!({ "resources": [] })),
+        "prompts/list" => reply(json!({ "prompts": [] })),
+        // A notification gets no answer, whatever it is.
+        _ if id.is_none() => None,
+        "" => fail(-32600, "not a JSON-RPC request".to_string()),
+        other => fail(-32601, format!("method `{other}` is not supported")),
+    }
+}
+
 pub struct Server {
     store: Box<dyn GraphStore>,
     root: PathBuf,
@@ -187,6 +244,15 @@ impl Server {
         }
     }
 
+    /// The store this server answers from.
+    pub fn store(&self) -> &dyn GraphStore {
+        self.store.as_ref()
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn commit(&self) -> String {
         self.store
             .repository()
@@ -198,7 +264,7 @@ impl Server {
 
     /// Bring the index up to date. A failure does not block the answer; it is
     /// reported in front of it, because the answer may then be stale.
-    fn freshen(&mut self) -> Option<String> {
+    pub fn freshen(&mut self) -> Option<String> {
         if !self.keep_fresh {
             return None;
         }
@@ -514,57 +580,7 @@ impl Server {
 
     /// Answer one JSON-RPC message. `None` for a notification.
     pub fn handle(&mut self, message: &Value) -> Option<Value> {
-        let id = message.get("id").cloned();
-        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        let reply = |result: Value| {
-            id.clone()
-                .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-        };
-        let fail = |code: i64, text: String| {
-            Some(
-                json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null), "error": { "code": code, "message": text } }),
-            )
-        };
-        match method {
-            "initialize" => {
-                let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-                let version = if PROTOCOLS.contains(&asked) {
-                    asked
-                } else {
-                    PROTOCOLS[1]
-                };
-                reply(json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "lge", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": INSTRUCTIONS,
-                }))
-            }
-            "ping" => reply(json!({})),
-            "tools/list" => {
-                let list: Vec<Value> = tools()
-                    .into_iter()
-                    .map(|t| json!({ "name": t.name, "description": t.description, "inputSchema": t.input_schema }))
-                    .collect();
-                reply(json!({ "tools": list }))
-            }
-            "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                let (text, is_error) = match self.call(&name, &args) {
-                    Ok(text) => (text, false),
-                    Err(e) => (format!("error: {e}\n"), true),
-                };
-                reply(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
-            }
-            "resources/list" => reply(json!({ "resources": [] })),
-            "prompts/list" => reply(json!({ "prompts": [] })),
-            // A notification gets no answer, whatever it is.
-            _ if id.is_none() => None,
-            "" => fail(-32600, "not a JSON-RPC request".to_string()),
-            other => fail(-32601, format!("method `{other}` is not supported")),
-        }
+        reply(message, &mut |name, args| self.call(name, args))
     }
 
     /// Serve until the input ends. One JSON message per line in, one per line out.

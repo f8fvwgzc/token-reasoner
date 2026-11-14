@@ -3,5 +3,6 @@
 
 pub mod command;
 pub mod responses;
+pub mod server;
 pub mod session;
 pub mod shorten;

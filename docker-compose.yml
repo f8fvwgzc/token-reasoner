@@ -1,0 +1,25 @@
+# The lge daemon: proxy, usage page and graph tools on http://127.0.0.1:8787
+#
+#   export LGE_WORKSPACE=$HOME/code      # the folder that holds your repositories
+#   docker compose up -d --build
+#
+# The workspace is mounted read-only at the same path it has on the host, so
+# the paths the agent reports are the paths the daemon reads.
+services:
+  lge:
+    build: .
+    image: lge:latest
+    container_name: lge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      LGE_WORKSPACE: ${LGE_WORKSPACE:?set LGE_WORKSPACE to the folder that holds your repositories}
+      LGE_CODEX_HOME: /codex
+    volumes:
+      - lge-data:/data
+      - ${LGE_WORKSPACE}:${LGE_WORKSPACE}:ro
+      - ${HOME}/.codex:/codex:ro
+
+volumes:
+  lge-data:

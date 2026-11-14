@@ -10,10 +10,20 @@ anyhow.workspace = true
 serde.workspace = true
 # preserve_order: a body that is parsed and written back keeps its key order.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# The local HTTP server. Synchronous: one thread per request, no async runtime.
+tiny_http = "0.12.0"
+# The client towards the provider. No automatic decompression: bytes are relayed as they come.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Decodes a zstd-compressed request body. Pure Rust.
+ruzstd = "0.8"
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
 lge-retrieve = { path = "../lge-retrieve" }
 lge-filter = { path = "../lge-filter" }
+lge-mcp = { path = "../lge-mcp" }
+lge-memory = { path = "../lge-memory" }
+lge-usage = { path = "../lge-usage" }
+lge-router = { path = "../lge-router" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

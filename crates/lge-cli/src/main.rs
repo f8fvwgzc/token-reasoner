@@ -103,6 +103,29 @@ enum Cmd {
     Query { cypher: String },
     /// Install the LadybugDB full-text (BM25) extension. Needs network once.
     Setup,
+    /// Run the daemon: the proxy between the agent and the model provider, the
+    /// page that shows usage and savings, and the graph tools over HTTP.
+    Serve {
+        #[arg(long, env = "LGE_HOST", default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, env = "LGE_PORT", default_value_t = 8787)]
+        port: u16,
+        /// Where graphs, the usage log and settings are kept. Default: ~/.lge
+        #[arg(long, env = "LGE_HOME")]
+        data_dir: Option<PathBuf>,
+        /// A folder the daemon may index (repeatable, or separated by `:` in LGE_WORKSPACE). Default: any folder.
+        #[arg(long = "workspace", env = "LGE_WORKSPACE", value_delimiter = ':')]
+        workspaces: Vec<PathBuf>,
+        /// The agent's home, for importing the usage of past sessions. Default: ~/.codex if it exists.
+        #[arg(long, env = "LGE_CODEX_HOME")]
+        codex_home: Option<PathBuf>,
+        /// Provider base URL for API-key requests.
+        #[arg(long, env = "LGE_UPSTREAM_API")]
+        upstream_api: Option<String>,
+        /// Provider base URL for requests made with a ChatGPT login.
+        #[arg(long, env = "LGE_UPSTREAM_CHATGPT")]
+        upstream_chatgpt: Option<String>,
+    },
     /// Serve the graph and the memory to a coding agent over MCP (stdio).
     Mcp {
         #[arg(long, default_value_t = 1)]
@@ -319,10 +342,54 @@ fn main() -> Result<()> {
     if let Cmd::Init { write, register } = &cli.cmd {
         return init(&repo, *write, *register);
     }
+    // The daemon owns its own databases, one per folder, under its data directory.
+    if let Cmd::Serve {
+        host,
+        port,
+        data_dir,
+        workspaces,
+        codex_home,
+        upstream_api,
+        upstream_chatgpt,
+    } = &cli.cmd
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.clone());
+        let mut cfg = lge_proxy::server::Config::new(data_dir.clone().unwrap_or_else(|| home.join(".lge")));
+        cfg.host = host.clone();
+        cfg.port = *port;
+        cfg.workspaces = workspaces
+            .iter()
+            .filter(|w| !w.as_os_str().is_empty())
+            .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
+            .collect();
+        cfg.codex_home = codex_home
+            .clone()
+            .or_else(|| Some(home.join(".codex")).filter(|p| p.is_dir()));
+        if let Some(u) = upstream_api {
+            cfg.upstream_api = u.clone();
+        }
+        if let Some(u) = upstream_chatgpt {
+            cfg.upstream_chatgpt = u.clone();
+        }
+        let daemon = lge_proxy::server::Daemon::open(cfg)?;
+        let (server, addr) = lge_proxy::server::bind(&daemon)?;
+        eprintln!(
+            "lge: proxy and page on http://{addr}  (data in {})",
+            daemon.cfg.data_dir.display()
+        );
+        eprintln!(
+            "lge: point Codex at it with base_url = \"http://127.0.0.1:{}/v1\"; open the page for the exact lines",
+            addr.port()
+        );
+        lge_proxy::server::run(daemon, server);
+        return Ok(());
+    }
 
     let store = open(&db)?;
     match cli.cmd {
-        Cmd::Init { .. } => unreachable!("handled above"),
+        Cmd::Init { .. } | Cmd::Serve { .. } => unreachable!("handled above"),
         Cmd::Index {
             root,
             service_depth,
@@ -634,8 +701,21 @@ fn main() -> Result<()> {
 fn init(repo: &Path, write: bool, register: bool) -> Result<()> {
     let exe = std::env::current_exe().context("cannot find the lge binary")?;
     let exe = exe.canonicalize().unwrap_or(exe);
+    println!("A. The proxy: every Codex session goes through lge, nothing else to remember.\n");
+    println!("   1. Start the daemon:  lge serve      (or, in Docker:  docker compose up -d)");
+    println!("   2. Add to ~/.codex/config.toml (the CLI and the desktop app read the same file):\n");
+    println!("        model_provider = \"lge\"\n");
+    println!("        [model_providers.lge]");
+    println!("        name = \"OpenAI through lge\"");
+    println!("        base_url = \"http://127.0.0.1:8787/v1\"");
+    println!("        wire_api = \"responses\"");
+    println!("        requires_openai_auth = true\n");
+    println!("   3. Open http://127.0.0.1:8787 to add folders and see tokens per session.");
+    println!("      Graph tools for the agent:  codex mcp add local_graph --url http://127.0.0.1:8787/mcp\n");
+
     let command = ["mcp", "add", "local_graph", "--", &exe.to_string_lossy(), "mcp"].map(str::to_string);
-    println!("1. Register the MCP server with Codex (once; it serves whichever repository Codex is started in):\n");
+    println!("B. Without the daemon: the graph tools only, started by Codex in the repository it works in.\n");
+    println!("   lge index");
     println!("   codex {}\n", command.join(" "));
     if register {
         let status = std::process::Command::new("codex")
@@ -647,9 +727,10 @@ fn init(repo: &Path, write: bool, register: bool) -> Result<()> {
         }
         println!("   registered.\n");
     }
+
     let agents = repo.join("AGENTS.md");
     println!(
-        "2. Tell Codex to ask the graph first: this block belongs in {}:\n",
+        "C. The rule that makes the agent ask the graph first belongs in {}:\n",
         agents.display()
     );
     println!("{AGENTS_BLOCK}");
@@ -670,6 +751,5 @@ fn init(repo: &Path, write: bool, register: bool) -> Result<()> {
             println!("   {} already has this block.", agents.display());
         }
     }
-    println!("3. Index the repository: `lge index`. The MCP server keeps it fresh after that.");
     Ok(())
 }

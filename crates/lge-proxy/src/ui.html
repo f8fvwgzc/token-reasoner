@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lge</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#15181d; --dim:#667085; --line:#e3e6eb; --accent:#1d6f5c; --warn:#b54708; --bad:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1e24; --ink:#e8eaed; --dim:#98a2b3; --line:#2a3038; --accent:#4cc2a4; --warn:#f0a35e; --bad:#f97066; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
+  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .dim { color:var(--dim); } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .big { font-size:22px; font-weight:650; } .ok { color:var(--accent); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  section { margin-bottom:22px; }
+  table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:600; font-size:12px; } td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .scroll { overflow-x:auto; }
+  input[type=text] { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+  button { padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; } button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; } .grow { flex:1 1 260px; }
+  pre { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0 0; }
+  .folders { max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin-top:8px; }
+  .folders div { padding:6px 10px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
+  .folders div:hover { background:var(--bg); }
+  label.switch { display:flex; gap:8px; align-items:center; }
+  #msg { min-height:20px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>lge</h1>
+    <span class="dim" id="sub">connecting…</span>
+  </header>
+
+  <div class="grid" id="cards"></div>
+
+  <section>
+    <h2>Connect Codex</h2>
+    <div class="card">
+      <div>Add this to <span class="mono">~/.codex/config.toml</span>. It sends model requests through this proxy and keeps your login. The CLI and the desktop app read the same file.</div>
+      <pre class="mono" id="snippet"></pre>
+      <div class="dim" style="margin-top:8px">Optional: the graph tools for the agent: <span class="mono" id="mcpcmd"></span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Folders in the graph</h2>
+    <div class="card">
+      <div class="scroll"><table id="repos"></table></div>
+      <div class="row" style="margin-top:12px">
+        <input class="grow" type="text" id="path" placeholder="/path/to/a/repository" autocomplete="off">
+        <button id="browse">Browse</button>
+        <button class="primary" id="add">Add and index</button>
+      </div>
+      <div class="folders" id="folders" hidden></div>
+      <div id="msg" class="dim" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Sessions through the proxy</h2>
+    <div class="card scroll"><table id="sessions"></table></div>
+  </section>
+
+  <section>
+    <h2>Before and after</h2>
+    <div class="card">
+      <div class="scroll"><table id="modes"></table></div>
+      <div class="row" style="margin-top:12px">
+        <button id="import">Import past Codex sessions</button>
+        <span class="dim">Reads token counts from the agent's session files to get a baseline. No conversation text is stored.</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <div class="card row">
+      <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
+      <label class="switch"><input type="checkbox" id="s_shorten"> Shorten file reads, searches and check output</label>
+      <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const n = v => (v || 0).toLocaleString();
+const pct = (a, b) => b > 0 ? Math.round(100 * a / b) + '%' : '–';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let state = null, settingsDirty = false;
+
+async function api(path, method = 'GET', body) {
+  const r = await fetch('/lge/api/' + path, { method, headers: body ? {'Content-Type': 'application/json'} : {}, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function say(text, cls = 'dim') { const m = $('msg'); m.className = cls; m.textContent = text; }
+
+function render(s) {
+  state = s;
+  $('sub').textContent = `v${s.version} · listening on ${s.listen} · up ${Math.floor(s.uptime_seconds / 60)} min`;
+  const proxy = (s.modes.find(m => m.mode === 'proxy')) || {};
+  const sv = s.saved;
+  const removed = sv.tokens_before - sv.tokens_after;
+  $('cards').innerHTML = [
+    ['Sessions', n(proxy.sessions), ''],
+    ['Input tokens', n(proxy.input_tokens), `cached ${pct(proxy.cached_input_tokens, proxy.input_tokens)}`],
+    ['Output tokens', n(proxy.output_tokens), `reasoning ${pct(proxy.reasoning_tokens, proxy.output_tokens)}`],
+    ['Removed from tool output', n(removed), `${n(sv.outputs_shortened)} outputs, ${pct(removed, sv.tokens_before)} smaller`],
+    ['Graph context added', n(sv.context_tokens), `${n(sv.contexts_added)} packs`],
+  ].map(([k, v, d]) => `<div class="card"><div class="dim">${k}</div><div class="big">${v}</div><div class="dim">${d}</div></div>`).join('');
+
+  const origin = location.origin;
+  $('snippet').textContent = `model_provider = "lge"\n\n[model_providers.lge]\nname = "OpenAI through lge"\nbase_url = "${origin}/v1"\nwire_api = "responses"\nrequires_openai_auth = true`;
+  $('mcpcmd').textContent = `codex mcp add local_graph --url ${origin}/mcp`;
+
+  $('repos').innerHTML = '<tr><th>Folder</th><th>State</th><th class="n">Files</th><th class="n">Symbols</th><th class="n">Facts</th><th></th></tr>' +
+    (s.repos.length ? s.repos.map(r => `<tr><td><b>${esc(r.name)}</b><div class="dim mono">${esc(r.root)}</div></td>
+      <td class="${r.state === 'ready' ? 'ok' : r.state === 'failed' ? 'bad' : 'warn'}">${r.state}${r.detail ? '<div class="dim">' + esc(r.detail) + '</div>' : ''}</td>
+      <td class="n">${n(r.files)}</td><td class="n">${n(r.symbols)}</td><td class="n">${n(r.memories)}</td>
+      <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')
+      : '<tr><td colspan="6" class="dim">No folder yet. Add one below, or start Codex in a git repository.</td></tr>');
+
+  $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Removed</th><th class="n">Added</th></tr>' +
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}</div></td>
+      <td class="n">${n(x.requests)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
+      <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
+      <td class="n">${n(x.tokens_before - x.tokens_after)}</td><td class="n">${n(x.context_tokens)}</td></tr>`).join('')
+      : '<tr><td colspan="8" class="dim">No session has gone through the proxy yet.</td></tr>');
+
+  const label = { history: 'Past sessions (before lge)', proxy: 'Through the proxy' };
+  $('modes').innerHTML = '<tr><th></th><th class="n">Sessions</th><th class="n">Input / session</th><th class="n">Cached</th><th class="n">Output / session</th><th class="n">Reasoning / session</th></tr>' +
+    (s.modes.length ? s.modes.map(m => `<tr><td>${esc(label[m.mode] || m.mode)}</td><td class="n">${n(m.sessions)}</td>
+      <td class="n">${n(Math.round(m.input_tokens / Math.max(1, m.sessions)))}</td><td class="n">${pct(m.cached_input_tokens, m.input_tokens)}</td>
+      <td class="n">${n(Math.round(m.output_tokens / Math.max(1, m.sessions)))}</td><td class="n">${n(Math.round(m.reasoning_tokens / Math.max(1, m.sessions)))}</td></tr>`).join('')
+      : '<tr><td colspan="6" class="dim">Nothing measured yet.</td></tr>');
+
+  if (!settingsDirty) {
+    $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_auto').checked = s.settings.auto_index;
+  }
+}
+
+async function refresh() { try { render(await api('status')); } catch (e) { $('sub').textContent = 'not reachable: ' + e.message; } }
+
+async function addRepo(path) {
+  if (!path) return say('Type or pick a folder first.', 'warn');
+  try { await api('repos', 'POST', { path }); say('Indexing ' + path + ' …', 'ok'); $('path').value = ''; $('folders').hidden = true; refresh(); }
+  catch (e) { say(e.message, 'bad'); }
+}
+async function browse(path) {
+  try {
+    const b = await api('browse?path=' + encodeURIComponent(path || ''));
+    const rows = (b.parent ? [`<div data-path="${esc(b.parent)}"><span>‹ up</span></div>`] : []).concat(
+      b.folders.map(f => `<div data-path="${esc(f.path)}"><span>${esc(f.name)}</span><span class="dim">${f.git ? 'git' : ''}</span></div>`));
+    $('folders').innerHTML = rows.join('') || '<div class="dim">No folders here.</div>';
+    $('folders').hidden = false;
+    if (b.path) $('path').value = b.path;
+    if (b.error) say(b.error, 'bad');
+  } catch (e) { say(e.message, 'bad'); }
+}
+
+$('add').onclick = () => addRepo($('path').value.trim());
+$('browse').onclick = () => browse($('path').value.trim());
+$('folders').onclick = e => { const d = e.target.closest('[data-path]'); if (d) browse(d.dataset.path); };
+$('repos').onclick = async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try {
+    if (b.dataset.reindex) { await api('repos', 'POST', { path: b.dataset.reindex }); say('Re-indexing …', 'ok'); }
+    if (b.dataset.remove) { await api('repos?path=' + encodeURIComponent(b.dataset.remove), 'DELETE'); say('Removed from the list. Its graph stays on disk.', 'dim'); }
+    refresh();
+  } catch (err) { say(err.message, 'bad'); }
+};
+$('import').onclick = async () => {
+  $('import').disabled = true;
+  try { const r = await api('import-history', 'POST', {}); say(`Imported ${r.imported} past sessions (${r.skipped} skipped, ${r.unreadable} unreadable).`, 'ok'); refresh(); }
+  catch (e) { say(e.message, 'bad'); }
+  $('import').disabled = false;
+};
+for (const id of ['s_inject', 's_shorten', 's_auto']) $(id).onchange = async () => {
+  settingsDirty = true;
+  const body = Object.assign({}, state ? state.settings : {}, { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, auto_index: $('s_auto').checked });
+  try { await api('settings', 'POST', body); } catch (e) { say(e.message, 'bad'); }
+  settingsDirty = false; refresh();
+};
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>

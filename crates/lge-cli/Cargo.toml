@@ -18,7 +18,8 @@ lge-mcp = { path = "../lge-mcp" }
 lge-bench = { path = "../lge-bench" }
 lge-usage = { path = "../lge-usage" }
 lge-filter = { path = "../lge-filter" }
-clap = { version = "4.6.7", features = ["derive"] }
+lge-proxy = { path = "../lge-proxy" }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 
 [[bin]]
 name = "lge"
