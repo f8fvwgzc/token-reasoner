@@ -1,5 +1,6 @@
 # ---- build -----------------------------------------------------------------
-FROM rust:1-bookworm AS build
+# Debian 13: the LadybugDB headers need C++20 <format> (GCC 13 or later).
+FROM rust:1-trixie AS build
 # Pin the LadybugDB library the `lbug` crate downloads; without a version it
 # asks for the latest release, which may not match the crate.
 ENV LBUG_VERSION=0.22.3
@@ -15,7 +16,7 @@ RUN lge --db /tmp/setup/graph.lbug setup || echo "full-text extension not instal
 RUN mkdir -p /root/.lbdb
 
 # ---- run -------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/lge /usr/local/bin/lge
 COPY --from=build /root/.lbdb /root/.lbdb

@@ -21,7 +21,20 @@ yourself, create `.cargo/config.toml` (ignored by git):
     LBUG_LIBRARY_DIR = "/path/to/liblbug"
     LBUG_INCLUDE_DIR = "/path/to/liblbug"
 
-## Use with Codex
+## Use as a proxy for Codex (recommended)
+
+    docker compose up -d --build   # or: lge serve
+
+Then add one line to `~/.codex/config.toml` (CLI and desktop app; your login stays):
+
+    openai_base_url = "http://127.0.0.1:8787/v1"
+
+Open http://127.0.0.1:8787 to add folders and see input, cached, output and reasoning
+tokens per session. Every Codex session then goes through lge, which shortens test and
+search output, points repeated output to its first copy, and adds graph context after a
+message about the code. Details and limits: `docs/PROXY.md`.
+
+## Use with Codex through MCP only
 
     lge setup                      # once: install the LadybugDB full-text extension
     lge index                      # index the repository you are in
@@ -106,6 +119,7 @@ next to each session, so `lge usage report` shows what routing would have change
 | lge-session | Prompt builder and session runner |
 | lge-filter | Local checks reduced to failures and relevant diff hunks |
 | lge-usage | Codex token usage parsing and reports |
+| lge-proxy | The daemon: proxy in front of the provider, usage page, folder API, MCP over HTTP |
 | lge-mcp | MCP stdio server |
 | lge-bench | Benchmark runner |
 | lge-cli | The `lge` binary |
@@ -125,4 +139,5 @@ Calls to names that do not exist in the repository are counted as external and n
 - `docs/PLAN.md`: the development plan.
 - `docs/ARCHITECTURE.md`: what each crate promises the others.
 - `docs/CONTEXT_GRAPH.md`: how tokens are saved with the model and reasoning level fixed.
-- `docs/PRIOR_ART.md`: what was learned from graphify, hindsight, graphiti and omnigraph.
+- `docs/PROXY.md`: the proxy: what it changes, what it never touches, how to run it.
+- `docs/PRIOR_ART.md`: what was learned from graphify, hindsight, graphiti, omnigraph, headroom and rtk.

@@ -210,6 +210,30 @@ impl Session {
         decided
     }
 
+    /// What to send in place of a tool output whose command is not known (a
+    /// script, a tool the proxy cannot read), judged by its content alone: a
+    /// recognised test or lint run, or a long list of search matches. Decided
+    /// once per distinct text and repeated exactly afterwards.
+    pub fn rewrite_text(&mut self, output: &str, opts: &Options) -> Option<String> {
+        if !opts.shorten_outputs {
+            return None;
+        }
+        let id = key(&["text", output]);
+        if let Some(known) = self.outputs.get(&id) {
+            return known.clone();
+        }
+        let files = &self.relevant_files;
+        let decided = failures_only("", output)
+            .or_else(|| cap_search(output, &|path| files.contains(path.trim_start_matches("./"))));
+        if let Some(text) = &decided {
+            self.saved.outputs_shortened += 1;
+            self.saved.tokens_before += count(output);
+            self.saved.tokens_after += count(text);
+        }
+        self.outputs.insert(id, decided.clone());
+        decided
+    }
+
     /// Count an output that was replaced by a pointer to its earlier copy.
     /// The same item comes back on every turn; it is counted once.
     pub fn count_pointer(&mut self, id: &str, before: &str, after: &str) {

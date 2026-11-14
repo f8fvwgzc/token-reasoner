@@ -77,13 +77,32 @@ fn message_text(item: &Value) -> Option<String> {
     }
 }
 
-/// A user-role message that the agent wrote, not the person: environment
-/// context, instructions, notices. They start with a tag or a known heading.
-fn is_injected(text: &str) -> bool {
-    let t = text.trim_start();
-    t.starts_with('<')
-        || t.starts_with("# AGENTS.md")
-        || t.starts_with("## My request for Codex") && t.contains("<image")
+/// Wrappers the agent puts around context it adds as user messages.
+const INJECTED_STARTS: [&str; 8] = [
+    "# agents.md instructions",
+    "<environment_context>",
+    "<turn_aborted>",
+    "<user_shell_command>",
+    "<subagent_notification>",
+    "<codex_internal_context",
+    "<external_",
+    "<lge_context>",
+];
+
+/// True when a user-role message was written by the agent, not typed by the
+/// person: environment context, instructions, notices. The agent says so in
+/// the item's metadata when it sends one; otherwise the known wrappers decide,
+/// and any other message that opens with a tag is treated as not typed.
+fn is_injected(item: &Value, text: &str) -> bool {
+    let kinds = item
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|m| m.get("content_item_kinds"))
+        .and_then(Value::as_array);
+    if let Some(kinds) = kinds.filter(|k| !k.is_empty()) {
+        return !kinds.iter().filter_map(Value::as_str).any(|k| k.starts_with("user."));
+    }
+    let t = text.trim_start().to_ascii_lowercase();
+    INJECTED_STARTS.iter().any(|m| t.starts_with(m)) || t.starts_with('<')
 }
 
 fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -112,10 +131,10 @@ fn unframe(raw: &str) -> Framed {
             }
         }
     }
-    // The header is short; the marker must be near the top to count.
+    // The agent frames a command's text with a few status lines that end in
+    // `Output:` (exit code, wall time, chunk id, a truncation warning).
     if let Some(at) = raw.find("\nOutput:\n") {
-        if at < 400 && (raw.starts_with("Exit code:") || raw.starts_with("Chunk ID:") || raw.starts_with("Wall time:"))
-        {
+        if at < 600 && raw[..at].contains("Wall time") {
             let cut = at + "\nOutput:\n".len();
             return Framed::Plain {
                 prefix: raw[..cut].to_string(),
@@ -144,6 +163,41 @@ fn context_item(text: &str) -> Value {
     json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] })
 }
 
+/// Shorten the texts of an output whose command is not known, each judged by
+/// its content. Returns how many were replaced. The JSON type of `output` and
+/// the number of its parts never change.
+fn rewrite_by_content(item: &mut Value, session: &mut Session, opts: &Options) -> usize {
+    let mut replaced = 0;
+    match item.get_mut("output") {
+        Some(Value::String(raw)) => {
+            let framed = unframe(raw);
+            let text = match &framed {
+                Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
+            };
+            if let Some(shorter) = session.rewrite_text(&text, opts) {
+                *raw = reframe(framed, shorter);
+                replaced += 1;
+            }
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts.iter_mut() {
+                if part.get("type").and_then(Value::as_str) != Some("input_text") {
+                    continue;
+                }
+                let Some(Value::String(text)) = part.get_mut("text") else {
+                    continue;
+                };
+                if let Some(shorter) = session.rewrite_text(text, opts) {
+                    *text = shorter;
+                    replaced += 1;
+                }
+            }
+        }
+        _ => {}
+    }
+    replaced
+}
+
 /// Read what the request says about itself, without changing it.
 pub fn inspect(body: &Value) -> Seen {
     let mut seen = Seen {
@@ -161,7 +215,7 @@ pub fn inspect(body: &Value) -> Seen {
         if seen.cwd.is_none() {
             seen.cwd = tag(&text, "cwd").map(str::to_string);
         }
-        if seen.first_user_message.is_empty() && !is_injected(&text) {
+        if seen.first_user_message.is_empty() && !is_injected(item, &text) {
             seen.first_user_message = text.trim().chars().take(200).collect();
         }
     }
@@ -205,6 +259,18 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
     for mut item in std::mem::take(items) {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         match kind.as_str() {
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output"
+                if !item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| ran.contains_key(id))
+                    || !item.get("output").is_some_and(Value::is_string) =>
+            {
+                // No command to go by (a script, another tool), or the output is a
+                // list of parts: each text is judged by its content alone.
+                seen.outputs_replaced += rewrite_by_content(&mut item, session, opts);
+                out.push(item);
+            }
             "function_call_output" | "local_shell_call_output" => {
                 let call = item
                     .get("call_id")
@@ -249,13 +315,11 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
             }
             "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
                 let text = message_text(&item);
+                let typed = text.as_deref().is_some_and(|t| !is_injected(&item, t));
                 out.push(item);
-                let (Some(text), Some(graph)) = (text, graph) else {
+                let (Some(text), Some(graph), true) = (text, graph, typed) else {
                     continue;
                 };
-                if is_injected(&text) {
-                    continue;
-                }
                 if let Some(context) = session.context_for(graph, &text, opts) {
                     out.push(context_item(&context));
                     seen.contexts_present += 1;
@@ -340,7 +404,7 @@ mod tests {
     }
 
     fn call(id: &str, command: &str) -> Value {
-        json!({ "type": "function_call", "name": "shell", "call_id": id, "arguments": json!({ "command": ["bash", "-lc", command], "workdir": "/repo" }).to_string() })
+        json!({ "type": "function_call", "name": "exec_command", "call_id": id, "arguments": json!({ "cmd": command, "workdir": "/repo", "yield_time_ms": 10000 }).to_string() })
     }
 
     fn output(id: &str, text: &str) -> Value {
@@ -382,7 +446,7 @@ mod tests {
     #[test]
     fn only_shell_outputs_change_and_everything_else_is_untouched() {
         let run = passing_run();
-        let framed = format!("Exit code: 0\nWall time: 9.9 seconds\nOutput:\n{run}");
+        let framed = format!("Chunk ID: a1b2c3\nWall time: 9.9123 seconds\nProcess exited with code 0\nOriginal token count: 5460\nOutput:\n{run}");
         let mut body = json!({
             "model": "gpt-test",
             "prompt_cache_key": "conv-1",
@@ -396,7 +460,7 @@ mod tests {
                 call("c2", "git diff"),
                 output("c2", &run),
                 { "type": "function_call", "name": "update_plan", "call_id": "c3", "arguments": "{\"plan\":[]}" },
-                output("c3", &run),
+                output("c3", "Plan updated"),
             ],
             "tools": [{ "type": "function", "name": "shell" }],
             "stream": true,
@@ -414,7 +478,7 @@ mod tests {
         assert_eq!(items.len(), 9, "no item is added without a graph");
         let short = items[4]["output"].as_str().unwrap();
         assert!(
-            short.starts_with("Exit code: 0\nWall time: 9.9 seconds\nOutput:\nok"),
+            short.starts_with("Chunk ID: a1b2c3\nWall time: 9.9123 seconds\nProcess exited with code 0\nOriginal token count: 5460\nOutput:\nok"),
             "the frame stays: {short}"
         );
         assert!(short.len() * 10 < framed.len());
@@ -505,11 +569,108 @@ mod tests {
             transform(&mut body, &mut Session::default(), None, &Options::default());
             assert_eq!(body, before);
         }
-        // Outputs that are not strings, and outputs without a known call, are left alone.
-        let mut body = json!({ "input": [call("c1", "pytest -v"), { "type": "function_call_output", "call_id": "c1", "output": [{ "type": "input_text", "text": passing_run() }] }, output("zz", &passing_run())] });
+    }
+
+    #[test]
+    fn an_output_without_a_known_command_is_judged_by_its_content() {
+        // A script run (code mode): the output is a list of parts, the command is inside the script.
+        let listing: String = (0..200)
+            .map(|i| {
+                format!(
+                    "src/mod_{}/views.py:{}:    return render(request, template)\n",
+                    i % 25,
+                    i
+                )
+            })
+            .collect();
+        let mut body = json!({ "input": [
+            { "type": "custom_tool_call", "call_id": "s1", "name": "exec", "input": "const r = await tools.exec_command({cmd: 'pytest -v'}); text(r.output);" },
+            { "type": "custom_tool_call_output", "call_id": "s1", "output": [
+                { "type": "input_text", "text": "Script completed\nWall time 9.9 seconds\nOutput:\n" },
+                { "type": "input_text", "text": passing_run() },
+                { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+                { "type": "input_text", "text": listing },
+            ] },
+            output("zz", &passing_run()),
+            output("yy", "a short note"),
+            { "type": "function_call_output", "call_id": "m1", "output": "Wall time: 0.1 seconds\nOutput:\n{\"rows\": [1, 2, 3]}" },
+        ] });
         let before = body.clone();
-        transform(&mut body, &mut Session::default(), None, &Options::default());
-        assert_eq!(body, before);
+        let mut session = Session::default();
+        let seen = transform(&mut body, &mut session, None, &Options::default());
+        let parts = body["input"][1]["output"].as_array().unwrap();
+        assert_eq!(
+            seen.outputs_replaced,
+            3,
+            "{}",
+            serde_json::to_string(&json!([parts[1], parts[3], body["input"][2]]))
+                .unwrap()
+                .chars()
+                .take(900)
+                .collect::<String>()
+        );
+        assert_eq!(parts.len(), 4, "the number of parts never changes");
+        assert_eq!(parts[0], before["input"][1]["output"][0]);
+        assert!(parts[1]["text"].as_str().unwrap().starts_with("ok"), "{}", parts[1]);
+        assert_eq!(parts[2], before["input"][1]["output"][2]);
+        assert!(
+            parts[3]["text"]
+                .as_str()
+                .unwrap()
+                .contains("lge: 60 of 200 matching lines shown"),
+            "{}",
+            parts[3]
+        );
+        assert!(body["input"][2]["output"].as_str().unwrap().starts_with("ok"));
+        assert_eq!(
+            body["input"][0], before["input"][0],
+            "the script itself is never touched"
+        );
+        assert_eq!(body["input"][3], before["input"][3]);
+        assert_eq!(
+            body["input"][4], before["input"][4],
+            "an unrecognised result passes through"
+        );
+        // Decided once: the same request again gives the same bytes.
+        let mut again = before.clone();
+        transform(&mut again, &mut session, None, &Options::default());
+        assert_eq!(again, body);
+        assert_eq!(
+            session.saved.outputs_shortened, 2,
+            "the same text twice is decided and counted once"
+        );
+    }
+
+    #[test]
+    fn typed_messages_are_told_from_what_the_agent_adds() {
+        let typed = user("please fix the login bug");
+        let mut tagged = user("# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>");
+        assert!(!is_injected(&typed, "please fix the login bug"));
+        assert!(is_injected(&tagged, "# AGENTS.md instructions for /repo"));
+        for text in [
+            "<environment_context>\n<cwd>/r</cwd>",
+            "  <turn_aborted>",
+            "<lge_context>x",
+            "<anything else>",
+        ] {
+            assert!(is_injected(&typed, text), "{text}");
+        }
+        // The agent's own labels win over the text when they are present.
+        tagged["internal_chat_message_metadata_passthrough"] = json!({ "content_item_kinds": ["user.text"] });
+        assert!(!is_injected(&tagged, "<looks like a tag>"));
+        tagged["internal_chat_message_metadata_passthrough"] =
+            json!({ "content_item_kinds": ["agents_md.instructions", "environments.environment_context"] });
+        assert!(is_injected(&tagged, "please fix the login bug"));
+        // Both parts of the agent's context message are read for the working directory.
+        let body = json!({ "input": [{ "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nx\n</INSTRUCTIONS>" },
+            { "type": "input_text", "text": "<environment_context>\n  <cwd>/repo/app</cwd>\n  <shell>zsh</shell>\n</environment_context>" },
+        ] }, typed] });
+        let seen = inspect(&body);
+        assert_eq!(
+            (seen.cwd.as_deref(), seen.first_user_message.as_str()),
+            (Some("/repo/app"), "please fix the login bug")
+        );
     }
 
     #[test]

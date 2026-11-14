@@ -13,7 +13,8 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # The local HTTP server. Synchronous: one thread per request, no async runtime.
 tiny_http = "0.12.0"
 # The client towards the provider. No automatic decompression: bytes are relayed as they come.
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# cookies: the ChatGPT backend sets load-balancer cookies the client cannot keep over plain HTTP.
+ureq = { version = "3", default-features = false, features = ["rustls", "cookies"] }
 # Decodes a zstd-compressed request body. Pure Rust.
 ruzstd = "0.8"
 lge-core = { path = "../lge-core" }

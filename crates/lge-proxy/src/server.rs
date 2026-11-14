@@ -389,16 +389,20 @@ impl Daemon {
 
     /// Rewrite a Responses request body. Returns the new bytes and the
     /// conversation they belong to, or `None` to forward the original.
-    fn rewrite(self: &Arc<Self>, body: &[u8]) -> Option<(Vec<u8>, Arc<Mutex<Conv>>)> {
+    fn rewrite(self: &Arc<Self>, body: &[u8], thread: Option<&str>) -> Option<(Vec<u8>, Arc<Mutex<Conv>>)> {
         let mut value: Value = serde_json::from_slice(body).ok()?;
         let seen = inspect(&value);
-        let key = seen.conversation.clone().unwrap_or_else(|| {
-            stable_id(&[
-                "conversation",
-                &seen.first_user_message,
-                seen.cwd.as_deref().unwrap_or(""),
-            ])
-        });
+        // Sub-agents share the cache key of their parent; the thread header tells them apart.
+        let key = thread
+            .map(str::to_string)
+            .or_else(|| seen.conversation.clone())
+            .unwrap_or_else(|| {
+                stable_id(&[
+                    "conversation",
+                    &seen.first_user_message,
+                    seen.cwd.as_deref().unwrap_or(""),
+                ])
+            });
         let conv = lock(&self.convs)
             .entry(key.clone())
             .or_insert_with(|| {
@@ -509,6 +513,20 @@ impl Daemon {
     }
 
     fn proxy(self: &Arc<Self>, mut request: Request) {
+        // Codex opens a WebSocket first. 426 makes it switch to HTTP streaming
+        // for the session at once (a 400 would end the turn), and the proxy can
+        // only read and rewrite HTTP requests.
+        let upgrade = request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Upgrade") && h.value.as_str().eq_ignore_ascii_case("websocket"));
+        if upgrade {
+            return respond_json(
+                request,
+                426,
+                &json!({ "error": { "message": "lge proxy: use HTTP streaming for this provider", "type": "upgrade_required" } }),
+            );
+        }
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
         let (path, query) = split_url(&url);
@@ -549,10 +567,16 @@ impl Daemon {
                 Some(_) => None,
             };
             let daemon = self.clone();
+            let thread = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("thread-id"))
+                .map(|(_, v)| v.clone());
             let rewritten = plain.and_then(|plain| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| daemon.rewrite(&plain)))
-                    .ok()
-                    .flatten()
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    daemon.rewrite(&plain, thread.as_deref())
+                }))
+                .ok()
+                .flatten()
             });
             if let Some((new_body, c)) = rewritten {
                 body = new_body;
@@ -643,20 +667,23 @@ impl Daemon {
                 writer.write_all(b"\r\n")?;
                 writer.flush()?;
             }
-            writer.write_all(b"0\r\n\r\n")?;
-            writer.flush()
+            Ok(())
         })();
-        drop(writer);
         // A stream the client cut still used tokens: record what was seen.
-        let _ = relay;
         let usage = scanner.usage.or_else(|| {
             // A response that was not streamed carries its usage in the body.
             let v: Value = serde_json::from_slice(&whole).ok()?;
             crate::responses::usage_of_event(&json!({ "type": "response.completed", "response": v }).to_string())
         });
+        // Recorded before the last chunk goes out, so a client that asks for
+        // the numbers right after the answer ends sees them.
         if let (Some(conv), Some(usage)) = (conv, usage) {
             self.record_usage(&conv, usage);
         }
+        if relay.is_ok() {
+            let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
+        }
+        drop(writer);
     }
 
     // ---- MCP over HTTP ----------------------------------------------------

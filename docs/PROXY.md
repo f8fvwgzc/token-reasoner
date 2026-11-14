@@ -85,24 +85,33 @@ log live in the `lge-data` volume.
 
 ## Connect Codex
 
-The page shows these lines with the right address. Add them to `~/.codex/config.toml`;
-the CLI and the desktop app read the same file:
+Add one line to `~/.codex/config.toml`. The CLI and the desktop app read the same file,
+and your ChatGPT or API-key login stays as it is:
 
 ```toml
-model_provider = "lge"
-
-[model_providers.lge]
-name = "OpenAI through lge"
-base_url = "http://127.0.0.1:8787/v1"
-wire_api = "responses"
-requires_openai_auth = true
+openai_base_url = "http://127.0.0.1:8787/v1"
 ```
+
+Remove the line to stop using the proxy.
+
+How this works with Codex 0.160 (from its source):
+
+- Codex first tries a WebSocket to the provider. The proxy answers `426`, and Codex uses
+  HTTP streaming for the rest of the session. A plain HTTP request is what the proxy can
+  read and rewrite.
+- With a ChatGPT login Codex sends `chatgpt-account-id`; the proxy forwards those requests
+  to `https://chatgpt.com/backend-api/codex`, and API-key requests to
+  `https://api.openai.com/v1`. Credentials pass through and are never stored.
+- With a ChatGPT login Codex compresses request bodies with zstd; the proxy decodes them
+  and forwards plain JSON.
+- If you set `HTTP_PROXY` or `ALL_PROXY` in your shell, add `127.0.0.1` to `NO_PROXY`, or
+  Codex sends the local requests to that proxy.
+- If the daemon is stopped while the line is set, Codex keeps retrying. Start the daemon or
+  remove the line.
 
 Optional, for the graph tools:
 
     codex mcp add local_graph --url http://127.0.0.1:8787/mcp
-
-To stop using the proxy, remove the `model_provider` line.
 
 ## Settings
 

@@ -44,7 +44,7 @@
   <section>
     <h2>Connect Codex</h2>
     <div class="card">
-      <div>Add this to <span class="mono">~/.codex/config.toml</span>. It sends model requests through this proxy and keeps your login. The CLI and the desktop app read the same file.</div>
+      <div>Add this to <span class="mono">~/.codex/config.toml</span>. One line: model requests go through this proxy, your ChatGPT or API-key login stays as it is, and the CLI and the desktop app both read this file. Remove the line to stop.</div>
       <pre class="mono" id="snippet"></pre>
       <div class="dim" style="margin-top:8px">Optional: the graph tools for the agent: <span class="mono" id="mcpcmd"></span></div>
     </div>
@@ -120,7 +120,7 @@ function render(s) {
   ].map(([k, v, d]) => `<div class="card"><div class="dim">${k}</div><div class="big">${v}</div><div class="dim">${d}</div></div>`).join('');
 
   const origin = location.origin;
-  $('snippet').textContent = `model_provider = "lge"\n\n[model_providers.lge]\nname = "OpenAI through lge"\nbase_url = "${origin}/v1"\nwire_api = "responses"\nrequires_openai_auth = true`;
+  $('snippet').textContent = `openai_base_url = "${origin}/v1"`;
   $('mcpcmd').textContent = `codex mcp add local_graph --url ${origin}/mcp`;
 
   $('repos').innerHTML = '<tr><th>Folder</th><th>State</th><th class="n">Files</th><th class="n">Symbols</th><th class="n">Facts</th><th></th></tr>' +

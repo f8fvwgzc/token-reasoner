@@ -703,13 +703,9 @@ fn init(repo: &Path, write: bool, register: bool) -> Result<()> {
     let exe = exe.canonicalize().unwrap_or(exe);
     println!("A. The proxy: every Codex session goes through lge, nothing else to remember.\n");
     println!("   1. Start the daemon:  lge serve      (or, in Docker:  docker compose up -d)");
-    println!("   2. Add to ~/.codex/config.toml (the CLI and the desktop app read the same file):\n");
-    println!("        model_provider = \"lge\"\n");
-    println!("        [model_providers.lge]");
-    println!("        name = \"OpenAI through lge\"");
-    println!("        base_url = \"http://127.0.0.1:8787/v1\"");
-    println!("        wire_api = \"responses\"");
-    println!("        requires_openai_auth = true\n");
+    println!("   2. Add one line to ~/.codex/config.toml (the CLI and the desktop app read the same file;");
+    println!("      your ChatGPT or API-key login stays as it is):\n");
+    println!("        openai_base_url = \"http://127.0.0.1:8787/v1\"\n");
     println!("   3. Open http://127.0.0.1:8787 to add folders and see tokens per session.");
     println!("      Graph tools for the agent:  codex mcp add local_graph --url http://127.0.0.1:8787/mcp\n");
 

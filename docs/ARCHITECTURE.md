@@ -32,6 +32,8 @@ lge-router    reasoning router v0 and v1                     -> core, store, ret
 lge-session   prompt builder and session runner              -> core, store, retrieve, router, usage, filter
 lge-mcp       rmcp stdio server, six tools, watcher          -> core, store, retrieve
 lge-bench     benchmark runner                               -> core, store, retrieve, router
+lge-memory    long-term memory: retain, recall, pages          -> core, store, retrieve
+lge-proxy     daemon: proxy, usage page, MCP over HTTP         -> core, store, retrieve, filter, mcp, memory, usage, router
 lge-cli       the `lge` binary                               -> everything
 ```
 
