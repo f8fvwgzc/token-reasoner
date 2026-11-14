@@ -380,7 +380,7 @@ fn main() -> Result<()> {
             daemon.cfg.data_dir.display()
         );
         eprintln!(
-            "lge: point Codex at it with base_url = \"http://127.0.0.1:{}/v1\"; open the page for the exact lines",
+            "lge: point Codex at it: add  openai_base_url = \"http://127.0.0.1:{}/v1\"  to ~/.codex/config.toml",
             addr.port()
         );
         lge_proxy::server::run(daemon, server);
