@@ -204,6 +204,9 @@ struct AbArgs {
     /// Start even when ~/.codex/config.toml does not send Codex's requests to the daemon.
     #[arg(long)]
     no_codex_check: bool,
+    /// Codex model for both arms. Default: `[session] model` in lge.toml, else Codex's own default.
+    #[arg(long)]
+    model: Option<String>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -790,7 +793,7 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
     };
     let mut opts = ab::AbOptions::new(args.work_dir.clone().unwrap_or_else(ab::default_work_dir));
     opts.runs = args.runs;
-    opts.model = (!session.model.is_empty()).then(|| session.model.clone());
+    opts.model = args.model.clone().or_else(|| (!session.model.is_empty()).then(|| session.model.clone()));
     opts.sandbox = (!args.sandbox.is_empty()).then(|| args.sandbox.clone());
     eprintln!(
         "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions in copies of {} under {}",
