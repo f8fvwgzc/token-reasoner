@@ -1,6 +1,7 @@
-# lge: Local Graph Intelligence Engine
+# token-reasoner
 
-lge sits between your coding agent and the model. It builds a graph of your code, and
+token-reasoner (command name `lge`, the Local Graph Intelligence Engine) sits between your
+coding agent and the model. It builds a graph of your code, and
 uses it to send the model less text for the same work:
 
 ```
@@ -43,9 +44,9 @@ Paste this into Codex, Qwen Code, Claude Code or any agent that can run shell co
 your Mac:
 
 ```text
-Install lge (Local Graph Intelligence Engine) on this Mac and connect Codex to it.
+Install token-reasoner (lge) on this Mac and connect Codex to it.
 Follow the "Instructions for agents" section of
-https://github.com/f8fvwgzc/local-graph-intelli-engine/blob/main/README.md exactly.
+https://github.com/f8fvwgzc/token-reasoner/blob/main/README.md exactly.
 Do not improvise other steps. When done, show me the page URL and the last lines of
 the install output.
 ```
@@ -61,10 +62,10 @@ Run these steps in order. Stop and report if a step fails; do not work around it
    confirm), wait for them, then continue.
 3. **Get the code.**
    ```bash
-   git clone https://github.com/f8fvwgzc/local-graph-intelli-engine.git ~/lge-src
-   cd ~/lge-src
+   git clone https://github.com/f8fvwgzc/token-reasoner.git ~/token-reasoner
+   cd ~/token-reasoner
    ```
-   If `~/lge-src` already exists, run `git -C ~/lge-src pull` instead.
+   If `~/token-reasoner` already exists, run `git -C ~/token-reasoner pull` instead.
 4. **Run the installer.**
    ```bash
    scripts/install-macos.sh --connect-codex
@@ -85,7 +86,7 @@ Run these steps in order. Stop and report if a step fails; do not work around it
    must print `{"ok":true}`. `head -3 ~/.codex/config.toml` must show
    `openai_base_url = "http://127.0.0.1:8787/v1"`.
 6. **Report** to the user: the page URL `http://127.0.0.1:8787`, that the change is undone
-   with `~/lge-src/scripts/install-macos.sh --uninstall`, and that lge stops at logout
+   with `~/token-reasoner/scripts/install-macos.sh --uninstall`, and that lge stops at logout
    unless `--autostart` was used.
 
 The installer is safe to run again. It changes nothing outside `~/.local/bin/lge`,
@@ -100,8 +101,8 @@ Requirements: macOS on Apple silicon or Intel, the Xcode Command Line Tools
 (`xcode-select --install`), and Rust 1.88 or later (`curl https://sh.rustup.rs -sSf | sh`).
 
 ```bash
-git clone https://github.com/f8fvwgzc/local-graph-intelli-engine.git ~/lge-src
-cd ~/lge-src
+git clone https://github.com/f8fvwgzc/token-reasoner.git ~/token-reasoner
+cd ~/token-reasoner
 scripts/install-macos.sh --connect-codex --autostart
 ```
 
@@ -124,8 +125,8 @@ The build downloads LadybugDB 0.22.3 from its GitHub releases (the version is pi
 The same layout as a Headroom container: one container, the page and proxy on port 8787.
 
 ```bash
-git clone https://github.com/f8fvwgzc/local-graph-intelli-engine.git ~/lge-src
-cd ~/lge-src
+git clone https://github.com/f8fvwgzc/token-reasoner.git ~/token-reasoner
+cd ~/token-reasoner
 export LGE_WORKSPACE=$HOME/code     # the folder that holds your repositories
 docker compose up -d --build
 ```
@@ -344,8 +345,8 @@ output_per_mtok = 0.0
 ## 8. Uninstall
 
 ```bash
-~/lge-src/scripts/install-macos.sh --uninstall           # keeps ~/.lge
-~/lge-src/scripts/install-macos.sh --uninstall --purge   # also deletes ~/.lge
+~/token-reasoner/scripts/install-macos.sh --uninstall           # keeps ~/.lge
+~/token-reasoner/scripts/install-macos.sh --uninstall --purge   # also deletes ~/.lge
 ```
 
 This stops lge, removes the start-at-login entry, removes the lge line and the

@@ -1,6 +1,6 @@
 # Notes for coding agents
 
-## Installing lge for a user
+## Installing token-reasoner (lge) for a user
 
 Follow "Instructions for agents" in README.md, section 1. In short, on macOS:
 
