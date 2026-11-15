@@ -55,6 +55,24 @@ fn a_named_symbol_is_the_seed_and_the_pack_follows_it_across_services() {
         text.contains("def create_order(payload: dict):"),
         "the seed body is shown\n{text}"
     );
+    // The conclusions come first, worked out by the graph.
+    assert!(
+        text.contains(
+            "## In short\n- The change starts at orders_api.routes.create_order (orders_api/routes.py:10).\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- Changing it affects 1 symbol(s); nearest, 2 steps away: web_gateway.src.ordersClient.createOrder.\n"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("- Covered by 1 test(s): orders_api.tests.test_routes.test_create_order.\n- It reaches endpoint POST /orders.\n"), "{text}");
+    assert!(
+        text.contains("Edges without a mark were resolved from the source and need no re-checking"),
+        "{text}"
+    );
     assert!(text.contains("orders_api.repo.insert_order"), "what it calls\n{text}");
     assert!(
         text.contains("## Tests to run") && text.contains("orders_api.tests.test_routes.test_create_order"),

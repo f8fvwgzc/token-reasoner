@@ -65,8 +65,10 @@ pub struct Saved {
 /// Opening lines of every injected context. Fixed text: it is part of the
 /// cached prompt of every later turn.
 pub const CONTEXT_OPEN: &str = "<lge_context>\nCode-graph context for the request above, added by the local graph engine, not written by the user. \
-Use it as the map: start from these locations instead of searching, and read only the line ranges you need. \
-Edges marked inferred or unresolved are not verified.\n\n";
+It was worked out from the source: use its conclusions instead of re-deriving them, start from these locations instead of searching, \
+and read only the line ranges you need.\n\n";
+/// Tokens of remembered facts added to one context.
+const MEMORY_BUDGET: usize = 300;
 pub const CONTEXT_CLOSE: &str = "</lge_context>";
 
 #[derive(Default)]
@@ -179,7 +181,27 @@ impl Session {
             self.relevant_symbols.insert(seed.id.clone());
         }
         self.relevant_files.extend(pack.files.iter().cloned());
-        Some(format!("{CONTEXT_OPEN}{}\n{CONTEXT_CLOSE}", pack.text.trim_end()))
+        // Decisions and conventions stored in earlier sessions: the model uses
+        // them instead of working them out again.
+        let mut text = pack.text.trim_end().to_string();
+        let remembered = lge_memory::recall(
+            graph.store,
+            user_text,
+            &lge_memory::RecallOptions {
+                budget: MEMORY_BUDGET,
+                now: lge_retrieve::unix_now(),
+                limit: 8,
+                ..lge_memory::RecallOptions::default()
+            },
+            None,
+        );
+        if let Ok(found) = remembered {
+            if !found.items.is_empty() {
+                text.push_str("\n\n## Decided in earlier sessions\n");
+                text.push_str(found.text.trim_end());
+            }
+        }
+        Some(format!("{CONTEXT_OPEN}{text}\n{CONTEXT_CLOSE}"))
     }
 
     /// What to send in place of the output of a shell command, or `None` to

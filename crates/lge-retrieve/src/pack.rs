@@ -279,6 +279,24 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
         ),
     );
 
+    // The conclusions the graph has already worked out, first: the model can
+    // start from them instead of deriving them in its reasoning.
+    for line in in_short(
+        &seed_nodes,
+        &seeds,
+        &used_by_symbols,
+        &tests,
+        &resources,
+        unresolved.len() + inferred.len(),
+    ) {
+        emit_forced(&mut text, &mut budget, &line);
+    }
+    emit_forced(
+        &mut text,
+        &mut budget,
+        "Edges without a mark were resolved from the source and need no re-checking; only those marked inferred or unresolved do.",
+    );
+
     emit_forced(&mut text, &mut budget, "\n## Start here");
     let body_allowance = ((opts.budget as f64 * SEED_BODY_SHARE) as usize / seeds.len()).max(40);
     let rationale = rationale_by_symbol(store, &seed_ids);
@@ -462,6 +480,81 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
     pack.unresolved_edges = unresolved.len() as i64;
     pack.inferred_edges = inferred.len();
     Ok(pack)
+}
+
+/// Names of at most `n` nodes, then "and N more".
+fn some_names<'a>(names: impl Iterator<Item = &'a str>, n: usize) -> String {
+    let all: Vec<&str> = names.collect();
+    let mut out = all.iter().take(n).copied().collect::<Vec<_>>().join(", ");
+    if all.len() > n {
+        out.push_str(&format!(" and {} more", all.len() - n));
+    }
+    out
+}
+
+/// The pack's conclusions in a few sentences: where the change starts, what it
+/// affects, which tests cover it, what it reaches outside the code, and how
+/// much of that is not verified. Every sentence comes from the graph.
+fn in_short(
+    seed_nodes: &HashMap<String, NodeRec>,
+    seeds: &[Seed],
+    used_by: &[&Reached],
+    tests: &[&Reached],
+    resources: &[(&'static str, &Reached)],
+    unverified: usize,
+) -> Vec<String> {
+    let mut out = vec!["\n## In short".to_string()];
+    let starts: Vec<String> = seeds
+        .iter()
+        .filter_map(|s| seed_nodes.get(&s.hit.id))
+        .map(|n| format!("{} ({}:{})", n.qualified_name, n.file_path, n.start_line))
+        .collect();
+    out.push(format!(
+        "- The change starts at {}.",
+        some_names(starts.iter().map(String::as_str), 3)
+    ));
+    // The nearest dependents: callers when there are any, otherwise whatever
+    // is closest (code that reaches it through an endpoint or a queue).
+    let nearest_hop = used_by.iter().map(|r| r.hops).min().unwrap_or(0);
+    let nearest: Vec<&&Reached> = used_by.iter().filter(|r| r.hops == nearest_hop).collect();
+    if used_by.is_empty() {
+        out.push("- Nothing else in the code calls or depends on it.".to_string());
+    } else {
+        let how = if nearest_hop == 1 {
+            "directly".to_string()
+        } else {
+            format!("nearest, {nearest_hop} steps away")
+        };
+        out.push(format!(
+            "- Changing it affects {} symbol(s); {how}: {}.",
+            used_by.len(),
+            some_names(nearest.iter().map(|r| r.node.qualified_name.as_str()), 4)
+        ));
+    }
+    if tests.is_empty() {
+        out.push("- No test reaches it.".to_string());
+    } else {
+        out.push(format!(
+            "- Covered by {} test(s): {}.",
+            tests.len(),
+            some_names(tests.iter().map(|r| r.node.qualified_name.as_str()), 3)
+        ));
+    }
+    let mut outside: Vec<String> = resources.iter().map(|(_, r)| resource_line(&r.node)).collect();
+    outside.sort();
+    outside.dedup();
+    if !outside.is_empty() {
+        out.push(format!(
+            "- It reaches {}.",
+            some_names(outside.iter().map(String::as_str), 4)
+        ));
+    }
+    if unverified > 0 {
+        out.push(format!(
+            "- {unverified} link(s) below are not verified; check them in the source before relying on them."
+        ));
+    }
+    out
 }
 
 /// The line every answer ends with, so the reader knows how fresh it is.

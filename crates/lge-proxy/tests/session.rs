@@ -108,6 +108,28 @@ fn context_is_added_for_a_message_about_the_code_and_repeated_exactly() {
     assert!(found.contains("recordDelivery"), "{found}");
     assert_eq!(session.saved.contexts_added, 2);
 
+    // A decision stored in an earlier session comes with the context.
+    lge_memory::retain(
+        &store,
+        &lge_memory::RetainInput {
+            text: "notifier/src/audit.ts must never block the email: audit writes are fire-and-forget".into(),
+            kind: "decision".into(),
+            key: "notifier.audit".into(),
+            ..lge_memory::RetainInput::default()
+        },
+        1_794_441_600,
+    )
+    .unwrap();
+    let mut fresh = Session::default();
+    let with_memory = fresh
+        .context_for(&graph, "recordDelivery should log the delivery time", &opts)
+        .expect("names a symbol");
+    assert!(
+        with_memory
+            .contains("## Decided in earlier sessions\n- [decision] notifier/src/audit.ts must never block the email"),
+        "{with_memory}"
+    );
+
     let off = Options {
         inject_context: false,
         ..Options::default()

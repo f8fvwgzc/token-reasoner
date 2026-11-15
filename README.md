@@ -228,6 +228,41 @@ A coding agent spends most of its tokens finding its way: listing folders, grepp
 reading whole files, rereading the same output, and reading thousands of lines of passing
 test output. Each of these turns is sent again on every later turn of the conversation.
 
+### One request, step by step
+
+1. **You ask Codex** for a fix, a feature or a change, in your own words.
+2. **lge refreshes the graph.** Files that changed since the last request (including the
+   ones Codex just edited) are parsed again and their edges resolved again, so the graph
+   always matches the code on disk. Unchanged files cost nothing.
+3. **lge finds what your message is about** in the graph: symbols you named, then
+   full-text search over names, split identifier words, signatures, docs and comments.
+4. **lge gathers the answer Codex would otherwise go looking for:** the files and line
+   ranges, the source of the starting symbols, what they call, what calls them, the tests
+   that cover them, the endpoints, queues and tables they reach, and decisions remembered
+   from earlier sessions.
+5. **lge adds that to your message** as one short context block, under a token budget,
+   with the conclusions first ("the change starts at X, it affects Y, tests Z cover it").
+6. **Codex starts from the answer** instead of listing folders, grepping and reading
+   whole files. Its later tool output (test runs, searches, repeated reads) is shortened
+   on the way out, and the conversation's cached prefix is kept intact.
+
+### Why reasoning tokens drop too
+
+The model and its reasoning level do not change, but the model reasons again on every
+turn, over everything in front of it. lge lowers that in four ways:
+
+- **Fewer turns.** Every search or file read the context replaces is one round of
+  reasoning that never happens.
+- **Conclusions, not raw material.** What a change affects, who calls it and which tests
+  cover it are computed by the graph and stated first, so the model does not derive them.
+- **No re-checking.** Edges resolved from the source are marked as such; the model is
+  told that only the edges marked inferred or unresolved need checking.
+- **No re-deciding.** Decisions and conventions stored in earlier sessions come with the
+  context instead of being worked out again.
+
+How much this saves depends on the task; the page shows reasoning tokens per session next
+to your sessions from before lge, so you can see it on your own work.
+
 ### What lge does with each request
 
 lge reads the request Codex sends, changes only what it understands, and forwards it:
