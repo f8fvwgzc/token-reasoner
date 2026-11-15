@@ -345,8 +345,10 @@ pub(crate) fn lambda_label(src: &[u8], lambda_start: usize) -> String {
 /// True for a header that is C++ rather than C: a line that starts a class,
 /// a namespace, a template or an access section.
 pub(crate) fn looks_like_cpp(src: &[u8]) -> bool {
-    String::from_utf8_lossy(src).lines().any(|line| {
+    String::from_utf8_lossy(sniffed(src)).lines().any(|line| {
         let t = line.trim_start();
+        // `extern "C"` guards a C API for C++ callers; the C grammar rejects the
+        // linkage block and would lose every declaration inside it.
         [
             "class ",
             "namespace ",
@@ -355,9 +357,36 @@ pub(crate) fn looks_like_cpp(src: &[u8]) -> bool {
             "private:",
             "protected:",
             "using namespace ",
+            "extern \"C\"",
         ]
         .iter()
         .any(|p| t.starts_with(p))
+    })
+}
+
+/// The part of a file read to decide its dialect.
+fn sniffed(src: &[u8]) -> &[u8] {
+    &src[..src.len().min(256 * 1024)]
+}
+
+/// True for MATLAB or Octave source: a `function` or `classdef` line, or a
+/// `%` comment line, with no Objective-C directive (checked by the caller).
+pub(crate) fn looks_like_matlab(src: &[u8]) -> bool {
+    String::from_utf8_lossy(sniffed(src)).lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("function ") || t.starts_with("classdef ") || t.starts_with('%')
+    })
+}
+
+/// True for Objective-C: a `.h` header with `@interface` and friends, or a
+/// `.m` file that is Objective-C rather than MATLAB or Octave (which share the
+/// extension and contain none of these).
+pub(crate) fn looks_like_objc(src: &[u8]) -> bool {
+    String::from_utf8_lossy(sniffed(src)).lines().any(|line| {
+        let t = line.trim_start();
+        ["@interface", "@protocol", "@implementation", "@import", "#import"]
+            .iter()
+            .any(|p| t.starts_with(p))
     })
 }
 

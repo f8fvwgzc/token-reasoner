@@ -85,9 +85,10 @@ const DEPENDENCY_DIRS: &[&str] = &[
 /// Generated source of the other languages: protobuf, Dart builders, designers.
 const GENERATED_SUFFIXES: &[&str] = &[".pb.go", ".pb.cc", ".pb.h", ".g.dart", ".freezed.dart", ".Designer.cs"];
 
-/// Largest file of the other languages that is read. A bigger one is generated
-/// (a parser table, an amalgamation) and would flood the graph with call sites.
-const MAX_GENERIC_BYTES: u64 = 2 * 1024 * 1024;
+/// Largest file of the other languages that is read at all. Files over 2 MiB
+/// are read for their definitions only (see `generic::CALLS_UP_TO_BYTES`):
+/// they are almost always generated, and their calls would flood the graph.
+const MAX_GENERIC_BYTES: u64 = 16 * 1024 * 1024;
 
 /// True for a file of a language read through a tags query that is a
 /// dependency, generated, or too big to be written by hand.
@@ -165,6 +166,8 @@ pub fn parse_file(rel_path: &str, service: &str, src: &[u8], hash: &str) -> Resu
         lang::PYTHON => parse_python(rel_path, service, src, hash)?,
         lang::TYPESCRIPT | lang::JAVASCRIPT => parse_typescript(rel_path, service, src, hash)?,
         doc if document::is_document(doc) => document::parse_document(rel_path, service, src, hash, doc)?,
+        // `.m` is Objective-C or MATLAB; MATLAB read as Objective-C is garbage.
+        lang::OBJC if rel_path.ends_with(".m") && !generic::is_objc_source(src) => return Ok(None),
         other => parse_generic(rel_path, service, src, hash, other)?,
     };
     let tokens: Vec<&str> = [Some(comment), generic::alt_comment_token(lang)]

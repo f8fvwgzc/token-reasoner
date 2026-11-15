@@ -166,6 +166,7 @@ struct File<'a> {
 /// Parse one file of a language read through a grammar and a tags query.
 pub fn parse_generic(rel_path: &str, service: &str, src: &[u8], hash: &str, lang: &str) -> Result<ParsedFile> {
     let lang = grammar_lang(rel_path, src, lang);
+    let large = src.len() > CALLS_UP_TO_BYTES;
     let i = position(lang).with_context(|| format!("no grammar for language {lang:?}"))?;
     let config = config(i)?;
     let tags = tags_for(config, &GRAMMARS[i], src).with_context(|| format!("tags of {rel_path}"))?;
@@ -208,7 +209,18 @@ pub fn parse_generic(rel_path: &str, service: &str, src: &[u8], hash: &str, lang
     };
     out.symbols.push(module_symbol(&file, &module, &module_id, &defs));
     out.symbols.extend(definition_symbols(&file, &defs, &ids));
-    out.calls = call_sites(&file, &call_tags(&tags, config, src), config, &defs, &ids, &module_id);
+    // A very large file is almost always generated (a parser table, a bundle):
+    // its definitions are kept, its calls would flood the graph.
+    if !large {
+        out.calls = call_sites(
+            &file,
+            &call_tags(&tags, config, src, file.grammar.lang),
+            config,
+            &defs,
+            &ids,
+            &module_id,
+        );
+    }
     if file.grammar.case_insensitive {
         same_case_as_definitions(&mut out);
     }
@@ -250,7 +262,8 @@ fn definition_symbols(file: &File, defs: &[Definition], ids: &[String]) -> Vec<S
 
 /// The reference tags that are calls. A macro lives in another namespace than
 /// a function: `name!(...)` is a call only of a macro the file defines.
-fn call_tags<'t>(tags: &'t [Tag], config: &TagsConfiguration, src: &[u8]) -> Vec<&'t Tag> {
+fn call_tags<'t>(tags: &'t [Tag], config: &TagsConfiguration, src: &[u8], lang: &str) -> Vec<&'t Tag> {
+    let rust = lang == lang::RUST;
     let syntax = |t: &Tag| config.syntax_type_name(t.syntax_type_id);
     let macros: HashSet<String> = tags
         .iter()
@@ -261,7 +274,7 @@ fn call_tags<'t>(tags: &'t [Tag], config: &TagsConfiguration, src: &[u8]) -> Vec
         .filter(|t| {
             !t.is_definition
                 && match syntax(t) {
-                    "call" | "new" | "cascade" => true,
+                    "call" | "new" | "cascade" => !(rust && declared_in_macro(src, t)),
                     "macro" => macros.contains(&text::name_text(src, &t.name_range)),
                     _ => false,
                 }
@@ -269,14 +282,42 @@ fn call_tags<'t>(tags: &'t [Tag], config: &TagsConfiguration, src: &[u8]) -> Vec
         .collect()
 }
 
+/// True when a Rust call tag's name follows `fn`, `$` or `#`: inside a macro's
+/// token tree that is a function being defined (`quote! { fn f() {} }`), a
+/// macro variable or an attribute, not a call. Rust only: in Haskell (`f $ x`),
+/// OCaml (`obj#m`) and R (`obj$m()`) those characters come before real calls.
+fn declared_in_macro(src: &[u8], t: &Tag) -> bool {
+    let before = String::from_utf8_lossy(&src[t.name_range.start.saturating_sub(16)..t.name_range.start]);
+    let before = before.trim_end();
+    before.ends_with('$')
+        || before.ends_with('#')
+        || before.ends_with(" fn")
+        || before.ends_with("\tfn")
+        || before == "fn"
+        || before.ends_with("{fn")
+}
+
+/// True when a `.m` file is Objective-C, not MATLAB.
+pub(crate) fn is_objc_source(src: &[u8]) -> bool {
+    text::looks_like_objc(src) || !text::looks_like_matlab(src)
+}
+
+/// Files larger than this keep their definitions but not their calls.
+pub(crate) const CALLS_UP_TO_BYTES: usize = 2 * 1024 * 1024;
+
 /// The language whose grammar reads a file: a `.h` header written in C++
 /// (most C++ projects name their headers `.h`) is read as C++.
 fn grammar_lang<'l>(path: &str, src: &[u8], lang: &'l str) -> &'l str {
-    if lang == lang::C && path.ends_with(".h") && text::looks_like_cpp(src) {
-        lang::CPP
-    } else {
-        lang
+    if lang == lang::C && path.ends_with(".h") {
+        // Objective-C first: an Objective-C++ header can hold C++ as well.
+        if text::looks_like_objc(src) {
+            return lang::OBJC;
+        }
+        if text::looks_like_cpp(src) {
+            return lang::CPP;
+        }
     }
+    lang
 }
 
 fn module_symbol(file: &File, module: &str, id: &str, defs: &[Definition]) -> SymbolRec {

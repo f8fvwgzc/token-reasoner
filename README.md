@@ -427,7 +427,10 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 ## 10. Limits
 
 - **Languages:** 36 languages are indexed, at the depths in the table in section 6. Files
-  in other languages, and files over 2 MiB, are not in the graph.
+  in other languages are not in the graph. Source files over 2 MiB (almost always
+  generated) keep their definitions but not their calls; files over 16 MiB are skipped.
+- `.h` headers are read as C, C++ or Objective-C by their content, and `.m` files that are
+  MATLAB rather than Objective-C are left out, as graphify does.
 - **Proxy:** only the OpenAI Responses API is rewritten (Codex). Other APIs pass through
   unchanged.
 - **Savings are not measured yet.** The page shows real counts per session; judge from
