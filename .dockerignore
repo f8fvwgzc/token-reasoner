@@ -2,7 +2,6 @@ target/
 .git/
 .lge/
 .claude/
-.cargo/config.toml
 **/.DS_Store
 docs/
 tests/

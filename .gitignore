@@ -1,5 +1,4 @@
 target/
 .lge/
-.cargo/config.toml
 .DS_Store
 .claude/worktrees/

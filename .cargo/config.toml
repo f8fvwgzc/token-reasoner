@@ -1,0 +1,4 @@
+[env]
+# The `lbug` crate downloads a prebuilt LadybugDB library at build time. Without
+# a version it asks for the latest release, whose files may not match the crate.
+LBUG_VERSION = "0.22.3"
