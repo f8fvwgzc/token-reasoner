@@ -238,8 +238,9 @@ test output. Each of these turns is sent again on every later turn of the conver
    full-text search over names, split identifier words, signatures, docs and comments.
 4. **lge gathers the answer Codex would otherwise go looking for:** the files and line
    ranges, the source of the starting symbols, what they call, what calls them, the tests
-   that cover them, the endpoints, queues and tables they reach, and decisions remembered
-   from earlier sessions.
+   that cover them, the endpoints, queues and tables they reach, decisions remembered
+   from earlier sessions, and the recent commits and merged pull requests that touched
+   that code.
 5. **lge adds that to your message** as one short context block, under a token budget,
    with the conclusions first ("the change starts at X, it affects Y, tests Z cover it").
 6. **Codex starts from the answer** instead of listing folders, grepping and reading
@@ -289,12 +290,26 @@ cached. A request in which nothing changed is forwarded byte for byte.
 files ─► scan ─► parse (tree-sitter) ─► resolve ─► LadybugDB ─► rank ─► evidence pack
 ```
 
-1. **Scan.** Python, TypeScript and JavaScript files, honouring `.gitignore`. Only new and
-   changed files are parsed again (content hash), and a changed working tree is picked up
-   before each answer.
-2. **Parse.** Every function, method, class, interface and type with its signature, doc
-   line, body and line range; every call, import, HTTP route, HTTP call, SQL table, ORM
-   model, queue publish and consume, base class, and `NOTE:` / `WHY:` / `HACK:` comment.
+1. **Scan.** Source in 36 languages, honouring `.gitignore`, plus HTML, CSS, Markdown,
+   SQL, YAML, TOML and JSON as outlines (see the table below). Only new and changed files
+   are parsed again (content hash), and a changed working tree is picked up before each
+   answer.
+2. **Parse.** With tree-sitter, every function, method, class, interface and type with its
+   signature, doc line, body and line range, and every call with its receiver. Python,
+   TypeScript and JavaScript go deeper: imports, HTTP routes and calls, SQL tables, ORM
+   models, queue publish and consume, base classes. `NOTE:` / `WHY:` / `HACK:` comments are
+   kept with their symbol in every language. Documents are outlined: page titles, element
+   ids, headings, selectors, tables and top-level keys, each with its lines.
+
+   | Depth | Languages |
+   |---|---|
+   | Full (imports, routes, tables, queues) | Python, TypeScript, JavaScript |
+   | Definitions and calls | Rust, Go, Java, Kotlin, Scala, Groovy, C, C++, CUDA, C#, Swift, Objective-C, Dart, Ruby, PHP, Perl, Lua, Luau, Bash, PowerShell, R, Julia, Elixir, Erlang, Gleam, Haskell, OCaml, F#, Elm, Clojure, Zig, Nix, Solidity |
+   | Outline | HTML (also Vue, Svelte), CSS, SCSS, Less, Markdown, SQL, YAML, TOML, JSON |
+
+   In the languages without import resolution, a call to the same file or to the own class
+   is verified; a call matched by name across files is marked inferred (one candidate) or
+   unresolved (several), never verified.
 3. **Resolve.** Calls and imports are matched to their targets. Every edge records how it
    was found:
 
@@ -326,8 +341,9 @@ A repeated fact raises a counter instead of adding a copy; a newer fact with the
 closes the older one, which is kept, not deleted. `recall_memory` searches by keyword, by
 the code the facts mention, and by recency, merges the lists by rank, and packs the
 result into a token budget. Facts tagged as decisions, conventions or feature work are
-also written as markdown pages under `~/.lge/graphs/<repo>/pages/`. No model is called to
-store or recall memory.
+also written as markdown pages under `~/.lge/graphs/<repo>/pages/`. Every git commit, merges (merged pull requests) included, is
+also stored as a fact linked to the files it changed, so asking about code brings its
+recent history along without `git log`. No model is called to store or recall memory.
 
 ### Where the ideas come from
 
@@ -410,8 +426,8 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 
 ## 10. Limits
 
-- **Languages:** Python, TypeScript and JavaScript are indexed. Other files are not in the
-  graph (Rust, Go, Java, ... are not yet supported).
+- **Languages:** 36 languages are indexed, at the depths in the table in section 6. Files
+  in other languages, and files over 2 MiB, are not in the graph.
 - **Proxy:** only the OpenAI Responses API is rewritten (Codex). Other APIs pass through
   unchanged.
 - **Savings are not measured yet.** The page shows real counts per session; judge from

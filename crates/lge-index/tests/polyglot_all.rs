@@ -21,6 +21,7 @@ impl Fixture {
         assert_eq!(
             listed,
             vec![
+                ("notifier/package.json", "notifier", "json"),
                 ("notifier/src/audit.ts", "notifier", "typescript"),
                 ("notifier/src/consumer.test.ts", "notifier", "typescript"),
                 ("notifier/src/consumer.ts", "notifier", "typescript"),
@@ -33,11 +34,12 @@ impl Fixture {
                 ("orders_api/routes.py", "orders_api", "python"),
                 ("orders_api/tests/__init__.py", "orders_api", "python"),
                 ("orders_api/tests/test_routes.py", "orders_api", "python"),
+                ("web_gateway/package.json", "web_gateway", "json"),
                 ("web_gateway/src/ordersClient.ts", "web_gateway", "typescript"),
                 ("web_gateway/src/routes.ts", "web_gateway", "typescript"),
                 ("web_gateway/src/views.ts", "web_gateway", "typescript"),
             ],
-            "package.json is not source"
+            "source files and package.json outlines"
         );
         let parsed = lge_index::parse_many(&scanned);
         assert_eq!(parsed.len(), scanned.len(), "every file has an extractor");

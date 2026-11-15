@@ -92,6 +92,31 @@ pub fn ingest_commits(store: &dyn GraphStore, commits: &[Commit], now: i64) -> R
     Ok(stored)
 }
 
+/// Commits read per call at most. The walk stops earlier at the first commit
+/// already in memory, so this bounds only the first run on a long history.
+pub const HISTORY_DEPTH: usize = 200;
+
+/// Read the repository's recent history from git and store what is new.
+pub fn ingest_repo_history(store: &dyn GraphStore, root: &std::path::Path, now: i64) -> Result<usize> {
+    // Nothing new since the last call: one lookup, no walk.
+    match lge_index::git::head_commit(root) {
+        Some(head) if !store.memories_by_key(&commit_key(&head))?.is_empty() => return Ok(0),
+        None => return Ok(0),
+        _ => {}
+    }
+    let commits: Vec<Commit> = lge_index::git::recent_commits(root, HISTORY_DEPTH)?
+        .into_iter()
+        .map(|c| Commit {
+            sha: c.sha,
+            time: c.time,
+            subject: c.subject,
+            files: c.files,
+            merge: c.merge,
+        })
+        .collect();
+    ingest_commits(store, &commits, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,29 +147,4 @@ mod tests {
         assert_eq!(commit_key("381f402ee3c8a1b2"), "commit:381f402ee3c8");
         assert_eq!(commit_key("abc"), "commit:abc");
     }
-}
-
-/// Commits read per call at most. The walk stops earlier at the first commit
-/// already in memory, so this bounds only the first run on a long history.
-pub const HISTORY_DEPTH: usize = 200;
-
-/// Read the repository's recent history from git and store what is new.
-pub fn ingest_repo_history(store: &dyn GraphStore, root: &std::path::Path, now: i64) -> Result<usize> {
-    // Nothing new since the last call: one lookup, no walk.
-    match lge_index::git::head_commit(root) {
-        Some(head) if !store.memories_by_key(&commit_key(&head))?.is_empty() => return Ok(0),
-        None => return Ok(0),
-        _ => {}
-    }
-    let commits: Vec<Commit> = lge_index::git::recent_commits(root, HISTORY_DEPTH)?
-        .into_iter()
-        .map(|c| Commit {
-            sha: c.sha,
-            time: c.time,
-            subject: c.subject,
-            files: c.files,
-            merge: c.merge,
-        })
-        .collect();
-    ingest_commits(store, &commits, now)
 }

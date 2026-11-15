@@ -1,14 +1,20 @@
 //! Repository scanner, content hashing, git change detection and Tree-sitter
 //! extraction of symbols, call sites, import sites and fact sites.
 //!
+//! Python, TypeScript and JavaScript have extractors of their own. Every other
+//! language goes through [`parse_generic`]: a grammar and a tags query per language.
+//!
 //! This crate only reads source files. It never resolves anything: what it
 //! returns is what is written in one file, and `lge-resolve` turns that into edges.
 
+mod document;
 pub mod facts;
+mod generic;
 pub mod git;
 mod python;
 mod typescript;
 
+pub use generic::parse_generic;
 pub use python::parse_python;
 pub use typescript::parse_typescript;
 
@@ -40,7 +46,7 @@ pub fn lang_of(path: &str) -> Option<&'static str> {
         "py" => Some(lang::PYTHON),
         "ts" | "tsx" => Some(lang::TYPESCRIPT),
         "js" | "jsx" | "mjs" | "cjs" => Some(lang::JAVASCRIPT),
-        _ => None,
+        other => generic::lang_of_extension(other).or_else(|| document::lang_of_extension(other)),
     }
 }
 
@@ -49,7 +55,51 @@ const SKIP_DIRS: &[&str] = &["node_modules", "dist", "build", ".venv", "venv", "
 
 /// Generated files that share an extension with real source.
 fn is_generated(file_name: &str) -> bool {
-    file_name.ends_with(".d.ts") || file_name.ends_with(".min.js")
+    file_name.ends_with(".d.ts")
+        || file_name.ends_with(".min.js")
+        || document::is_generated(file_name.rsplit('/').next().unwrap_or(file_name))
+}
+
+/// Directories where the other languages keep dependencies and build output
+/// (Go and PHP `vendor`, Rust `target`, Elixir `deps` and `_build`, ...). They
+/// are skipped only for files of those languages, so what Python, TypeScript
+/// and JavaScript index stays the same.
+const DEPENDENCY_DIRS: &[&str] = &[
+    "vendor",
+    "target",
+    "_build",
+    "deps",
+    "Pods",
+    ".build",
+    ".gradle",
+    ".dart_tool",
+    ".stack-work",
+    "dist-newstyle",
+    "elm-stuff",
+    "zig-cache",
+    ".zig-cache",
+    "zig-out",
+    "_opam",
+];
+
+/// Generated source of the other languages: protobuf, Dart builders, designers.
+const GENERATED_SUFFIXES: &[&str] = &[".pb.go", ".pb.cc", ".pb.h", ".g.dart", ".freezed.dart", ".Designer.cs"];
+
+/// Largest file of the other languages that is read. A bigger one is generated
+/// (a parser table, an amalgamation) and would flood the graph with call sites.
+const MAX_GENERIC_BYTES: u64 = 2 * 1024 * 1024;
+
+/// True for a file of a language read through a tags query that is a
+/// dependency, generated, or too big to be written by hand.
+fn is_dependency_or_generated(rel: &str, lang: &str, bytes: u64) -> bool {
+    if matches!(lang, lang::PYTHON | lang::TYPESCRIPT | lang::JAVASCRIPT) {
+        return false;
+    }
+    let mut dirs = rel.split('/');
+    dirs.next_back();
+    bytes > MAX_GENERIC_BYTES
+        || dirs.any(|d| DEPENDENCY_DIRS.contains(&d))
+        || GENERATED_SUFFIXES.iter().any(|s| rel.ends_with(s))
 }
 
 /// Walk `root`, honouring .gitignore, and return the source files of every
@@ -80,7 +130,8 @@ pub fn scan(root: &Path, service_depth: usize) -> Result<Vec<ScannedFile>> {
         }
         let rel = p.strip_prefix(&root)?.to_string_lossy().replace('\\', "/");
         let Some(lang) = lang_of(&rel) else { continue };
-        if is_generated(&rel) {
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if is_generated(&rel) || is_dependency_or_generated(&rel, lang, bytes) {
             continue;
         }
         let service = match (service_depth, rel.split_once('/')) {
@@ -107,13 +158,31 @@ pub fn hash_file(path: &Path) -> Result<(Vec<u8>, String)> {
 /// Parse one file with the extractor for its language. `Ok(None)` means the
 /// language is not supported.
 pub fn parse_file(rel_path: &str, service: &str, src: &[u8], hash: &str) -> Result<Option<ParsedFile>> {
-    let (mut parsed, comment) = match lang_of(rel_path) {
-        Some(lang::PYTHON) => (parse_python(rel_path, service, src, hash)?, "#"),
-        Some(lang::TYPESCRIPT | lang::JAVASCRIPT) => (parse_typescript(rel_path, service, src, hash)?, "//"),
-        _ => return Ok(None),
+    let (Some(lang), Some(comment)) = (lang_of(rel_path), comment_token(rel_path)) else {
+        return Ok(None);
     };
-    add_rationale(&mut parsed, rel_path, src, comment);
+    let mut parsed = match lang {
+        lang::PYTHON => parse_python(rel_path, service, src, hash)?,
+        lang::TYPESCRIPT | lang::JAVASCRIPT => parse_typescript(rel_path, service, src, hash)?,
+        doc if document::is_document(doc) => document::parse_document(rel_path, service, src, hash, doc)?,
+        other => parse_generic(rel_path, service, src, hash, other)?,
+    };
+    let tokens: Vec<&str> = [Some(comment), generic::alt_comment_token(lang)]
+        .into_iter()
+        .flatten()
+        .collect();
+    add_rationale(&mut parsed, rel_path, src, &tokens);
     Ok(Some(parsed))
+}
+
+/// The line comment token of a file's language (`#`, `//`, `--`, `%`, `(*`),
+/// decided by its extension. `None` means the file is not indexed.
+pub fn comment_token(path: &str) -> Option<&'static str> {
+    match lang_of(path)? {
+        lang::PYTHON => Some("#"),
+        lang::TYPESCRIPT | lang::JAVASCRIPT => Some("//"),
+        other => generic::comment_token(other).or_else(|| document::comment_token(other)),
+    }
 }
 
 /// Comment prefixes that say why code is the way it is. Such a comment is
@@ -122,20 +191,27 @@ const RATIONALE_MARKERS: [&str; 7] = ["NOTE:", "WHY:", "HACK:", "IMPORTANT:", "R
 
 /// Attach every rationale comment to the innermost symbol that contains its
 /// line, as a `rationale` fact. Works on source lines, so it is the same for
-/// every language: a comment token, optional spaces, then a marker.
-fn add_rationale(parsed: &mut ParsedFile, rel_path: &str, src: &[u8], comment: &str) {
+/// every language: a comment token (one of `comments`), optional spaces, then a marker.
+fn add_rationale(parsed: &mut ParsedFile, rel_path: &str, src: &[u8], comments: &[&str]) {
     let text = String::from_utf8_lossy(src);
     for (i, line) in text.lines().enumerate() {
-        let Some(note) = rationale_in(line, comment) else {
+        let Some(note) = comments.iter().find_map(|c| rationale_in(line, c)) else {
             continue;
         };
         let line_no = i as i64 + 1;
-        // The innermost symbol is the one with the smallest range that holds the line.
+        // The innermost symbol is the one with the smallest range that holds the
+        // line; a definition before the module when both span the whole file.
         let owner = parsed
             .symbols
             .iter()
             .filter(|s| s.start_line <= line_no && line_no <= s.end_line)
-            .min_by_key(|s| (s.end_line - s.start_line, s.start_line));
+            .min_by_key(|s| {
+                (
+                    s.end_line - s.start_line,
+                    s.kind == lge_core::kind::MODULE,
+                    s.start_line,
+                )
+            });
         let Some(owner) = owner else { continue };
         parsed.facts.push(facts::fact_site(
             rel_path,
@@ -151,7 +227,8 @@ fn add_rationale(parsed: &mut ParsedFile, rel_path: &str, src: &[u8], comment: &
 }
 
 /// The rationale text of a line, when it has a comment that starts with a
-/// marker: `# NOTE: ...`, `// WHY: ...`, ` * HACK: ...`. At most 200 chars.
+/// marker: `# NOTE: ...`, `// WHY: ...`, ` * HACK: ...`, `-- TODO: ...`,
+/// `%% FIXME: ...`, `(* NOTE: ... *)`. At most 200 chars.
 fn rationale_in(line: &str, comment: &str) -> Option<String> {
     let trimmed = line.trim_start();
     // A block-comment line (`* NOTE:` or `/* NOTE:`), a whole-line comment, or
@@ -164,11 +241,15 @@ fn rationale_in(line: &str, comment: &str) -> Option<String> {
         let at = line.find(&format!(" {comment}"))?;
         &line[at + 1 + comment.len()..]
     };
-    let after = after.trim_start_matches(['/', '#', '*', '!']).trim_start();
+    // A repeated comment token (`%%`, `;;`, `---`) is still the comment token.
+    let after = after
+        .trim_start_matches(|c: char| matches!(c, '/' | '#' | '*' | '!') || comment.contains(c))
+        .trim_start();
+    let closer = if comment == "(*" { "*)" } else { "*/" };
     RATIONALE_MARKERS
         .iter()
         .any(|m| after.starts_with(m))
-        .then(|| after.trim_end_matches("*/").trim().chars().take(200).collect())
+        .then(|| after.trim_end_matches(closer).trim().chars().take(200).collect())
 }
 
 /// Read, hash and parse `files` in parallel. The result keeps the order of
@@ -282,9 +363,42 @@ mod tests {
         for js in ["x.js", "x.jsx", "x.mjs", "x.cjs"] {
             assert_eq!(lang_of(js), Some(lang::JAVASCRIPT), "{js}");
         }
-        for other in ["README.md", "Makefile", "a.py/readme", "x.pyc", "x.json", ".py"] {
+        // Documents are indexed as outlines.
+        assert_eq!(lang_of("README.md"), Some("markdown"));
+        assert_eq!(lang_of("web/x.json"), Some("json"));
+        assert_eq!(lang_of("index.html"), Some("html"));
+        for other in ["notes.txt", "Makefile", "a.py/readme", "x.pyc", "x.lock", ".py"] {
             assert_eq!(lang_of(other), None, "{other}");
         }
+        for (path, lang) in [
+            ("a/b.go", lang::GO),
+            ("a/b.rs", lang::RUST),
+            ("A.java", lang::JAVA),
+            ("x.h", lang::C),
+            ("x.hpp", lang::CPP),
+            ("x.R", lang::R),
+            ("x.r", lang::R),
+            ("x.m", lang::OBJC),
+            ("x.exs", lang::ELIXIR),
+            ("x.ml", lang::OCAML),
+            ("x.ps1", lang::POWERSHELL),
+        ] {
+            assert_eq!(lang_of(path), Some(lang), "{path}");
+        }
+        for other in ["x.mli", "x.fsi", "x.ini", "x.cfg", ".rs"] {
+            assert_eq!(lang_of(other), None, "{other}");
+        }
+        for (path, token) in [
+            ("a.py", "#"),
+            ("a.ts", "//"),
+            ("a.rb", "#"),
+            ("a.lua", "--"),
+            ("a.erl", "%"),
+        ] {
+            assert_eq!(comment_token(path), Some(token), "{path}");
+        }
+        assert_eq!(comment_token("README.md"), Some("<!--"));
+        assert_eq!(comment_token("notes.txt"), None);
     }
 
     fn write(root: &Path, rel: &str, text: &str) {
@@ -314,7 +428,7 @@ mod tests {
         for skipped in [
             "api/generated/client.py",
             "api/debug.log.py",
-            "api/README.md",
+            "api/README.txt",
             "api/__pycache__/app.py",
             "api/.venv/lib/site.py",
             "api/venv/lib/site.py",
@@ -323,7 +437,7 @@ mod tests {
             "web/dist/bundle.js",
             "web/src/types.d.ts",
             "web/src/vendor.min.js",
-            "web/package.json",
+            "web/package-lock.json",
         ] {
             write(root, skipped, "x = 1\n");
         }
@@ -363,6 +477,52 @@ mod tests {
     }
 
     #[test]
+    fn scan_reads_the_other_languages_and_skips_their_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for kept in [
+            "cmd/main.go",
+            "src/lib.rs",
+            "app/models/cart.rb",
+            "include/cart.h",
+            "web/vendor/legacy.js",
+            "tools/target/run.py",
+        ] {
+            write(root, kept, "x\n");
+        }
+        for skipped in [
+            "vendor/github.com/x/y.go",
+            "target/debug/build/out.rs",
+            "deps/plug/lib/plug.ex",
+            "api/order.pb.go",
+            "lib/cart.g.dart",
+            "ios/Pods/Lib/Lib.m",
+        ] {
+            write(root, skipped, "x\n");
+        }
+        let table = format!("int t[] = {{{}}};\n", "1,".repeat(MAX_GENERIC_BYTES as usize / 2));
+        write(root, "src/parser.c", &table);
+        let got: Vec<(String, &str)> = scan(root, 0)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.rel_path, f.lang))
+            .collect();
+        let want: Vec<(String, &str)> = [
+            ("app/models/cart.rb", lang::RUBY),
+            ("cmd/main.go", lang::GO),
+            ("include/cart.h", lang::C),
+            ("src/lib.rs", lang::RUST),
+            // A dependency directory of another language does not hide these.
+            ("tools/target/run.py", lang::PYTHON),
+            ("web/vendor/legacy.js", lang::JAVASCRIPT),
+        ]
+        .into_iter()
+        .map(|(p, l)| (p.to_string(), l))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn scan_fails_on_a_missing_root() {
         assert!(scan(Path::new("/definitely/not/a/real/root"), 0).is_err());
     }
@@ -396,7 +556,12 @@ mod tests {
             assert_eq!(parsed.file.as_ref().map(|f| f.lang.as_str()), Some(lang), "{path}");
             assert!(parsed.symbols.iter().any(|s| s.qualified_name == "svc.a.f"), "{path}");
         }
-        assert!(parse_file("svc/notes.md", "svc", b"# hi", "h").unwrap().is_none());
+        assert!(parse_file("svc/notes.txt", "svc", b"hi", "h").unwrap().is_none());
+        let doc = parse_file("svc/notes.md", "svc", b"# hi", "h").unwrap().unwrap();
+        assert!(doc
+            .symbols
+            .iter()
+            .any(|s| s.kind == lge_core::kind::SECTION && s.name == "hi"));
     }
 
     #[test]
@@ -407,7 +572,7 @@ mod tests {
         write(root, "svc/a.py", "def a():\n    pass\n");
         write(root, "svc/c.ts", "export const c = (): number => 1;\n");
         write(root, "svc/d.js", "function d() {}\n");
-        write(root, "svc/notes.md", "# not source\n");
+        write(root, "svc/notes.txt", "not source\n");
         let mut files = scan(root, 1).unwrap();
         let extra = |rel: &str| ScannedFile {
             rel_path: rel.into(),
@@ -416,7 +581,7 @@ mod tests {
             lang: lang::PYTHON,
         };
         // A language no extractor knows is left out; a file that is gone is an error.
-        files.push(extra("svc/notes.md"));
+        files.push(extra("svc/notes.txt"));
         files.push(extra("svc/gone.py"));
 
         let parsed = parse_many(&files);

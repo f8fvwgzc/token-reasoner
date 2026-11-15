@@ -148,6 +148,10 @@ pub mod kind {
     pub const INTERFACE: &str = "interface";
     pub const TYPE: &str = "type";
     pub const ENUM: &str = "enum";
+    /// A file that is not code (HTML, CSS, Markdown, SQL, configuration), as a whole.
+    pub const DOCUMENT: &str = "document";
+    /// A part of such a file: a heading, element id, selector, table or key.
+    pub const SECTION: &str = "section";
     /// Placeholder target of an unresolved edge.
     pub const UNRESOLVED: &str = "unresolved";
 }
@@ -156,6 +160,40 @@ pub mod lang {
     pub const PYTHON: &str = "python";
     pub const TYPESCRIPT: &str = "typescript";
     pub const JAVASCRIPT: &str = "javascript";
+    // Read through a Tree-sitter grammar and a tags query (`lge-index` `generic`).
+    pub const BASH: &str = "bash";
+    pub const C: &str = "c";
+    pub const CLOJURE: &str = "clojure";
+    pub const CPP: &str = "cpp";
+    pub const CSHARP: &str = "csharp";
+    pub const CUDA: &str = "cuda";
+    pub const DART: &str = "dart";
+    pub const ELIXIR: &str = "elixir";
+    pub const ELM: &str = "elm";
+    pub const ERLANG: &str = "erlang";
+    pub const FSHARP: &str = "fsharp";
+    pub const GLEAM: &str = "gleam";
+    pub const GO: &str = "go";
+    pub const GROOVY: &str = "groovy";
+    pub const HASKELL: &str = "haskell";
+    pub const JAVA: &str = "java";
+    pub const JULIA: &str = "julia";
+    pub const KOTLIN: &str = "kotlin";
+    pub const LUA: &str = "lua";
+    pub const LUAU: &str = "luau";
+    pub const NIX: &str = "nix";
+    pub const OBJC: &str = "objc";
+    pub const OCAML: &str = "ocaml";
+    pub const PERL: &str = "perl";
+    pub const PHP: &str = "php";
+    pub const POWERSHELL: &str = "powershell";
+    pub const R: &str = "r";
+    pub const RUBY: &str = "ruby";
+    pub const RUST: &str = "rust";
+    pub const SCALA: &str = "scala";
+    pub const SOLIDITY: &str = "solidity";
+    pub const SWIFT: &str = "swift";
+    pub const ZIG: &str = "zig";
 }
 
 /// Kinds of [`FactSite`](crate::FactSite).

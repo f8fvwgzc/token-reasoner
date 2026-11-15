@@ -419,7 +419,7 @@ fn a_folder_is_indexed_and_its_graph_reaches_the_request_and_the_tools() {
             status["repos"][0]["name"].as_str(),
             status["repos"][0]["files"].as_i64()
         ),
-        (Some("shop"), Some(15)),
+        (Some("shop"), Some(17)),
         "{status}"
     );
 

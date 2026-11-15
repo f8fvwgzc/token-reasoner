@@ -10,7 +10,11 @@ fn indexed() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("graph.lbug")).unwrap();
     let report = index_repo(&store, &root, &IndexOptions::default()).unwrap();
-    assert_eq!((report.indexed, report.failed.len()), (15, 0));
+    assert_eq!(
+        (report.indexed, report.failed.len()),
+        (17, 0),
+        "15 source files and 2 package.json outlines"
+    );
     (dir, store)
 }
 

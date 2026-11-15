@@ -18,6 +18,15 @@ fn lang_of(path: &str) -> &'static str {
         "py" => "python",
         "ts" | "tsx" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        // A few of the languages read through a grammar and a tags query.
+        "go" => "go",
+        "rs" => "rust",
+        "rb" => "ruby",
+        "java" => "java",
+        "kt" => "kotlin",
+        "c" => "c",
+        "cpp" => "cpp",
+        "ex" => "elixir",
         _ => "",
     }
 }

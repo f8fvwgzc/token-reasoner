@@ -19,6 +19,18 @@ pub(crate) enum Lang {
 }
 
 impl Lang {
+    /// The language of the file at `path` among `files`, from its extension
+    /// when it has no record.
+    fn of_path(files: &BTreeMap<&str, &FileRec>, path: &str) -> Lang {
+        match files.get(path) {
+            Some(f) => Lang::of(f),
+            None => Lang::of(&FileRec {
+                path: path.to_string(),
+                ..FileRec::default()
+            }),
+        }
+    }
+
     pub fn of(file: &FileRec) -> Lang {
         match file.lang.as_str() {
             lang::PYTHON => Lang::Python,
@@ -44,6 +56,9 @@ pub(crate) enum Want {
     /// What `self.f()` or `Class.f()` can reach inside a known class.
     CallTarget,
     Class,
+    /// A type whose members `self` and an implicit `this` name: a class, an
+    /// enum or an interface (a Rust trait, a Java interface with default methods).
+    Scope,
     /// What a class can extend or implement.
     Base,
     /// What a bare identifier can name: anything but a method.
@@ -58,6 +73,7 @@ impl Want {
             Want::Member => k == kind::METHOD || k == kind::FUNCTION,
             Want::CallTarget => k == kind::FUNCTION || k == kind::METHOD || k == kind::CLASS,
             Want::Class => k == kind::CLASS,
+            Want::Scope => k == kind::CLASS || k == kind::ENUM || k == kind::INTERFACE,
             Want::Base => k == kind::CLASS || k == kind::INTERFACE,
             Want::Nameable => k != kind::METHOD,
             Want::Any => true,
@@ -73,14 +89,26 @@ impl Want {
 pub(crate) struct Index<'a> {
     files: BTreeMap<&'a str, &'a FileRec>,
     files_by_id: HashMap<&'a str, &'a FileRec>,
+    /// The [`family`] of each file, by path: looked up once per candidate of
+    /// every match by name.
+    families: HashMap<&'a str, &'a str>,
     by_id: HashMap<&'a str, &'a SymbolRec>,
     modules: HashMap<&'a str, &'a SymbolRec>,
+    /// Every module symbol by file and qualified name, inner modules included.
+    module_qn: HashMap<(&'a str, &'a str), &'a SymbolRec>,
     by_file_name: HashMap<(&'a str, &'a str), Vec<&'a SymbolRec>>,
     by_file_qn: HashMap<(&'a str, &'a str), Vec<&'a SymbolRec>>,
     by_name: HashMap<&'a str, Vec<&'a SymbolRec>>,
     /// Members declared inside an interface or a type: signatures with no body,
-    /// so nothing to call.
+    /// so nothing to call. In the languages read through a tags query an
+    /// interface member can have a body (a Java default method, a Rust trait
+    /// method), and only a member without one is a signature.
     signatures: HashSet<&'a str>,
+    /// Members written without a body in the languages read through a tags
+    /// query (a C++ method declared in its class and defined in the `.cpp`, an
+    /// abstract method): what a call in the same file can name, but no
+    /// candidate of a match by name, where the definition is the one meant.
+    declarations: HashSet<&'a str>,
 }
 
 /// Every field of a symbol that can change the output, so that two records with
@@ -107,17 +135,21 @@ impl<'a> Index<'a> {
         let mut ix = Index {
             files: BTreeMap::new(),
             files_by_id: HashMap::new(),
+            families: HashMap::new(),
             by_id: HashMap::new(),
             modules: HashMap::new(),
+            module_qn: HashMap::new(),
             by_file_name: HashMap::new(),
             by_file_qn: HashMap::new(),
             by_name: HashMap::new(),
             signatures: HashSet::new(),
+            declarations: HashSet::new(),
         };
         for f in files {
             if !ix.files.contains_key(f.path.as_str()) {
                 ix.files.insert(&f.path, f);
                 ix.files_by_id.entry(&f.id).or_insert(f);
+                ix.families.insert(&f.path, family(f));
             }
         }
         for s in symbols {
@@ -126,8 +158,20 @@ impl<'a> Index<'a> {
                 continue;
             }
             ix.by_id.insert(&s.id, s);
+            // Outlines of HTML, CSS, Markdown, SQL and configuration files: in
+            // the graph for search and line ranges, never a call or reference target.
+            if s.kind == kind::DOCUMENT || s.kind == kind::SECTION {
+                continue;
+            }
             if s.kind == kind::MODULE {
-                ix.modules.entry(&s.file_path).or_insert(s);
+                // A file's own module symbol is the outermost one: a module
+                // defined inside the file (an Elixir `defmodule`, a C++
+                // namespace) has a longer qualified name under it.
+                let file_module = ix.modules.entry(&s.file_path).or_insert(s);
+                if s.qualified_name.len() < file_module.qualified_name.len() {
+                    *file_module = s;
+                }
+                ix.module_qn.entry((&s.file_path, &s.qualified_name)).or_insert(s);
                 continue;
             }
             ix.by_file_name.entry((&s.file_path, &s.name)).or_default().push(s);
@@ -136,6 +180,10 @@ impl<'a> Index<'a> {
                 .or_default()
                 .push(s);
             ix.by_name.entry(&s.name).or_default().push(s);
+            let member = s.kind == kind::METHOD || s.kind == kind::FUNCTION;
+            if member && Lang::of_path(&ix.files, &s.file_path) == Lang::Other && is_declaration(s) {
+                ix.declarations.insert(&s.id);
+            }
         }
         // A member's scope is its qualified name without the last segment. A
         // class merged with an interface of the same name still defines its
@@ -145,7 +193,13 @@ impl<'a> Index<'a> {
                 .rsplit_once('.')
                 .and_then(|(scope, _)| ix.by_file_qn.get(&(*file, scope)));
             if scope.is_some_and(|outer| outer.iter().all(|s| declares_only(s))) {
-                ix.signatures.extend(members.iter().map(|s| s.id.as_str()));
+                let other = Lang::of_path(&ix.files, file) == Lang::Other;
+                ix.signatures.extend(
+                    members
+                        .iter()
+                        .filter(|s| !other || has_no_body(s))
+                        .map(|s| s.id.as_str()),
+                );
             }
         }
         ix
@@ -166,6 +220,16 @@ impl<'a> Index<'a> {
 
     pub fn lang(&self, path: &str) -> Lang {
         self.file(path).map(Lang::of).unwrap_or(Lang::Other)
+    }
+
+    /// The language of a file as the indexer recorded it; "" when unknown.
+    pub fn lang_name(&self, path: &str) -> &'a str {
+        self.file(path).map(|f| f.lang.as_str()).unwrap_or("")
+    }
+
+    /// Which code a symbol in `path` can call by name alone. See [`family`].
+    pub fn family(&self, path: &str) -> &'a str {
+        self.families.get(path).copied().unwrap_or("")
     }
 
     /// Any symbol, module symbols included (they own top-level calls and facts).
@@ -196,23 +260,82 @@ impl<'a> Index<'a> {
         one(self.admitted(self.by_file_qn.get(&(file, qualified_name)), want))
     }
 
-    /// Symbols called `name` anywhere in the repository, sorted by id.
+    /// Every symbol of `file` with this qualified name, a module included.
+    pub fn in_scope(&self, file: &str, qualified_name: &str) -> Vec<&'a SymbolRec> {
+        let mut found = self
+            .by_file_qn
+            .get(&(file, qualified_name))
+            .cloned()
+            .unwrap_or_default();
+        found.extend(self.module_qn.get(&(file, qualified_name)).copied());
+        found
+    }
+
+    /// Symbols called `name` anywhere in the repository, sorted by id. A
+    /// declaration is no candidate to call.
+    #[cfg(test)]
     pub fn named(&self, name: &str, want: Want) -> Vec<&'a SymbolRec> {
-        self.admitted(self.by_name.get(name), want)
+        self.named_iter(name, want).collect()
+    }
+
+    /// [`Index::named`], one at a time: a match by name stops at its second
+    /// candidate, and a common name has thousands.
+    pub fn named_iter<'s>(&'s self, name: &str, want: Want) -> impl Iterator<Item = &'a SymbolRec> + 's {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |s| self.fits(s, want) && !(want.is_call() && self.declarations.contains(s.id.as_str())))
     }
 
     fn admitted(&self, found: Option<&Vec<&'a SymbolRec>>, want: Want) -> Vec<&'a SymbolRec> {
-        let fits =
-            |s: &&'a SymbolRec| want.admits(&s.kind) && !(want.is_call() && self.signatures.contains(s.id.as_str()));
         found
-            .map(|v| v.iter().copied().filter(fits).collect())
+            .map(|v| v.iter().copied().filter(|s| self.fits(s, want)).collect())
             .unwrap_or_default()
+    }
+
+    fn fits(&self, s: &SymbolRec, want: Want) -> bool {
+        want.admits(&s.kind) && !(want.is_call() && self.signatures.contains(s.id.as_str()))
+    }
+}
+
+/// The languages that call each other by name: Python, TypeScript and
+/// JavaScript (as before any other language was indexed), C with C++,
+/// Objective-C, CUDA and Swift, the JVM languages, the BEAM languages, Lua with Luau;
+/// every other language on its own. "" when the language is not known, which
+/// matches every family.
+pub(crate) fn family(file: &FileRec) -> &str {
+    match file.lang.as_str() {
+        lang::PYTHON | lang::TYPESCRIPT | lang::JAVASCRIPT => "script",
+        "" if Lang::of(file) != Lang::Other => "script",
+        // Swift calls Objective-C (and C) of its target by the same names.
+        lang::C | lang::CPP | lang::OBJC | lang::CUDA | lang::SWIFT => "c",
+        lang::JAVA | lang::KOTLIN | lang::SCALA | lang::GROOVY => "jvm",
+        lang::ELIXIR | lang::ERLANG => "beam",
+        lang::LUA | lang::LUAU => "lua",
+        other => other,
     }
 }
 
 /// An interface or a type alias: it declares members, it does not define them.
 fn declares_only(s: &SymbolRec) -> bool {
     s.kind == kind::INTERFACE || s.kind == kind::TYPE
+}
+
+/// A member written without a body: its source text is its signature and a
+/// `;` at most (`fn area(&self) -> f64;`, `int total();`, `func total() -> Int`).
+fn has_no_body(s: &SymbolRec) -> bool {
+    let body = s.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = body.trim_end_matches(';').trim_end();
+    !s.signature.is_empty() && body.ends_with(s.signature.as_str())
+}
+
+/// A member declared with a `;` and no body (`void swap(Buffer&) noexcept;`,
+/// `abstract int rows();`). The `;` tells it from a one-line definition whose
+/// header runs to its end (Erlang's `report(C) -> C.`).
+fn is_declaration(s: &SymbolRec) -> bool {
+    s.body.trim_end().ends_with(';') && has_no_body(s)
 }
 
 /// Several candidates are never narrowed down to one.
@@ -307,6 +430,46 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_is_named_in_its_file_but_no_candidate_by_name() {
+        let with_body = |file: &str, qn: &str, signature: &str, body: &str| SymbolRec {
+            signature: signature.into(),
+            body: body.into(),
+            ..sym(file, qn, kind::METHOD)
+        };
+        let input = ResolveInput {
+            symbols: vec![
+                sym("order.hpp", "order.Order", kind::CLASS),
+                with_body(
+                    "order.hpp",
+                    "order.Order.subtotal",
+                    "int subtotal() const",
+                    "int subtotal() const;",
+                ),
+                with_body(
+                    "order.cpp",
+                    "order.Order.subtotal",
+                    "int Order::subtotal() const",
+                    "int Order::subtotal() const { return 1; }",
+                ),
+                // A one-line Erlang clause: its header runs to its end, but it is defined.
+                with_body("money.erl", "money.report", "report(C) -> C.", "report(C) -> C."),
+            ],
+            ..ResolveInput::default()
+        };
+        let ix = Index::new(&input);
+        let called: Vec<&str> = ix
+            .named("subtotal", Want::Member)
+            .iter()
+            .map(|s| s.file_path.as_str())
+            .collect();
+        assert_eq!(called, ["order.cpp"]);
+        assert!(ix
+            .member("order.hpp", "order.Order.subtotal", Want::CallTarget)
+            .is_some());
+        assert_eq!(ix.named("report", Want::Member).len(), 1);
+    }
+
+    #[test]
     fn language_comes_from_the_record_then_the_extension() {
         let file = |path: &str, lang: &str| FileRec {
             path: path.into(),
@@ -320,5 +483,33 @@ mod tests {
         assert_eq!(Lang::of(&file("a.tsx", "")), Lang::Script);
         assert_eq!(Lang::of(&file("a.go", "go")), Lang::Other);
         assert_eq!(Lang::of(&file("a.txt", "")), Lang::Other);
+    }
+
+    #[test]
+    fn languages_that_call_each_other_share_a_family() {
+        let file = |path: &str, lang: &str| FileRec {
+            path: path.into(),
+            lang: lang.into(),
+            ..FileRec::default()
+        };
+        for (path, lang) in [
+            ("a.py", "python"),
+            ("a.ts", "typescript"),
+            ("a.js", "javascript"),
+            ("a.tsx", ""),
+        ] {
+            assert_eq!(family(&file(path, lang)), "script", "{path}");
+        }
+        for (path, lang) in [("a.c", "c"), ("a.cpp", "cpp"), ("a.m", "objc"), ("a.cu", "cuda")] {
+            assert_eq!(family(&file(path, lang)), "c", "{path}");
+        }
+        for (path, lang) in [("A.java", "java"), ("A.kt", "kotlin"), ("A.scala", "scala")] {
+            assert_eq!(family(&file(path, lang)), "jvm", "{path}");
+        }
+        assert_eq!(family(&file("a.ex", "elixir")), family(&file("a.erl", "erlang")));
+        assert_eq!(family(&file("a.lua", "lua")), family(&file("a.luau", "luau")));
+        assert_eq!(family(&file("a.go", "go")), "go");
+        assert_eq!(family(&file("a.rb", "ruby")), "ruby");
+        assert_eq!(family(&file("notes.txt", "")), "", "unknown matches every family");
     }
 }

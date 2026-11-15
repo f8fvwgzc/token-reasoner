@@ -34,11 +34,7 @@ fn worth_it(before: &str, after: &str) -> bool {
 const MIN_BODY_LINES: usize = 8;
 
 fn comment_token(path: &str) -> &'static str {
-    if path.ends_with(".py") {
-        "#"
-    } else {
-        "//"
-    }
+    lge_index::comment_token(path).unwrap_or("//")
 }
 
 /// Index (into `lines`) of the last line of the signature of a definition

@@ -108,8 +108,12 @@ pub struct CommitInfo {
 /// files each changed (against its first parent). Commits that change nothing
 /// under `root` are left out. Empty outside a repository or before the first commit.
 pub fn recent_commits(root: &Path, limit: usize) -> Result<Vec<CommitInfo>> {
-    let Some(repo) = discover(root)? else { return Ok(Vec::new()) };
-    let Some(workdir) = repo.workdir() else { return Ok(Vec::new()) };
+    let Some(repo) = discover(root)? else {
+        return Ok(Vec::new());
+    };
+    let Some(workdir) = repo.workdir() else {
+        return Ok(Vec::new());
+    };
     let prefix = root_prefix(root, workdir)?;
     let mut walk = repo.revwalk()?;
     if walk.push_head().is_err() {
@@ -127,7 +131,12 @@ pub fn recent_commits(root: &Path, limit: usize) -> Result<Vec<CommitInfo>> {
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
         let mut files: Vec<String> = diff
             .deltas()
-            .filter_map(|d| d.new_file().path().or_else(|| d.old_file().path()).map(|p| p.to_string_lossy().replace('\\', "/")))
+            .filter_map(|d| {
+                d.new_file()
+                    .path()
+                    .or_else(|| d.old_file().path())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
             .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
             .collect();
         files.sort();
@@ -138,7 +147,10 @@ pub fn recent_commits(root: &Path, limit: usize) -> Result<Vec<CommitInfo>> {
         out.push(CommitInfo {
             sha: commit.id().to_string(),
             time: commit.time().seconds(),
-            subject: commit.summary_bytes().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default(),
+            subject: commit
+                .summary_bytes()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .unwrap_or_default(),
             files,
             merge: commit.parent_count() > 1,
         });

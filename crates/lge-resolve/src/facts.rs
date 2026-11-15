@@ -249,7 +249,7 @@ fn named(resolver: &Resolver, owner: &SymbolRec, f: &FactSite, edge_type: EdgeTy
     };
     let found = match hit {
         Some((target, prov)) => Found::Symbol(target, prov),
-        None => resolver.anywhere(name, wide, Prov::INFERRED_BARE),
+        None => resolver.anywhere(file, name, wide, Prov::INFERRED_BARE),
     };
     match found {
         Found::Symbol(target, prov) => {
