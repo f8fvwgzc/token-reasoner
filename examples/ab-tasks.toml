@@ -1,0 +1,57 @@
+# A/B task file for `lge ab`: the kind of work where a code graph should pay off.
+#
+# Copy this file next to your project, replace the prompts and checks with real
+# tasks from your backlog, and run from the repository root:
+#
+#   lge ab ab-tasks.toml --repo . --runs 2 --model <a model your account allows>
+#
+# How to pick tasks (this decides whether the result means anything):
+# - Real work you would give Codex anyway, not toy changes.
+# - Vague and multi-file: the prompt describes the behaviour, not the file or
+#   function to edit. "Find why X happens" beats "change line 40 of foo.py".
+# - Each task has a check that fails before the change and passes after it.
+#   Write that check first (a test in `setup`, or an existing test you know fails).
+# - 5 to 10 tasks, `--runs 2`: one task and one run is noise.
+# - Every session starts from a clean copy of HEAD: commit what the tasks need.
+#
+# Fields: name (unique), prompt (what you would type to Codex), check (shell
+# command, exit 0 = done correctly), setup (optional, runs in the copy first).
+# Checks run inside the copy; use absolute paths for anything outside it.
+
+# ---- 1. Bug hunt across layers ----------------------------------------------
+[[task]]
+name = "bug-across-layers"
+prompt = "Orders created through the public API sometimes get the wrong total when a discount code is used. Find the cause and fix it. Add a regression test."
+setup = "cp /path/to/your/regression_test_total.py tests/test_total_regression.py"
+check = "python -m pytest -q tests/test_total_regression.py tests"
+
+# ---- 2. Feature that touches several services --------------------------------
+[[task]]
+name = "feature-across-services"
+prompt = "Add a 'cancelled' order status: the API must accept cancelling an unshipped order, the worker must skip cancelled orders, and the notifier must send a cancellation email. Add tests."
+check = "make test"
+
+# ---- 3. Change with a wide impact -------------------------------------------
+[[task]]
+name = "rename-with-impact"
+prompt = "customer_id is being renamed to account_id in the orders domain. Rename it everywhere it is used, including queries and API payloads, without breaking callers. Keep the old field accepted in API input for one release."
+check = "npm test --silent"
+
+# ---- 4. Understand, then change ---------------------------------------------
+[[task]]
+name = "explain-then-fix"
+prompt = "Requests to the reports endpoint time out for large accounts. Work out which query is slow and why, then make it fast enough for 100k rows. Add a test that would have caught it."
+check = "go test ./..."
+
+# ---- 5. Follow a contract between two codebases -----------------------------
+[[task]]
+name = "contract-change"
+prompt = "The billing service now returns amounts in cents instead of dollars. Update every consumer of its API in this repository and their tests."
+check = "cargo test -q"
+
+# ---- 6. A small, well-specified change (control) ----------------------------
+# Expect little saving here: the prompt names the place. It shows the floor.
+[[task]]
+name = "control-small-change"
+prompt = "In utils/money.py, format_amount must round half up instead of half to even. Add a test."
+check = "python -m pytest -q tests/test_money.py"
