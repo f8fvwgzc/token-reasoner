@@ -70,7 +70,7 @@ Run these steps in order. Stop and report if a step fails; do not work around it
    ```bash
    scripts/install-macos.sh --connect-codex
    ```
-   It installs Rust if missing, builds lge (a few minutes the first time), copies it to
+   It installs Rust and OpenSSL 3 (through Homebrew) if missing, builds lge (a few minutes the first time), copies it to
    `~/.local/bin/lge`, starts the daemon on `127.0.0.1:8787`, adds one line to
    `~/.codex/config.toml` (backup in `~/.codex/config.toml.before-lge`), and registers the
    graph tools with Codex.
@@ -98,7 +98,8 @@ The installer is safe to run again. It changes nothing outside `~/.local/bin/lge
 ## 2. Install by hand on macOS
 
 Requirements: macOS on Apple silicon or Intel, the Xcode Command Line Tools
-(`xcode-select --install`), and Rust 1.88 or later (`curl https://sh.rustup.rs -sSf | sh`).
+(`xcode-select --install`), Rust 1.88 or later (`curl https://sh.rustup.rs -sSf | sh`), and
+OpenSSL 3 (`brew install openssl@3`).
 
 ```bash
 git clone https://github.com/f8fvwgzc/token-reasoner.git ~/token-reasoner
@@ -109,6 +110,7 @@ scripts/install-macos.sh --connect-codex --autostart
 Or every step yourself:
 
 ```bash
+export OPENSSL_DIR="$(brew --prefix openssl@3)"   # LadybugDB links against OpenSSL
 cargo build --release -p lge-cli         # downloads the prebuilt LadybugDB library
 cp target/release/lge ~/.local/bin/lge   # any folder on your PATH
 lge --db ~/.lge/setup/graph.lbug setup   # full-text search extension, once
@@ -418,6 +420,7 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 | Requests go to another proxy | `HTTP_PROXY` or `ALL_PROXY` is set in your shell: add `127.0.0.1` to `NO_PROXY` |
 | `port 8787 is in use` | Another proxy (for example Headroom) holds the port. Stop it, or install with `--port 8788` and use that port in the config line |
 | Build error `fatal error: 'format' file not found` | The C++ compiler is too old for LadybugDB's headers: update the Xcode Command Line Tools (on Linux, GCC 13 or later) |
+| Build error `library 'ssl' not found` | OpenSSL 3 is missing or not found: `brew install openssl@3` and `export OPENSSL_DIR="$(brew --prefix openssl@3)"`, then `cargo clean -p lbug` and build again |
 | Build tries to run cmake | The LadybugDB download failed. Check the network; the version is pinned in `.cargo/config.toml` |
 | The page shows no session after a request | Check `~/.lge/serve.log`: each model request leaves one line with the usage it read |
 | Search is weak | `lge --db ~/.lge/setup/graph.lbug setup` installs the full-text extension (needs network once) |

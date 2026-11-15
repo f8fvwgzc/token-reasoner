@@ -122,6 +122,21 @@ if [ "$(printf '%s\n1.88.0\n' "$RUST_VERSION" | sort -V | head -1)" != "1.88.0" 
   rustup update stable
 fi
 
+# LadybugDB links against OpenSSL. Homebrew keeps OpenSSL 3 outside the default
+# search paths, so the build is told where it is.
+if [ -z "${OPENSSL_DIR:-}" ]; then
+  if command -v brew >/dev/null 2>&1; then
+    if ! brew --prefix --installed openssl@3 >/dev/null 2>&1; then
+      say "Installing OpenSSL 3 with Homebrew"
+      brew install openssl@3
+    fi
+    OPENSSL_DIR="$(brew --prefix openssl@3)"
+    export OPENSSL_DIR
+  else
+    fail "OpenSSL 3 is needed. Install Homebrew (https://brew.sh) and run this script again, or set OPENSSL_DIR"
+  fi
+fi
+
 # ---- build and install ------------------------------------------------------------
 say "Building lge (the first build takes a few minutes)"
 (cd "$REPO" && cargo build --release -p lge-cli)

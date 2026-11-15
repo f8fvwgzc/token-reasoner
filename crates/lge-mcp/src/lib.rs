@@ -275,18 +275,19 @@ impl Server {
             &mut self.fresh,
             self.fresh_for,
         ) {
-            Ok(_) => None,
+            Ok(_) => {
+                // New commits and merged pull requests since the last call.
+                let _ = lge_memory::ingest_repo_history(self.store.as_ref(), &self.root, unix_now());
+                None
+            }
             Err(e) => Some(format!("warning: index not refreshed, answer may be stale: {e}\n")),
         }
     }
 
     /// Run one tool and return its text.
     pub fn call(&mut self, name: &str, args: &Value) -> Result<String> {
-        let warning = if matches!(name, "recall_memory" | "retain_memory") {
-            None
-        } else {
-            self.freshen()
-        };
+        // Recall needs the latest commits too; storing a fact needs nothing fresh.
+        let warning = if name == "retain_memory" { None } else { self.freshen() };
         let text = match name {
             "search_code_context" => self.search_code_context(args)?,
             "trace_execution_flow" => self.trace_execution_flow(args)?,
