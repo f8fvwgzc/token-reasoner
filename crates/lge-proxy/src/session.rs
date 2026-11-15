@@ -197,7 +197,7 @@ impl Session {
         );
         if let Ok(found) = remembered {
             if !found.items.is_empty() {
-                text.push_str("\n\n## Decided in earlier sessions\n");
+                text.push_str("\n\n## From project memory (decisions, conventions, recent commits)\n");
                 text.push_str(found.text.trim_end());
             }
         }

@@ -314,3 +314,99 @@ fn pages_follow_the_facts_and_are_written_only_when_they_change() {
         "{file}"
     );
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+#[test]
+fn commits_and_merged_pull_requests_are_remembered_with_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    std::fs::write(
+        root.join("pricing.py"),
+        "def apply_discount(total, code):\n    return total\n",
+    )
+    .unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "Add pricing"]);
+    git(&root, &["checkout", "-q", "-b", "fix-discount"]);
+    std::fs::write(
+        root.join("pricing.py"),
+        "def apply_discount(total, code):\n    if code is None:\n        raise ValueError(code)\n    return total\n",
+    )
+    .unwrap();
+    git(&root, &["commit", "-q", "-am", "Reject unknown discount codes"]);
+    git(&root, &["checkout", "-q", "main"]);
+    git(
+        &root,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "fix-discount",
+            "-m",
+            "Merge pull request #7 from fix-discount",
+        ],
+    );
+
+    let store = Store::open(&dir.path().join("graph.lbug")).unwrap();
+    index_repo(&store, &root, &IndexOptions::default()).unwrap();
+    assert_eq!(ingest_repo_history(&store, &root, T0).unwrap(), 3);
+    assert_eq!(
+        ingest_repo_history(&store, &root, T0).unwrap(),
+        0,
+        "nothing new: one lookup"
+    );
+
+    let merged = store.recent_memories(None, &["merge".to_string()], 5).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert!(
+        merged[0].text.starts_with("Merged ")
+            && merged[0]
+                .text
+                .contains(": Merge pull request #7 from fix-discount (changed pricing.py)"),
+        "{}",
+        merged[0].text
+    );
+    assert_eq!(merged[0].links, vec![file_id("pricing.py")]);
+
+    // Asking about the code brings its history along.
+    let found = recall(
+        &store,
+        "apply_discount should accept lowercase codes",
+        &RecallOptions {
+            now: T0,
+            ..RecallOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert!(found.text.contains("Reject unknown discount codes"), "{}", found.text);
+
+    // A new commit is picked up on the next call.
+    std::fs::write(
+        root.join("pricing.py"),
+        "def apply_discount(total, code):\n    return round(total, 2)\n",
+    )
+    .unwrap();
+    git(&root, &["commit", "-q", "-am", "Round totals"]);
+    assert_eq!(ingest_repo_history(&store, &root, T0).unwrap(), 1);
+}

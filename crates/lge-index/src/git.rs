@@ -90,6 +90,62 @@ fn root_prefix(root: &Path, workdir: &Path) -> Result<String> {
     Ok(prefix)
 }
 
+/// One commit of the repository's history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitInfo {
+    pub sha: String,
+    /// Unix seconds.
+    pub time: i64,
+    /// First line of the message.
+    pub subject: String,
+    /// Paths it changed under `root`, relative to `root`.
+    pub files: Vec<String>,
+    /// More than one parent: a merge, usually a merged pull request.
+    pub merge: bool,
+}
+
+/// The newest `limit` commits reachable from HEAD, newest first, with the
+/// files each changed (against its first parent). Commits that change nothing
+/// under `root` are left out. Empty outside a repository or before the first commit.
+pub fn recent_commits(root: &Path, limit: usize) -> Result<Vec<CommitInfo>> {
+    let Some(repo) = discover(root)? else { return Ok(Vec::new()) };
+    let Some(workdir) = repo.workdir() else { return Ok(Vec::new()) };
+    let prefix = root_prefix(root, workdir)?;
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME)?;
+    let mut out = Vec::new();
+    for oid in walk.take(limit * 4) {
+        if out.len() >= limit {
+            break;
+        }
+        let commit = repo.find_commit(oid?)?;
+        let tree = commit.tree()?;
+        let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut files: Vec<String> = diff
+            .deltas()
+            .filter_map(|d| d.new_file().path().or_else(|| d.old_file().path()).map(|p| p.to_string_lossy().replace('\\', "/")))
+            .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        files.sort();
+        files.dedup();
+        if files.is_empty() {
+            continue;
+        }
+        out.push(CommitInfo {
+            sha: commit.id().to_string(),
+            time: commit.time().seconds(),
+            subject: commit.summary_bytes().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default(),
+            files,
+            merge: commit.parent_count() > 1,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

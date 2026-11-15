@@ -405,6 +405,11 @@ fn main() -> Result<()> {
                 },
             )?;
             print_index(&r, &store);
+            match lge_memory::ingest_repo_history(&store, &root, lge_retrieve::unix_now()) {
+                Ok(0) => {}
+                Ok(n) => println!("history: {n} new commit(s) remembered"),
+                Err(e) => println!("warning: git history not read: {e}"),
+            }
             if let Err(e) = lge_memory::export_pages(&store, &pages_dir) {
                 println!("warning: pages not written to {}: {e}", pages_dir.display());
             }

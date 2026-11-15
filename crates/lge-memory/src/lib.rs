@@ -6,10 +6,12 @@
 //! loop. See `docs/PRIOR_ART.md`.
 
 pub mod dedup;
+mod history;
 mod pages;
 mod recall;
 mod retain;
 
+pub use history::{commit_key, ingest_commits, ingest_repo_history, Commit, HISTORY_DEPTH};
 pub use pages::{
     export_pages, refresh_pages, search_pages, snippet, to_markdown, PageHit, MEMORY_PAGE_KIND, SEEDED, SNIPPET_CHARS,
 };

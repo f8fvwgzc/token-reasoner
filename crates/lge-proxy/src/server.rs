@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response};
 
 const UI: &str = include_str!("ui.html");
+/// How long the first request in a new repository waits for its index.
+const FIRST_INDEX_WAIT: Duration = Duration::from_secs(10);
 /// Largest request body the proxy reads into memory.
 const MAX_BODY: usize = 128 * 1024 * 1024;
 
@@ -352,6 +354,8 @@ impl Daemon {
             ..IndexOptions::default()
         };
         index_repo(&store, root, &index)?;
+        // Recent commits and merged pull requests, as facts linked to their files.
+        let _ = lge_memory::ingest_repo_history(&store, root, lge_retrieve::unix_now());
         let _ = lge_memory::export_pages(&store, &dir.join("pages"));
         let mut server = lge_mcp::Server::new(Box::new(store), root, index);
         server.pages_dir = Some(dir.join("pages"));
@@ -375,7 +379,9 @@ impl Daemon {
             while let Some(d) = dir {
                 if d.join(".git").exists() {
                     if self.allowed(d) {
-                        let _ = self.add_repo(d);
+                        if let Ok(root) = self.add_repo(d) {
+                            return self.wait_ready(&root, FIRST_INDEX_WAIT);
+                        }
                     }
                     break;
                 }
@@ -383,6 +389,25 @@ impl Daemon {
             }
         }
         None
+    }
+
+    /// Wait up to `limit` for the first index of a repository. The first
+    /// message of a session is where context saves the most, and a context
+    /// added on a later turn would change the cached prefix; a small
+    /// repository is indexed in well under the limit. A larger one is used as
+    /// soon as it is ready, on a later request.
+    fn wait_ready(&self, root: &Path, limit: Duration) -> Option<Arc<Repo>> {
+        let repo = lock(&self.repos).get(root).cloned()?;
+        let deadline = Instant::now() + limit;
+        loop {
+            if matches!(*lock(&repo.state), RepoState::Ready(_)) {
+                return Some(repo);
+            }
+            if matches!(*lock(&repo.state), RepoState::Failed(_)) || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // ---- the proxy path ---------------------------------------------------
@@ -450,6 +475,12 @@ impl Daemon {
                     match &mut *state {
                         RepoState::Ready(server) => {
                             let _ = server.freshen();
+                            // New commits since the last request (Codex may have committed, a PR may have been merged).
+                            let _ = lge_memory::ingest_repo_history(
+                                server.store(),
+                                server.root(),
+                                lge_retrieve::unix_now(),
+                            );
                             let graph = Graph {
                                 store: server.store(),
                                 root: server.root(),

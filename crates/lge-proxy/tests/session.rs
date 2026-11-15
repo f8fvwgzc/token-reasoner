@@ -126,7 +126,7 @@ fn context_is_added_for_a_message_about_the_code_and_repeated_exactly() {
         .expect("names a symbol");
     assert!(
         with_memory
-            .contains("## Decided in earlier sessions\n- [decision] notifier/src/audit.ts must never block the email"),
+            .contains("## From project memory (decisions, conventions, recent commits)\n- [decision] notifier/src/audit.ts must never block the email"),
         "{with_memory}"
     );
 
