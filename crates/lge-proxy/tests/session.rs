@@ -1,5 +1,5 @@
 //! The proxy's decisions for one conversation, against a real indexed repository.
-use lge_proxy::session::{Graph, Options, Session, CONTEXT_CLOSE, CONTEXT_OPEN};
+use lge_proxy::session::{pack_budget, Graph, Options, Session, CONTEXT_CLOSE, CONTEXT_OPEN, LOCAL_CONTEXT_BUDGET};
 use lge_retrieve::{budget::count, index_repo, IndexOptions};
 use lge_store::Store;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,65 @@ fn context_is_added_for_a_message_about_the_code_and_repeated_exactly() {
 }
 
 #[test]
+fn a_question_about_one_file_that_nothing_else_uses_gets_a_small_pack() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let local = "handle_refund should reject a negative amount";
+    let shared = "create_order must validate the payload";
+
+    // handle_refund is in billing.py and nothing outside that file uses it;
+    // create_order is used by a test in another file and serves an endpoint.
+    assert_eq!(pack_budget(&store, local, &opts), LOCAL_CONTEXT_BUDGET);
+    assert_eq!(pack_budget(&store, shared, &opts), opts.context_budget);
+    // A smaller configured budget is never raised.
+    let tight = Options {
+        context_budget: 400,
+        ..Options::default()
+    };
+    assert_eq!(pack_budget(&store, local, &tight), 400);
+
+    let overhead = count(CONTEXT_OPEN) + count(CONTEXT_CLOSE) + 2;
+    let mut session = Session::default();
+    let small = session.context_for(&graph, local, &opts).expect("names a symbol");
+    assert!(
+        small.contains("orders_api/billing.py") && small.contains("handle_refund"),
+        "{small}"
+    );
+    assert!(count(&small) <= LOCAL_CONTEXT_BUDGET + overhead, "{}", count(&small));
+    assert_eq!(
+        session.saved.context_tokens,
+        count(&small),
+        "the pack's tokens are recorded"
+    );
+    // Decided from the graph alone: the same message gives the same bytes in another session.
+    assert_eq!(
+        Session::default().context_for(&graph, local, &opts).as_deref(),
+        Some(small.as_str())
+    );
+
+    let full = session.context_for(&graph, shared, &opts).expect("names a symbol");
+    let full_pack = lge_retrieve::evidence_pack(
+        &store,
+        shared,
+        &lge_retrieve::PackOptions {
+            budget: opts.context_budget,
+            ..lge_retrieve::PackOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        full.contains(full_pack.text.trim_end()),
+        "the configured budget is used: {full}"
+    );
+    assert_eq!(session.saved.contexts_added, 2);
+    assert_eq!(session.saved.context_tokens, count(&small) + count(&full));
+}
+
+#[test]
 fn a_file_read_from_the_top_becomes_a_skeleton_once() {
     let (_dir, root, store) = repo();
     let graph = Graph {
@@ -188,6 +247,28 @@ fn a_file_read_from_the_top_becomes_a_skeleton_once() {
     );
     assert_eq!(session.saved.outputs_shortened, 1);
     assert!(session.saved.tokens_after < session.saved.tokens_before);
+
+    // The same command again, in a later call of the same conversation: the
+    // reader asked again, so it gets the whole file, and each call keeps its
+    // own bytes on later turns.
+    let mut calls = Session::default();
+    calls.context_for(&graph, "handle_refund should reject a negative amount", &opts);
+    let first = calls.rewrite_call_output(Some(&graph), "c1", "cat orders_api/billing.py", None, &file, &opts);
+    assert_eq!(first.as_deref(), Some(short.as_str()));
+    assert_eq!(
+        calls.rewrite_call_output(Some(&graph), "c2", "cat orders_api/billing.py", None, &file, &opts),
+        None,
+        "a second read is sent whole"
+    );
+    assert_eq!(
+        calls.rewrite_call_output(Some(&graph), "c1", "cat orders_api/billing.py", None, &file, &opts),
+        first
+    );
+    assert_eq!(
+        calls.rewrite_call_output(Some(&graph), "c2", "cat orders_api/billing.py", None, &file, &opts),
+        None
+    );
+    assert_eq!(calls.saved.outputs_shortened, 1);
 
     // Reading the file again another way means the rest is needed: sent whole.
     let top: String = file.lines().take(120).map(|l| format!("{l}\n")).collect();
@@ -319,11 +400,17 @@ fn searches_and_check_runs_are_shortened_without_a_graph_too() {
         .rewrite_output(None, "cd orders_api && pytest -v", None, &run, &opts)
         .expect("a passing run is one line");
     assert!(passed.starts_with("ok") && count(&passed) < 60, "{passed}");
-    // Anything the proxy does not recognise passes through.
+    // Output the proxy does not recognise passes through.
     assert_eq!(session.rewrite_output(None, "git diff", None, &matches, &opts), None);
+    let plain: String = (0..300).map(|i| format!("Applying migration {i}... OK\n")).collect();
     assert_eq!(
-        session.rewrite_output(None, "python manage.py migrate", None, &run, &opts),
+        session.rewrite_output(None, "python manage.py migrate", None, &plain, &opts),
         None
     );
-    assert_eq!(session.saved.outputs_shortened, 2);
+    // An unknown runner that prints a recognised test run is shortened by its content.
+    let via_npm = session
+        .rewrite_output(None, "npm test", None, &run, &opts)
+        .expect("a pytest run behind npm");
+    assert!(via_npm.starts_with("ok"), "{via_npm}");
+    assert_eq!(session.saved.outputs_shortened, 3);
 }

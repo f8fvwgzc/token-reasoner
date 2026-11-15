@@ -198,6 +198,12 @@ reasoning tokens, what lge removed from tool output, and what graph context it a
 "Import past Codex sessions" reads the token counts of your earlier sessions from
 `~/.codex` (no conversation text) so you have a before and after.
 
+Under each folder the page also warns about folders that searches would wade through:
+build output, dependencies, logs or archives that `.gitignore` does not exclude (such as
+`artifacts/` or `dist/`, or anything over 50 MB or 5,000 files without source in it),
+with their size and the exact line to add to `.gitignore`. `lge index` prints the same
+warning.
+
 Every model request also leaves one line in `~/.lge/serve.log`, without any content:
 
 ```
@@ -216,9 +222,16 @@ lge memory retain "Tokens expire after 15 minutes" --kind decision --key auth.to
 lge memory recall "token expiry"
 lge usage report                # tokens per task
 lge check                       # lint, types, tests: failures only
+lge ab tasks.toml               # A/B: each task with lge off and on (spends tokens)
 ```
 
 `lge --help` lists everything.
+
+To measure the saving on your own work, `lge ab tasks.toml` runs each task as one Codex
+session with lge's features off and one with them on, each in a fresh copy of the
+repository, checks the result with the task's own command, and reports tokens, success
+and a verdict against the target: at least 25% lower median total tokens with no drop in
+success. The task file and the details are in [docs/AB.md](docs/AB.md).
 
 ---
 
@@ -249,6 +262,14 @@ test output. Each of these turns is sent again on every later turn of the conver
    whole files. Its later tool output (test runs, searches, repeated reads) is shortened
    on the way out, and the conversation's cached prefix is kept intact.
 
+### Codex code mode
+
+Current Codex models run their commands inside a small JavaScript script
+(`tools.exec_command({cmd: "rg -n ..."})`). lge reads the command out of such a script when
+there is exactly one, and shortens its output as it would a plain command; the script
+itself is never changed. Anything it cannot read with certainty is judged by its content
+or left alone.
+
 ### Why reasoning tokens drop too
 
 The model and its reasoning level do not change, but the model reasons again on every
@@ -273,9 +294,9 @@ lge reads the request Codex sends, changes only what it understands, and forward
 | In the conversation | What lge sends instead | When |
 |---|---|---|
 | Output of a test, lint or type-check run | The failures, or one line when it passed | Only for formats it recognises (pytest, jest, vitest, cargo, tsc, eslint, ruff, mypy, pyright, ...) |
-| A search with more than 60 matching lines | The matches capped, the files the task is about first, and a line saying what was left out | `rg`, `grep`, `git grep` |
+| A search with 60 or more matching lines that make up at least half of the output | The matches capped (6 per file, about 60 in all), the files the task is about first, every other line kept in place, and a line saying what was left out | `rg`, `grep`, `git grep`, also inside Codex's code-mode scripts |
 | The same large output a second time | One line pointing to the first copy | While the first copy is still in the request |
-| A message you typed about the code | Your message, followed by the graph's context for it | When it names a symbol or clearly matches one |
+| A message you typed about the code | Your message, followed by the graph's context for it (600 tokens for a one-file question, up to 1,500 when the change spans files) | When it names a symbol or clearly matches one |
 | Anything else | Exactly the same bytes | Always |
 
 Never touched: the system prompt, tool definitions, reasoning, tool calls, patches, and any

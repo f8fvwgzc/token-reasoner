@@ -6,6 +6,7 @@
 //! every other field of the body, exactly as it was. Items that carry ids or
 //! encrypted reasoning are never opened.
 
+use crate::command::script_command;
 use crate::session::{Graph, Options, Session};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -163,6 +164,126 @@ fn context_item(text: &str) -> Value {
     json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] })
 }
 
+/// The status part a code-mode script's result starts with
+/// (`Script completed\nWall time 0.1 seconds\nOutput:\n`).
+fn is_script_header(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("input_text")
+        && part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.len() < 600 && t.contains("Wall time") && t.trim_end().ends_with("Output:"))
+}
+
+/// The tool outputs of one request whose command is known, rewritten in
+/// conversation order.
+struct Known<'s, 'g> {
+    session: &'s mut Session,
+    graph: Option<&'g Graph<'g>>,
+    opts: &'s Options,
+    default_dir: Option<String>,
+    /// Text of large outputs sent in full so far in this request -> the command that produced it.
+    sent_in_full: HashMap<String, String>,
+}
+
+impl Known<'_, '_> {
+    /// What to send instead of one text `call` printed: the command-aware
+    /// rewrite, or a pointer to an identical earlier copy. `id` names the text
+    /// (its call id, and its part): the rewrite is decided once for it, and a
+    /// pointer is counted once.
+    fn text(&mut self, call: &Ran, id: &str, text: &str) -> Option<String> {
+        let dir: Option<PathBuf> = call
+            .workdir
+            .clone()
+            .or_else(|| self.default_dir.clone())
+            .map(PathBuf::from);
+        if let Some(shorter) =
+            self.session
+                .rewrite_call_output(self.graph, id, &call.command, dir.as_deref(), text, self.opts)
+        {
+            return Some(shorter);
+        }
+        if !self.opts.shorten_outputs || text.len() < REPEAT_MIN_BYTES {
+            return None;
+        }
+        // The same large output again (a file read twice, a command rerun with
+        // nothing changed): point to the first copy, which is still in this
+        // request. Decided from the request alone, so it is the same on every
+        // turn and right after a compaction.
+        let hash = lge_core::content_hash(text.as_bytes());
+        match self.sent_in_full.get(&hash) {
+            Some(earlier) => {
+                let first: String = earlier.chars().take(120).collect();
+                let pointer = format!(
+                    "lge: identical to the output of `{first}` earlier in this conversation ({} lines, unchanged); it is not repeated here.\n",
+                    text.lines().count()
+                );
+                self.session.count_pointer(id, text, &pointer);
+                Some(pointer)
+            }
+            None => {
+                self.sent_in_full.insert(hash, call.command.clone());
+                None
+            }
+        }
+    }
+
+    /// Rewrite the output of `item`, whose command is `call`. Returns how many
+    /// texts were replaced, or `None` when the output has a shape this does not
+    /// read (it is then judged by its content). The JSON type of `output`, the
+    /// number of its parts and every part that is not text never change.
+    fn output(&mut self, item: &mut Value, kind: &str, call: &Ran) -> Option<usize> {
+        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string();
+        match item.get_mut("output")? {
+            Value::String(raw) => {
+                let framed = unframe(raw);
+                let text = match &framed {
+                    Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
+                };
+                let id = if call_id.is_empty() {
+                    lge_core::content_hash(text.as_bytes())
+                } else {
+                    call_id
+                };
+                Some(match self.text(call, &id, &text) {
+                    Some(new) => {
+                        *raw = reframe(framed, new);
+                        1
+                    }
+                    None => 0,
+                })
+            }
+            // A code-mode script's result: its status part, then what the
+            // script printed. The status part stays as it is.
+            Value::Array(parts) if kind == "custom_tool_call_output" && parts.first().is_some_and(is_script_header) => {
+                let mut replaced = 0;
+                for (i, part) in parts.iter_mut().enumerate().skip(1) {
+                    if part.get("type").and_then(Value::as_str) != Some("input_text") {
+                        continue;
+                    }
+                    let Some(Value::String(raw)) = part.get_mut("text") else {
+                        continue;
+                    };
+                    let framed = unframe(raw);
+                    let text = match &framed {
+                        Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
+                    };
+                    let id = if call_id.is_empty() {
+                        lge_core::content_hash(text.as_bytes())
+                    } else {
+                        format!("{call_id}#{i}")
+                    };
+                    if let Some(new) = self.text(call, &id, &text) {
+                        *raw = reframe(framed, new);
+                        replaced += 1;
+                    }
+                }
+                Some(replaced)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Shorten the texts of an output whose command is not known, each judged by
 /// its content. Returns how many were replaced. The JSON type of `output` and
 /// the number of its parts never change.
@@ -230,8 +351,6 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return seen;
     };
-    let default_dir = seen.cwd.clone();
-
     // Which command produced which output.
     let mut ran: HashMap<String, Ran> = HashMap::new();
     for item in items.iter() {
@@ -246,6 +365,16 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .and_then(|a| command_of(&a)),
             "local_shell_call" => item.get("action").and_then(command_of),
+            // Code mode: a script that runs one shell command. The script is
+            // read, never changed.
+            "custom_tool_call" if item.get("name").and_then(Value::as_str) == Some("exec") => item
+                .get("input")
+                .and_then(Value::as_str)
+                .and_then(script_command)
+                .map(|c| Ran {
+                    command: c.cmd,
+                    workdir: c.workdir,
+                }),
             _ => None,
         };
         if let Some(r) = found {
@@ -253,64 +382,27 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
         }
     }
 
+    let mut known = Known {
+        session,
+        graph,
+        opts,
+        default_dir: seen.cwd.clone(),
+        sent_in_full: HashMap::new(),
+    };
     let mut out: Vec<Value> = Vec::with_capacity(items.len() + 2);
-    // Text of large outputs sent in full so far in this request -> the command that produced it.
-    let mut sent_in_full: HashMap<String, String> = HashMap::new();
     for mut item in std::mem::take(items) {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         match kind.as_str() {
-            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output"
-                if !item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| ran.contains_key(id))
-                    || !item.get("output").is_some_and(Value::is_string) =>
-            {
-                // No command to go by (a script, another tool), or the output is a
-                // list of parts: each text is judged by its content alone.
-                seen.outputs_replaced += rewrite_by_content(&mut item, session, opts);
-                out.push(item);
-            }
-            "function_call_output" | "local_shell_call_output" => {
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
                 let call = item
                     .get("call_id")
                     .and_then(Value::as_str)
                     .and_then(|id| ran.get(id))
                     .cloned();
-                if let (Some(call), Some(Value::String(raw))) = (call, item.get("output")) {
-                    let framed = unframe(raw);
-                    let text = match &framed {
-                        Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
-                    };
-                    let dir: Option<PathBuf> = call.workdir.clone().or_else(|| default_dir.clone()).map(PathBuf::from);
-                    if let Some(shorter) = session.rewrite_output(graph, &call.command, dir.as_deref(), &text, opts) {
-                        item["output"] = Value::String(reframe(framed, shorter));
-                        seen.outputs_replaced += 1;
-                    } else if opts.shorten_outputs && text.len() >= REPEAT_MIN_BYTES {
-                        // The same large output again (a file read twice, a command
-                        // rerun with nothing changed): point to the first copy, which
-                        // is still in this request. Decided from the request alone, so
-                        // it is the same on every turn and right after a compaction.
-                        let hash = lge_core::content_hash(text.as_bytes());
-                        match sent_in_full.get(&hash) {
-                            Some(earlier) => {
-                                let first: String = earlier.chars().take(120).collect();
-                                let pointer = format!(
-                                    "lge: identical to the output of `{first}` earlier in this conversation ({} lines, unchanged); it is not repeated here.
-",
-                                    text.lines().count()
-                                );
-                                let id = item.get("call_id").and_then(Value::as_str).unwrap_or(&hash).to_string();
-                                session.count_pointer(&id, &text, &pointer);
-                                item["output"] = Value::String(reframe(framed, pointer));
-                                seen.outputs_replaced += 1;
-                            }
-                            None => {
-                                sent_in_full.insert(hash, call.command.clone());
-                            }
-                        }
-                    }
-                }
+                let replaced = call.and_then(|call| known.output(&mut item, &kind, &call));
+                // No command to go by (another tool, a script this cannot read), or an
+                // output of another shape: each text is judged by its content alone.
+                seen.outputs_replaced += replaced.unwrap_or_else(|| rewrite_by_content(&mut item, known.session, opts));
                 out.push(item);
             }
             "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
@@ -320,7 +412,7 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                 let (Some(text), Some(graph), true) = (text, graph, typed) else {
                     continue;
                 };
-                if let Some(context) = session.context_for(graph, &text, opts) {
+                if let Some(context) = known.session.context_for(graph, &text, opts) {
                     out.push(context_item(&context));
                     seen.contexts_present += 1;
                 }
@@ -445,6 +537,9 @@ mod tests {
 
     #[test]
     fn only_shell_outputs_change_and_everything_else_is_untouched() {
+        let diff: String = (0..120)
+            .map(|i| format!("-    old_line_{i} = compute({i})\n+    new_line_{i} = compute({i}, True)\n"))
+            .collect();
         let run = passing_run();
         let framed = format!("Chunk ID: a1b2c3\nWall time: 9.9123 seconds\nProcess exited with code 0\nOriginal token count: 5460\nOutput:\n{run}");
         let mut body = json!({
@@ -458,7 +553,7 @@ mod tests {
                 call("c1", "pytest -v"),
                 output("c1", &framed),
                 call("c2", "git diff"),
-                output("c2", &run),
+                output("c2", &diff),
                 { "type": "function_call", "name": "update_plan", "call_id": "c3", "arguments": "{\"plan\":[]}" },
                 output("c3", "Plan updated"),
             ],
@@ -573,7 +668,8 @@ mod tests {
 
     #[test]
     fn an_output_without_a_known_command_is_judged_by_its_content() {
-        // A script run (code mode): the output is a list of parts, the command is inside the script.
+        // A script run (code mode) with two commands: the output is a list of
+        // parts, and no single command produced them.
         let listing: String = (0..200)
             .map(|i| {
                 format!(
@@ -584,7 +680,7 @@ mod tests {
             })
             .collect();
         let mut body = json!({ "input": [
-            { "type": "custom_tool_call", "call_id": "s1", "name": "exec", "input": "const r = await tools.exec_command({cmd: 'pytest -v'}); text(r.output);" },
+            { "type": "custom_tool_call", "call_id": "s1", "name": "exec", "input": "const r = await tools.exec_command({cmd: 'pytest -v'}); text(r.output);\nconst s = await tools.exec_command({cmd: 'rg -n render src'}); text(s.output);" },
             { "type": "custom_tool_call_output", "call_id": "s1", "output": [
                 { "type": "input_text", "text": "Script completed\nWall time 9.9 seconds\nOutput:\n" },
                 { "type": "input_text", "text": passing_run() },

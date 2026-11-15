@@ -8,14 +8,23 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 # Reads the benchmark task file. Parsing only.
 toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+# The A/B runner talks to the local daemon's settings API over plain HTTP.
+ureq = { version = "3", default-features = false }
 lge-core = { path = "../lge-core" }
 lge-store = { path = "../lge-store" }
 lge-retrieve = { path = "../lge-retrieve" }
 lge-router = { path = "../lge-router" }
+lge-session = { path = "../lge-session" }
+lge-usage = { path = "../lge-usage" }
+
+[target.'cfg(unix)'.dependencies]
+# Ctrl-C during an A/B run: restore the daemon's settings before exiting.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-serde_json.workspace = true
+tiny_http = "0.12.0"
 lge-mcp = { path = "../lge-mcp" }

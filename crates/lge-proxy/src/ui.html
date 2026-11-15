@@ -94,6 +94,15 @@
 const $ = id => document.getElementById(id);
 const n = v => (v || 0).toLocaleString();
 const pct = (a, b) => b > 0 ? Math.round(100 * a / b) + '%' : '–';
+const size = b => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; b = b || 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; } return (i ? b.toFixed(b < 10 ? 1 : 0) : b) + ' ' + u[i]; };
+// Folders that searches would read: the folder, its size, why, and the line that hides it.
+const bulky = r => {
+  const list = r.bulky || [];
+  if (!list.length) return '';
+  const rows = list.slice(0, 5).map(d => `<div class="warn">Searches would read <span class="mono">${esc(d.path)}/</span> (${size(d.bytes)}, ${n(d.files)} files): ${esc(d.reason)}. Add <span class="mono">${esc(d.ignore_line)}</span> to <span class="mono">${esc(r.root)}/.gitignore</span></div>`);
+  if (list.length > 5) rows.push(`<div class="warn">and ${list.length - 5} more such folders</div>`);
+  return rows.join('');
+};
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, settingsDirty = false;
 
@@ -124,7 +133,7 @@ function render(s) {
   $('mcpcmd').textContent = `codex mcp add local_graph --url ${origin}/mcp`;
 
   $('repos').innerHTML = '<tr><th>Folder</th><th>State</th><th class="n">Files</th><th class="n">Symbols</th><th class="n">Facts</th><th></th></tr>' +
-    (s.repos.length ? s.repos.map(r => `<tr><td><b>${esc(r.name)}</b><div class="dim mono">${esc(r.root)}</div></td>
+    (s.repos.length ? s.repos.map(r => `<tr><td><b>${esc(r.name)}</b><div class="dim mono">${esc(r.root)}</div>${bulky(r)}</td>
       <td class="${r.state === 'ready' ? 'ok' : r.state === 'failed' ? 'bad' : 'warn'}">${r.state}${r.detail ? '<div class="dim">' + esc(r.detail) + '</div>' : ''}</td>
       <td class="n">${n(r.files)}</td><td class="n">${n(r.symbols)}</td><td class="n">${n(r.memories)}</td>
       <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')

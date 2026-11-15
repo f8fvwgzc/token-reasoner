@@ -117,6 +117,9 @@ enum RepoState {
 struct Repo {
     root: PathBuf,
     state: Mutex<RepoState>,
+    /// Folders searches would wade through, found when the repository is
+    /// indexed (not on every status call).
+    bulky: Mutex<Vec<lge_index::BulkyDir>>,
 }
 
 /// One conversation as the proxy sees it.
@@ -302,6 +305,7 @@ impl Daemon {
         let repo = Arc::new(Repo {
             root: root.clone(),
             state: Mutex::new(RepoState::Indexing),
+            bulky: Mutex::new(Vec::new()),
         });
         if lock(&self.repos).insert(root.clone(), repo.clone()).is_some() {
             // Already known: index again with the existing entry replaced.
@@ -309,10 +313,19 @@ impl Daemon {
         self.save();
         let daemon = self.clone();
         std::thread::spawn(move || {
+            // Beside the index, so the warning shows while a slow index runs (a
+            // bulky folder is often why it is slow) without holding the index
+            // up, and a failure there never fails the index.
+            let bulky = {
+                let repo = repo.clone();
+                std::thread::spawn(move || *lock(&repo.bulky) = lge_index::bulky_dirs(&repo.root))
+            };
             let state = match daemon.open_repo(&repo.root) {
                 Ok(server) => RepoState::Ready(Box::new(server)),
                 Err(e) => RepoState::Failed(format!("{e:#}")),
             };
+            // A repository listed as ready has its warnings too.
+            let _ = bulky.join();
             *lock(&repo.state) = state;
         });
         Ok(root)
@@ -828,6 +841,10 @@ impl Daemon {
             RepoState::Ready(server) => ("ready", String::new(), server.store().stats().unwrap_or_default()),
         };
         let stat = |k: &str| stats.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(0);
+        let bulky: Vec<Value> = lock(&repo.bulky)
+            .iter()
+            .map(|d| json!({ "path": d.path, "bytes": d.bytes, "files": d.files, "reason": d.reason, "ignore_line": d.ignore_line() }))
+            .collect();
         json!({
             "root": repo.root.to_string_lossy(),
             "name": repo.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
@@ -837,6 +854,7 @@ impl Daemon {
             "symbols": stat("symbols"),
             "services": stat("services"),
             "memories": stat("memories"),
+            "bulky": bulky,
         })
     }
 

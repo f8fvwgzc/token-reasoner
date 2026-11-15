@@ -22,17 +22,29 @@ Only two kinds of item in the conversation, and nothing else in the body:
 
 | Item | What happens | Why it is safe |
 |---|---|---|
-| Output of a test, lint or type-check run | Reduced to its failures, or to one line when it passed | Only for tools whose output format is recognised; an unknown format is left alone |
-| Output of `rg` / `grep` with more than 60 matching lines | Capped: the files the task is about first, six lines per file, and a line saying what was left out | The closing line tells the model to narrow the search |
+| Output of a test, lint or type-check run | Reduced to its failures, or to one line when it passed | Only for tools whose output format is recognised; an unknown format is left alone. A pass is only stated when the tool's own closing line says so (`300 passed`, cargo's `Finished`): output cut before its end (a process still running, `\| head`) is sent as it is |
+| Output of `rg` / `grep` with 60 or more matching lines that make up at least half of it (also in rg's heading layout), alone or piped only into `head`, `tail`, `sort`, `uniq` or `grep` | Capped: the files the task is about first, then the files with the most matches, six lines per file, about sixty in all, and a line saying what was left out. Lines that are not matches (the agent's truncation notes, headers, `--`, `Binary file .. matches`) stay where they are | The closing line tells the model to narrow the search; a capped file says how many of its lines were left out |
 | The same large output a second time (a file read again, a command rerun with nothing changed) | Replaced by one line that points to the first copy | Only while the first copy is still in the request; after the agent compacts its history the content is sent again |
 | Output of `cat file`, or of a read that starts at line 1, for a file in the graph. **Off by default** | A skeleton: functions the task is not about keep their signature and first docstring line; each left-out body is replaced by a marker with the exact `sed -n 'A,Bp' file` that reads it | Only when the file on disk is exactly what was indexed; a second read of the same file is always sent whole |
-| A message the user typed, when it names a symbol or clearly matches one | One extra message is added after it: the evidence pack for that message, in `<lge_context>` tags | Small talk gets nothing; the same starting points are never added twice |
+| A message the user typed, when it names a symbol or clearly matches one | One extra message is added after it: the evidence pack for that message, in `<lge_context>` tags. When its starting points are all in one file and nothing outside that file uses them, the pack is at most 600 tokens | Small talk gets nothing; the same starting points are never added twice; the size is decided from the graph alone |
 
-Never touched: the system prompt, tool definitions, reasoning items, tool calls,
-patches, diffs, reads of a line range that does not start at the top, and any output
-the proxy cannot classify with certainty.
+Never touched: the system prompt, tool definitions, reasoning items, tool calls
+(code-mode scripts included), patches, diffs, reads of a line range that does not start
+at the top, and any output the proxy cannot classify with certainty.
 A request in which nothing was replaced or added is forwarded as the exact bytes that
 came in.
+
+**Code mode.** Current models run tools from a JavaScript script (a `custom_tool_call`
+named `exec`) whose result is a status part (`Script completed`, wall time) followed by
+what the script printed. When the script calls `tools.exec_command` exactly once,
+outside any loop or function, with a `cmd` written as a plain string, the printed text
+is treated as the output of that command, as if it had been run directly. The status
+part, the number of parts and every part that is not text stay as they are, and the
+script is only read. A script with several commands, a computed command, or anything
+the proxy cannot read with certainty is judged by the content of its output alone,
+which only shortens recognised test runs and long lists of numbered search matches
+(`path:line:text`, or rg's heading layout); a line that merely starts with `name:`
+(YAML keys, test ids, `host:port`) is never taken for a match there.
 
 Whole-file skeletons are opt-in because Headroom and RTK, which both measured this,
 leave file reads alone by default: a shortened read can cost more in follow-up reads
@@ -123,7 +135,7 @@ On the page, or `daemon.json` in the data directory:
 | Shorten outputs | on | Check results, search caps, pointers for repeated output |
 | Skeletons for whole-file reads | off | Experimental, see above |
 | Index on first use | on | A git repository inside the workspace is indexed the first time the agent works in it |
-| Context budget | 1,500 tokens | Size of one added pack |
+| Context budget | 1,500 tokens | Size of one added pack; a message about one file that nothing else uses gets at most 600 |
 
 ## What is not verified
 

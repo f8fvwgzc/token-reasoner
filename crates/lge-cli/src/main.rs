@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use lge_core::{method, EdgeType};
 use lge_retrieve::{
     architecture, compute_metrics, dependencies, evidence_pack, impact, index_repo, overview, refresh_if_stale,
@@ -179,6 +179,34 @@ enum Cmd {
         #[arg(long, default_value_t = 6000)]
         budget: usize,
     },
+    /// A/B test through the daemon: each task as one Codex session with lge's
+    /// features off and one with them on, each in a fresh copy of the
+    /// repository, then tokens, success and a verdict. Spends real tokens.
+    Ab(AbArgs),
+}
+
+#[derive(Args)]
+struct AbArgs {
+    /// The task file: `[[task]]` entries with name, prompt, check and an optional setup.
+    tasks: PathBuf,
+    /// Sessions per task and arm.
+    #[arg(long, default_value_t = 1)]
+    runs: usize,
+    /// The address of the running daemon (`lge serve`).
+    #[arg(long, env = "LGE_DAEMON", default_value = "http://127.0.0.1:8787")]
+    daemon: String,
+    /// Where the copies are made. Default: a new folder in the system's temporary folder.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+    /// Codex sandbox for the sessions. "" keeps Codex's default, which is read-only.
+    #[arg(long, default_value = "workspace-write")]
+    sandbox: String,
+    /// Start even when ~/.codex/config.toml does not send Codex's requests to the daemon.
+    #[arg(long)]
+    no_codex_check: bool,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +370,10 @@ fn main() -> Result<()> {
     if let Cmd::Init { write, register } = &cli.cmd {
         return init(&repo, *write, *register);
     }
+    // The A/B runner works in copies through the daemon; it never opens the repository's graph.
+    if let Cmd::Ab(args) = &cli.cmd {
+        return ab(&repo, args);
+    }
     // The daemon owns its own databases, one per folder, under its data directory.
     if let Cmd::Serve {
         host,
@@ -389,7 +421,7 @@ fn main() -> Result<()> {
 
     let store = open(&db)?;
     match cli.cmd {
-        Cmd::Init { .. } | Cmd::Serve { .. } => unreachable!("handled above"),
+        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Ab(_) => unreachable!("handled above"),
         Cmd::Index {
             root,
             service_depth,
@@ -405,6 +437,17 @@ fn main() -> Result<()> {
                 },
             )?;
             print_index(&r, &store);
+            for d in lge_index::bulky_dirs(&root) {
+                println!(
+                    "warning: searches would read {}/ ({}, {} files): {}; add `{}` to {}",
+                    d.path,
+                    size(d.bytes),
+                    d.files,
+                    d.reason,
+                    d.ignore_line(),
+                    root.join(".gitignore").display()
+                );
+            }
             match lge_memory::ingest_repo_history(&store, &root, lge_retrieve::unix_now()) {
                 Ok(0) => {}
                 Ok(n) => println!("history: {n} new commit(s) remembered"),
@@ -698,6 +741,85 @@ fn main() -> Result<()> {
             index_repo(&store, &repo, &IndexOptions::default())?;
             print!("{}", lge_bench::render(&lge_bench::run(&store, &repo, &list, budget)?));
         }
+    }
+    Ok(())
+}
+
+/// `52.3 MB`.
+fn size(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// `lge ab`: check what can be checked before any token is spent, then run
+/// both arms of every task and print the report.
+fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
+    use lge_bench::ab::{self, DaemonApi};
+    if args.runs == 0 {
+        bail!("--runs must be at least 1");
+    }
+    let tasks = ab::load_tasks(&args.tasks)?;
+    let session = lge_session::load_config(repo)?;
+    let daemon = ab::HttpDaemon::new(&args.daemon)?;
+    daemon.status()?;
+    if !args.no_codex_check {
+        let config = lge_usage::codex_home().join("config.toml");
+        let text = std::fs::read_to_string(&config).unwrap_or_default();
+        if !ab::codex_points_at(&text, daemon.base()) {
+            bail!(
+                "Codex does not send its requests to {base}, so both arms would be the same: add  \
+                 openai_base_url = \"{base}/v1\"  at the top of {} (before any [section]); \
+                 --no-codex-check skips this check",
+                config.display(),
+                base = daemon.base()
+            );
+        }
+    }
+    let runner = CodexRunner {
+        bin: session.codex_bin.clone(),
+    };
+    let mut opts = ab::AbOptions::new(args.work_dir.clone().unwrap_or_else(ab::default_work_dir));
+    opts.runs = args.runs;
+    opts.model = (!session.model.is_empty()).then(|| session.model.clone());
+    opts.sandbox = (!args.sandbox.is_empty()).then(|| args.sandbox.clone());
+    eprintln!(
+        "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions in copies of {} under {}",
+        tasks.len(),
+        opts.runs,
+        tasks.len() * opts.runs * 2,
+        repo.display(),
+        opts.work_dir.display()
+    );
+    eprintln!("lge ab: the daemon's settings are switched during the run and restored at the end (Ctrl-C too)");
+    ab::interrupt::install();
+    let log = |m: &str| eprintln!("lge ab: {m}");
+    let env = ab::AbEnv {
+        daemon: &daemon,
+        runner: &runner,
+        stop: &ab::interrupt::requested,
+        log: &log,
+    };
+    let report = ab::run_ab(repo, &tasks, &opts, &env)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", ab::render(&report));
+    }
+    if report.interrupted {
+        std::process::exit(130);
+    }
+    if !report.settings_restored {
+        std::process::exit(1);
     }
     Ok(())
 }

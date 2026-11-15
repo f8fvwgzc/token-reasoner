@@ -8,10 +8,10 @@
 //! the same way in every later request.
 
 use crate::command::{purpose, Purpose};
-use crate::shorten::{cap_search, failures_only, skeleton};
-use lge_core::{content_hash, split_words, NodeRec};
+use crate::shorten::{cap_numbered_search, cap_search, check_run, failures_only, skeleton};
+use lge_core::{content_hash, split_words, NodeLabel, NodeRec};
 use lge_retrieve::budget::count;
-use lge_retrieve::{evidence_pack, find_seeds, PackOptions, SeedOptions};
+use lge_retrieve::{dependents_of, evidence_pack, find_seeds, PackOptions, SeedOptions, WalkOptions};
 use lge_store::GraphStore;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -101,6 +101,64 @@ fn key(parts: &[&str]) -> String {
     content_hash(&bytes)
 }
 
+/// Tokens of the pack for a message whose starting points are all in one file
+/// that nothing else uses: beyond that file there is little to say.
+pub const LOCAL_CONTEXT_BUDGET: usize = 600;
+
+/// The budget of the pack for `user_text`: [`LOCAL_CONTEXT_BUDGET`] when every
+/// starting point the pack would use is in one file and nothing outside that
+/// file depends on them (as far as the pack would look), the configured
+/// budget otherwise. A smaller configured budget is never raised. Decided from
+/// the graph alone: the same graph and message give the same budget.
+pub fn pack_budget(store: &dyn GraphStore, user_text: &str, opts: &Options) -> usize {
+    if only_one_file(store, user_text).unwrap_or(false) {
+        opts.context_budget.min(LOCAL_CONTEXT_BUDGET)
+    } else {
+        opts.context_budget
+    }
+}
+
+/// True when the pack's starting points for `user_text` are all in one file
+/// and every symbol that depends on them is in that file too. Anything else
+/// that depends on them (an endpoint, a table, a queue), an unresolved edge
+/// from another file, or a walk cut short, means it is not.
+fn only_one_file(store: &dyn GraphStore, user_text: &str) -> Option<bool> {
+    let pack = PackOptions::default();
+    let seeds = find_seeds(
+        store,
+        user_text,
+        &SeedOptions {
+            max_seeds: pack.max_seeds,
+            service: pack.service.clone(),
+            ..SeedOptions::default()
+        },
+    )
+    .ok()?;
+    let file = seeds.first()?.hit.file_path.clone();
+    if file.is_empty() || seeds.iter().any(|s| s.hit.file_path != file) {
+        return Some(false);
+    }
+    let ids: Vec<String> = seeds.iter().map(|s| s.hit.id.clone()).collect();
+    let users = dependents_of(
+        store,
+        &ids,
+        &WalkOptions {
+            depth: pack.depth_used_by,
+            max_nodes: pack.max_nodes,
+            ..WalkOptions::default()
+        },
+    )
+    .ok()?;
+    Some(
+        !users.truncated
+            && users
+                .reached
+                .iter()
+                .all(|r| r.node.label == NodeLabel::Symbol && r.node.file_path == file)
+            && users.unresolved.iter().all(|e| e.evidence_file == file),
+    )
+}
+
 /// A repository-relative path for what a command named, if it is inside the root.
 fn relative(root: &Path, cwd: Option<&Path>, path: &str) -> Option<String> {
     let p = Path::new(path);
@@ -168,7 +226,7 @@ impl Session {
             graph.store,
             user_text,
             &PackOptions {
-                budget: opts.context_budget,
+                budget: pack_budget(graph.store, user_text, opts),
                 ..PackOptions::default()
             },
         )
@@ -215,10 +273,26 @@ impl Session {
         output: &str,
         opts: &Options,
     ) -> Option<String> {
+        self.rewrite_call_output(graph, "", command, cwd, output, opts)
+    }
+
+    /// [`Session::rewrite_output`] for the output of one tool call, named by
+    /// `call` (its call id). Decided once per call: the same call gets the same
+    /// bytes on every turn, while a second call with the same command and
+    /// output is decided on its own (a file read again is sent whole).
+    pub fn rewrite_call_output(
+        &mut self,
+        graph: Option<&Graph>,
+        call: &str,
+        command: &str,
+        cwd: Option<&Path>,
+        output: &str,
+        opts: &Options,
+    ) -> Option<String> {
         if !opts.shorten_outputs {
             return None;
         }
-        let id = key(&["output", command, output]);
+        let id = key(&["output", call, command, output]);
         if let Some(known) = self.outputs.get(&id) {
             return known.clone();
         }
@@ -234,8 +308,9 @@ impl Session {
 
     /// What to send in place of a tool output whose command is not known (a
     /// script, a tool the proxy cannot read), judged by its content alone: a
-    /// recognised test or lint run, or a long list of search matches. Decided
-    /// once per distinct text and repeated exactly afterwards.
+    /// recognised test or lint run, or a long list of numbered search matches.
+    /// A recognised run is never also taken for a search. Decided once per
+    /// distinct text and repeated exactly afterwards.
     pub fn rewrite_text(&mut self, output: &str, opts: &Options) -> Option<String> {
         if !opts.shorten_outputs {
             return None;
@@ -245,8 +320,10 @@ impl Session {
             return known.clone();
         }
         let files = &self.relevant_files;
-        let decided = failures_only("", output)
-            .or_else(|| cap_search(output, &|path| files.contains(path.trim_start_matches("./"))));
+        let decided = match check_run("", output) {
+            Some(decision) => decision,
+            None => cap_numbered_search(output, &|path| files.contains(path.trim_start_matches("./"))),
+        };
         if let Some(text) = &decided {
             self.saved.outputs_shortened += 1;
             self.saved.tokens_before += count(output);
@@ -286,7 +363,10 @@ impl Session {
             Purpose::ReadRange {
                 path, from_top: true, ..
             } if opts.shorten_reads => self.file_skeleton(graph?, &path, cwd, output),
-            Purpose::ReadWhole { .. } | Purpose::ReadRange { .. } | Purpose::Other => None,
+            Purpose::ReadWhole { .. } | Purpose::ReadRange { .. } => None,
+            // A runner the proxy does not know (`npm test`, `make check`) may still
+            // print a test or lint run it recognises: judge that by its content.
+            Purpose::Other => failures_only("", output),
         }
     }
 

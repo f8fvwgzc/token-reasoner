@@ -752,11 +752,16 @@ dependencies = [
  "lge-mcp",
  "lge-retrieve",
  "lge-router",
+ "lge-session",
  "lge-store",
+ "lge-usage",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "tiny_http",
  "toml",
+ "ureq",
 ]
 
 [[package]]

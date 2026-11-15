@@ -7,6 +7,8 @@
 //! graph, before any searching. What a real session spends is measured by the
 //! usage log, not here.
 
+pub mod ab;
+
 use anyhow::{Context, Result};
 use lge_core::Level;
 use lge_retrieve::budget::count;

@@ -496,3 +496,78 @@ fn a_folder_is_indexed_and_its_graph_reaches_the_request_and_the_tools() {
         "{text}"
     );
 }
+
+#[test]
+fn bulky_folders_are_reported_with_the_line_that_hides_them() {
+    let r = start();
+    std::fs::create_dir_all(r.repo.join("artifacts/2025")).unwrap();
+    std::fs::write(r.repo.join("artifacts/2025/build.tar"), vec![0u8; 4096]).unwrap();
+    std::fs::create_dir_all(r.repo.join("logs")).unwrap();
+    std::fs::write(r.repo.join("logs/today.log"), "x").unwrap();
+    std::fs::write(r.repo.join(".gitignore"), "/logs/\n").unwrap();
+    // Before anything is indexed, no repository and nothing to report.
+    assert!(r.json("/lge/api/status")["repos"].as_array().unwrap().is_empty());
+
+    let add = json!({ "path": r.repo.to_string_lossy() }).to_string();
+    let (status, _, _) = r.post(
+        "/lge/api/repos",
+        add.as_bytes(),
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 200);
+    r.wait_ready();
+    let status = r.json("/lge/api/status");
+    let bulky = status["repos"][0]["bulky"].as_array().unwrap();
+    assert_eq!(bulky.len(), 1, "the ignored `logs/` is not reported: {status}");
+    assert_eq!(bulky[0]["path"], "artifacts");
+    assert_eq!(bulky[0]["ignore_line"], "/artifacts/");
+    assert_eq!(
+        (bulky[0]["files"].as_u64(), bulky[0]["bytes"].as_u64()),
+        (Some(1), Some(4096))
+    );
+    assert!(bulky[0]["reason"].as_str().unwrap().contains("archives"), "{status}");
+    // The page renders the warning from these fields.
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("d.ignore_line") && page.contains("Searches would read"));
+
+    // Found when the folder is indexed, not on every status call: a folder
+    // added since shows only after the next index.
+    std::fs::create_dir_all(r.repo.join("dist")).unwrap();
+    std::fs::write(r.repo.join("dist/bundle.js"), "var a;").unwrap();
+    for _ in 0..3 {
+        let again = r.json("/lge/api/status");
+        assert_eq!(again["repos"][0]["bulky"].as_array().unwrap().len(), 1, "{again}");
+    }
+    let (status, _, _) = r.post(
+        "/lge/api/repos",
+        add.as_bytes(),
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 200);
+    r.wait_ready();
+    let status = r.json("/lge/api/status");
+    let lines: Vec<&str> = status["repos"][0]["bulky"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["ignore_line"].as_str().unwrap())
+        .collect();
+    assert_eq!(lines, ["/artifacts/", "/dist/"], "{status}");
+
+    // `DELETE /lge/api/repos` with the path in a JSON body (as `lge ab` sends it).
+    let response = r
+        .agent
+        .run(
+            ureq::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("{}/lge/api/repos", r.base))
+                .header("content-type", "application/json")
+                .body(add.clone().into_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let answer: Value = serde_json::from_slice(&response.into_body().read_to_vec().unwrap()).unwrap();
+    assert_eq!(answer["removed"], true, "{answer}");
+    assert!(r.json("/lge/api/status")["repos"].as_array().unwrap().is_empty());
+}
