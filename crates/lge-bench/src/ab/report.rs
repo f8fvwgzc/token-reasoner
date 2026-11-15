@@ -90,6 +90,12 @@ pub struct AbReport {
     pub interrupted: bool,
     /// False when the daemon's original settings could not be put back.
     pub settings_restored: bool,
+    /// The full id of the commit every copy was made from; "" when unknown.
+    pub base: String,
+    /// The sessions ran with `--approve-for-me` in place of `-s workspace-write`.
+    pub approve_for_me: bool,
+    /// The note appended to every prompt; `None` when there was none.
+    pub note: Option<String>,
 }
 
 /// The median; the mean of the two middle values for an even count.
@@ -180,6 +186,9 @@ pub fn summarize(names: &[String], runs: Vec<ArmRun>) -> AbReport {
         target_change: TARGET_CHANGE,
         interrupted: false,
         settings_restored: true,
+        base: String::new(),
+        approve_for_me: false,
+        note: None,
     }
 }
 
@@ -293,10 +302,24 @@ pub fn render(r: &AbReport) -> String {
         .unwrap_or(4)
         .clamp(4, 32);
     let cut = |name: &str| name.chars().take(width).collect::<String>();
-    let mut out = format!(
+    let mut out = String::new();
+    if !r.base.is_empty() {
+        out.push_str(&format!("base commit: {}\n", r.base));
+    }
+    match &r.note {
+        Some(note) => out.push_str(&format!("note appended to every prompt: {note}\n")),
+        None => out.push_str("note appended to every prompt: none\n"),
+    }
+    if r.approve_for_me {
+        out.push_str(
+            "sessions ran with --approve-for-me (workspace-write sandbox, approvals reviewed automatically)\n",
+        );
+    }
+    out.push('\n');
+    out.push_str(&format!(
         "{:width$}  {:>3}  {:>3}  {:>11}  {:>11}  {:>9}  {:>9}  {:>11}  {:>5}  {:>5}  result\n",
         "task", "run", "arm", "input", "cached", "output", "reasoning", "total", "turns", "reqs"
-    );
+    ));
     for run in &r.runs {
         let result = match (&run.error, run.check_passed) {
             (Some(e), _) => format!("error: {e}"),

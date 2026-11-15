@@ -18,9 +18,11 @@ use lge_router::{route, Route, RouterConfig};
 use lge_store::GraphStore;
 use lge_usage::{apply_session, find_rollout, new_record, parse_codex_jsonl, parse_rollout_file, task_id};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Bump when [`STABLE_PREFIX`] changes: a new prefix starts a new cache entry.
 pub const PREFIX_VERSION: u32 = 1;
@@ -71,6 +73,10 @@ pub struct SessionConfig {
     pub codex_bin: String,
     /// Sandbox mode passed to Codex; "" keeps its default.
     pub sandbox: String,
+    /// With `sandbox = "workspace-write"`, run Codex with `--approve-for-me`
+    /// (approval requests reviewed automatically, in the workspace-write
+    /// sandbox it selects) in place of `-s`, when this Codex has the flag.
+    pub approve_for_me: bool,
     /// Label written to the usage log, to compare runs with different levers on.
     pub mode: String,
 }
@@ -89,6 +95,7 @@ impl Default for SessionConfig {
             max_attempts: 2,
             codex_bin: "codex".to_string(),
             sandbox: String::new(),
+            approve_for_me: true,
             mode: "pack+mcp".to_string(),
         }
     }
@@ -126,6 +133,17 @@ impl SessionConfig {
         };
         (!e.is_empty()).then(|| e.clone())
     }
+
+    /// The sandbox, and whether to pass `--approve-for-me` in its place, for
+    /// sessions run by `runner` (see [`use_approve_for_me`]).
+    pub fn sandbox_for(&self, runner: &dyn SessionRunner) -> (Option<String>, bool) {
+        let sandbox = (!self.sandbox.is_empty()).then(|| self.sandbox.clone());
+        if use_approve_for_me(self.approve_for_me, sandbox.as_deref(), runner) {
+            (None, true)
+        } else {
+            (sandbox, false)
+        }
+    }
 }
 
 /// The prompt, in cache order: stable prefix, context, memory, then the task.
@@ -157,6 +175,10 @@ pub struct SessionRequest {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub sandbox: Option<String>,
+    /// Let the agent review approval requests itself (`codex exec
+    /// --approve-for-me`, which selects the workspace-write sandbox). Takes
+    /// the place of `sandbox`: Codex refuses the two together.
+    pub approve_for_me: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,11 +193,110 @@ pub struct SessionResult {
 pub trait SessionRunner {
     fn name(&self) -> &str;
     fn run(&self, request: &SessionRequest) -> Result<SessionResult>;
+    /// True when the runner can take [`SessionRequest::approve_for_me`]. None
+    /// can by default.
+    fn approve_for_me_available(&self) -> bool {
+        false
+    }
+}
+
+/// The sandbox `--approve-for-me` selects.
+pub const WORKSPACE_WRITE: &str = "workspace-write";
+
+/// Whether sessions run with `--approve-for-me`: wanted, the sandbox asked
+/// for is the one the flag selects, and the runner has it. The runner is
+/// asked only when the first two hold.
+pub fn use_approve_for_me(wanted: bool, sandbox: Option<&str>, runner: &dyn SessionRunner) -> bool {
+    wanted && sandbox == Some(WORKSPACE_WRITE) && runner.approve_for_me_available()
+}
+
+/// True when the text of `codex exec --help` lists the `--approve-for-me` option.
+pub fn help_lists_approve_for_me(help: &str) -> bool {
+    help.lines().any(|line| {
+        line.split(|c: char| c.is_whitespace() || c == ',')
+            .any(|word| word == "--approve-for-me")
+    })
 }
 
 /// `codex exec --json`, with the prompt on stdin.
 pub struct CodexRunner {
     pub bin: String,
+    /// What `codex exec --help` said about `--approve-for-me`, asked once.
+    approve_for_me: OnceLock<bool>,
+}
+
+impl CodexRunner {
+    pub fn new(bin: impl Into<String>) -> CodexRunner {
+        CodexRunner {
+            bin: bin.into(),
+            approve_for_me: OnceLock::new(),
+        }
+    }
+}
+
+/// Longest wait for `codex exec --help` before the answer is "no".
+pub const HELP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Ask `bin exec --help` whether it has `--approve-for-me`. A binary that
+/// cannot run, fails, or has not answered within `timeout` (it is killed
+/// then) has not.
+pub fn codex_has_approve_for_me(bin: &str, timeout: Duration) -> bool {
+    help_text(bin, timeout).is_some_and(|text| help_lists_approve_for_me(&text))
+}
+
+/// Standard output and error of a successful `bin exec --help`, or `None`.
+fn help_text(bin: &str, timeout: Duration) -> Option<String> {
+    let mut child = Command::new(bin)
+        .args(["exec", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // Read both pipes on their own threads: a full pipe never blocks the
+    // child, and a pipe held open by something it started never blocks us.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let readers: Vec<Box<dyn Read + Send>> = [
+        child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>),
+        child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let pipes = readers.len();
+    for mut pipe in readers {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut text = String::new();
+    for _ in 0..pipes {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(200));
+        let bytes = rx.recv_timeout(left).ok()?;
+        text.push_str(&String::from_utf8_lossy(&bytes));
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// The command line a request becomes. The prompt is not an argument: it goes
@@ -193,7 +314,9 @@ pub fn codex_args(request: &SessionRequest) -> Vec<String> {
     if let Some(e) = &request.effort {
         args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{e}\"")]);
     }
-    if let Some(s) = &request.sandbox {
+    if request.approve_for_me {
+        args.push("--approve-for-me".to_string());
+    } else if let Some(s) = &request.sandbox {
         args.extend(["-s".to_string(), s.clone()]);
     }
     args.push("-".to_string());
@@ -203,6 +326,12 @@ pub fn codex_args(request: &SessionRequest) -> Vec<String> {
 impl SessionRunner for CodexRunner {
     fn name(&self) -> &str {
         "codex"
+    }
+
+    fn approve_for_me_available(&self) -> bool {
+        *self
+            .approve_for_me
+            .get_or_init(|| codex_has_approve_for_me(&self.bin, HELP_TIMEOUT))
     }
 
     fn run(&self, request: &SessionRequest) -> Result<SessionResult> {
@@ -365,6 +494,7 @@ pub fn run_task(
     };
     let mut level = plan.level;
     let mut prompt = plan.prompt.clone();
+    let (sandbox, approve_for_me) = cfg.sandbox_for(runner);
 
     for attempt in 1..=cfg.max_attempts.max(1) as i64 {
         let attempt_started = unix_now();
@@ -389,7 +519,8 @@ pub fn run_task(
             cwd: root.to_path_buf(),
             model: (!cfg.model.is_empty()).then(|| cfg.model.clone()),
             effort: cfg.effort_for(level),
-            sandbox: (!cfg.sandbox.is_empty()).then(|| cfg.sandbox.clone()),
+            sandbox: sandbox.clone(),
+            approve_for_me,
         };
         let result = runner.run(&request)?;
         let mut parsed = parse_codex_jsonl(&result.events);

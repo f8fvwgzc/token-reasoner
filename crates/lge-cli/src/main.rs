@@ -180,14 +180,16 @@ enum Cmd {
         budget: usize,
     },
     /// A/B test through the daemon: each task as one Codex session with lge's
-    /// features off and one with them on, each in a fresh copy of the
-    /// repository, then tokens, success and a verdict. Spends real tokens.
+    /// features off and one with them on, each in a fresh git worktree of the
+    /// base commit, one after another, then tokens, success and a verdict.
+    /// Spends real tokens.
     Ab(AbArgs),
 }
 
 #[derive(Args)]
 struct AbArgs {
-    /// The task file: `[[task]]` entries with name, prompt, check and an optional setup.
+    /// The task file: `[[task]]` entries with name, prompt, check and an optional setup,
+    /// and an optional top-level `note` that replaces the default prompt note ("" turns it off).
     tasks: PathBuf,
     /// Sessions per task and arm.
     #[arg(long, default_value_t = 1)]
@@ -198,9 +200,20 @@ struct AbArgs {
     /// Where the copies are made. Default: a new folder in the system's temporary folder.
     #[arg(long)]
     work_dir: Option<PathBuf>,
+    /// The commit (or branch, tag, revision) the copies are made from, resolved once at the start.
+    #[arg(long, default_value = "HEAD")]
+    base: String,
     /// Codex sandbox for the sessions. "" keeps Codex's default, which is read-only.
     #[arg(long, default_value = "workspace-write")]
     sandbox: String,
+    /// Pass `-s workspace-write` even when Codex has `--approve-for-me`. By default the sessions
+    /// use `--approve-for-me` in its place, so approval requests do not stall them.
+    #[arg(long)]
+    no_approve_for_me: bool,
+    /// Append no note to the prompts. By default each prompt ends with a note not to install
+    /// dependencies or run long test suites (the check runs after the session).
+    #[arg(long)]
+    no_note: bool,
     /// Start even when ~/.codex/config.toml does not send Codex's requests to the daemon.
     #[arg(long)]
     no_codex_check: bool,
@@ -600,14 +613,17 @@ fn main() -> Result<()> {
                 cfg.run_checks = false;
             }
             let index = IndexOptions::default();
+            let runner = CodexRunner::new(cfg.codex_bin.clone());
             if dry_run {
                 let plan = plan_task(&store, &repo, &task, &cfg, &index)?;
+                let (sandbox, approve_for_me) = cfg.sandbox_for(&runner);
                 let request = SessionRequest {
                     prompt: String::new(),
                     cwd: repo.clone(),
                     model: (!cfg.model.is_empty()).then(|| cfg.model.clone()),
                     effort: cfg.effort_for(plan.level),
-                    sandbox: (!cfg.sandbox.is_empty()).then(|| cfg.sandbox.clone()),
+                    sandbox,
+                    approve_for_me,
                 };
                 println!(
                     "router: {} ({}){}",
@@ -630,9 +646,6 @@ fn main() -> Result<()> {
                 );
                 println!("----- prompt -----\n{}", plan.prompt);
             } else {
-                let runner = CodexRunner {
-                    bin: cfg.codex_bin.clone(),
-                };
                 let out = run_task(&store, &repo, &task, &cfg, &index, &runner)?;
                 for a in &out.attempts {
                     println!(
@@ -771,8 +784,11 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be at least 1");
     }
-    let tasks = ab::load_tasks(&args.tasks)?;
+    let file = ab::load_task_file(&args.tasks)?;
+    let tasks = file.tasks;
     let session = lge_session::load_config(repo)?;
+    // Before the daemon is asked anything: a wrong revision is a typo.
+    let base = ab::resolve_commit(repo, &args.base)?;
     let daemon = ab::HttpDaemon::new(&args.daemon)?;
     daemon.status()?;
     if !args.no_codex_check {
@@ -788,21 +804,30 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
             );
         }
     }
-    let runner = CodexRunner {
-        bin: session.codex_bin.clone(),
-    };
+    let runner = CodexRunner::new(session.codex_bin.clone());
     let mut opts = ab::AbOptions::new(args.work_dir.clone().unwrap_or_else(ab::default_work_dir));
     opts.runs = args.runs;
-    opts.model = args.model.clone().or_else(|| (!session.model.is_empty()).then(|| session.model.clone()));
+    opts.base = base.clone();
+    opts.model = args
+        .model
+        .clone()
+        .or_else(|| (!session.model.is_empty()).then(|| session.model.clone()));
     opts.sandbox = (!args.sandbox.is_empty()).then(|| args.sandbox.clone());
+    opts.approve_for_me = !args.no_approve_for_me;
+    opts.note = ab::resolve_note(file.note.as_deref(), args.no_note);
     eprintln!(
-        "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions in copies of {} under {}",
+        "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions, one after another, each in its own \
+         git worktree of commit {base} of {} under {}",
         tasks.len(),
         opts.runs,
         tasks.len() * opts.runs * 2,
         repo.display(),
         opts.work_dir.display()
     );
+    match &opts.note {
+        Some(note) => eprintln!("lge ab: note appended to every prompt: {note}"),
+        None => eprintln!("lge ab: no note appended to the prompts"),
+    }
     eprintln!("lge ab: the daemon's settings are switched during the run and restored at the end (Ctrl-C too)");
     ab::interrupt::install();
     let log = |m: &str| eprintln!("lge ab: {m}");

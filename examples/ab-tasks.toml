@@ -12,11 +12,18 @@
 # - Each task has a check that fails before the change and passes after it.
 #   Write that check first (a test in `setup`, or an existing test you know fails).
 # - 5 to 10 tasks, `--runs 2`: one task and one run is noise.
-# - Every session starts from a clean copy of HEAD: commit what the tasks need.
+# - Every session starts from a clean copy of HEAD (or of `--base <rev>`):
+#   commit what the tasks need.
+# - Keep checks fast and offline: run the tests that decide the task, nothing
+#   that downloads. Quote paths with spaces inside the command.
 #
 # Fields: name (unique), prompt (what you would type to Codex), check (shell
 # command, exit 0 = done correctly), setup (optional, runs in the copy first).
 # Checks run inside the copy; use absolute paths for anything outside it.
+#
+# Every prompt ends with a note not to install dependencies or run long test
+# suites (the check runs afterwards). A top-level `note = "..."` replaces it,
+# `note = ""` or `--no-note` drops it.
 
 # ---- 1. Bug hunt across layers ----------------------------------------------
 [[task]]

@@ -190,6 +190,80 @@ pub fn comment_token(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Most lines [`leading_start`] goes up.
+pub const MAX_LEADING_LINES: usize = 40;
+
+/// The first line (0-based) of the doc comments, attributes and annotations
+/// written right above a definition that starts on line `start` (0-based) of
+/// `lines`, the text of the file at `path`: `start` itself when there are
+/// none. A blank line, a line of code or a line indented deeper than the
+/// definition (the end of the block before it) ends them; an attribute over
+/// several lines (`#[derive(` ... `)]`) counts whole. At most
+/// [`MAX_LEADING_LINES`]. A document (Markdown, YAML, ...) has none: the
+/// lines above a section are the end of the section before it.
+pub fn leading_start(path: &str, lines: &[&str], start: usize) -> usize {
+    let start = start.min(lines.len());
+    let Some(lang) = lang_of(path) else {
+        return start;
+    };
+    let Some(comment) = comment_token(path) else {
+        return start;
+    };
+    if document::is_document(lang) {
+        return start;
+    }
+    let alt = generic::alt_comment_token(lang);
+    // Where `#` starts a comment, `#[` is a comment too, and block comments,
+    // `*` lines and the like are code.
+    let hash_comments = comment == "#";
+    let openers: &[&str] = if hash_comments {
+        &["@"]
+    } else {
+        &["/*", "(*", "{-", "-}", "#[", "@", "-spec"]
+    };
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let def_indent = lines.get(start).map_or(usize::MAX, |l| indent(l));
+    let leading = |line: &str| {
+        let t = line.trim();
+        // ` * text` and ` */` continue a block comment one column in.
+        if !hash_comments && t.starts_with('*') {
+            return true;
+        }
+        indent(line) <= def_indent
+            && (t.starts_with(comment)
+                || alt.is_some_and(|a| t.starts_with(a))
+                || openers.iter().any(|o| t.starts_with(o)))
+    };
+    let floor = start.saturating_sub(MAX_LEADING_LINES);
+    let mut first = start;
+    while first > floor {
+        let line = lines[first - 1];
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if leading(line) {
+            first -= 1;
+            continue;
+        }
+        // The last line of an attribute over several lines.
+        let opener = (!hash_comments && t.ends_with(']') && indent(line) <= def_indent).then(|| {
+            (floor..first - 1)
+                .rev()
+                .take_while(|&k| {
+                    let t = lines[k].trim();
+                    !t.is_empty() && !t.ends_with([';', '{', '}'])
+                })
+                .find(|&k| lines[k].trim_start().starts_with("#[") && indent(lines[k]) <= def_indent)
+        });
+        match opener.flatten() {
+            Some(k) => first = k,
+            None => break,
+        }
+    }
+    first
+}
+
 /// Comment prefixes that say why code is the way it is. Such a comment is
 /// worth more to a reader than the lines around it, so it is kept with the symbol.
 const RATIONALE_MARKERS: [&str; 7] = ["NOTE:", "WHY:", "HACK:", "IMPORTANT:", "RATIONALE:", "TODO:", "FIXME:"];
@@ -277,7 +351,7 @@ pub fn parse_many(files: &[ScannedFile]) -> Vec<(String, Result<ParsedFile>)> {
 }
 
 /// Longest definition body kept on a symbol, in bytes.
-pub(crate) const BODY_CAP: usize = 4000;
+pub const BODY_CAP: usize = 4000;
 
 /// The source text of a definition, cut at [`BODY_CAP`] bytes on a char boundary.
 pub(crate) fn cap_body(src: &[u8]) -> String {
@@ -623,5 +697,46 @@ mod tests {
         assert!(cut.chars().all(|c| c == 'x'));
         // Bytes that are not UTF-8 are replaced, never a panic.
         assert!(cap_body(&[0xff, b'a']).ends_with('a'));
+    }
+
+    #[test]
+    fn leading_lines_are_the_comments_and_attributes_right_above() {
+        let start = |path: &str, text: &str, line: usize| {
+            let lines: Vec<&str> = text.lines().collect();
+            leading_start(path, &lines, line)
+        };
+        let rust = "use x;\n\n/// Doc.\n///\n#[inline]\n#[cfg_attr(\n    test,\n    derive(Debug)\n)]\npub fn f() {}\n";
+        assert_eq!(start("a.rs", rust, 9), 2, "doc, attribute, attribute over lines");
+        // A blank line or code ends them.
+        assert_eq!(start("a.rs", "/// Old.\n\nfn f() {}\n", 2), 2);
+        assert_eq!(start("a.rs", "let v = [1];\nfn f() {}\n", 1), 1);
+        assert_eq!(start("a.rs", "}\n// Note.\nfn f() {}\n", 2), 1);
+        // The language's own comment token: `#` in Python, never in C.
+        assert_eq!(start("a.py", "x = 1\n# Why.\n@app.get(\"/\")\ndef f():\n", 3), 1);
+        assert_eq!(start("a.c", "#include <x.h>\nint f() {}\n", 1), 1);
+        assert_eq!(start("a.c", "/**\n * Doc.\n */\nint f() {}\n", 3), 0);
+        // At the top of a file, past its end, and in a file that is not indexed.
+        assert_eq!(start("a.rs", "fn f() {}\n", 0), 0);
+        assert_eq!(start("a.rs", "// a\n", 9), 0);
+        assert_eq!(start("a.unknown", "// a\nf\n", 1), 1);
+        // A long comment: only the lines nearest the definition.
+        let long = format!("{}fn f() {{}}\n", "// x\n".repeat(100));
+        assert_eq!(start("a.rs", &long, 100), 100 - MAX_LEADING_LINES);
+        // The end of the block above (indented deeper) is not this one's doc.
+        assert_eq!(start("a.py", "def g():\n    y = 1\n    # end of g\ndef f():\n", 3), 3);
+        assert_eq!(start("a.py", "def g():\n    return (a\n        * b)\ndef f():\n", 3), 3);
+        assert_eq!(
+            start(
+                "a.rs",
+                "impl A {\n    fn g() {\n        // x\n    }\n    /// F.\n    fn f() {}\n",
+                5
+            ),
+            4
+        );
+        // Where `#` is a comment, `#[` opens no attribute: the list stays out.
+        assert_eq!(start("a.py", "#[x]\nL = [\n    1,\n]\ndef f():\n", 4), 4);
+        // A document has no leading lines: they end the section before.
+        assert_eq!(start("a.md", "## A\n* item\n## B\n", 2), 2);
+        assert_eq!(start("a.yaml", "a: 1\n# about b\nb: 2\n", 2), 2);
     }
 }

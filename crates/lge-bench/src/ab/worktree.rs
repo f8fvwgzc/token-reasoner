@@ -1,5 +1,5 @@
-//! A fresh copy of the repository at HEAD for one session: a detached git
-//! worktree, removed again when the copy is dropped (also on error or panic).
+//! A fresh copy of the repository at one commit for one session: a detached
+//! git worktree, removed again when the copy is dropped (also on error or panic).
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -27,14 +27,49 @@ fn git(repo: &Path, args: &[&OsStr]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The commit HEAD points to; an error when `repo` is not in a git
-/// repository or has no commit yet.
-pub fn head(repo: &Path) -> Result<String> {
-    git(
+/// The full id of the commit `rev` names in the repository that holds
+/// `repo` (`HEAD`, a branch, a tag, a short id); an error when `repo` is not
+/// in a git repository, has no commit yet, or `rev` names no commit.
+pub fn resolve_commit(repo: &Path, rev: &str) -> Result<String> {
+    let rev = rev.trim();
+    if rev.is_empty() || rev.starts_with('-') {
+        bail!("`{rev}` is not a revision");
+    }
+    let spec = format!("{rev}^{{commit}}");
+    let found = git(
         repo,
-        &[OsStr::new("rev-parse"), OsStr::new("--verify"), OsStr::new("HEAD")],
-    )
-    .with_context(|| format!("{} has no commit to copy (is it a git repository?)", repo.display()))
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new(&spec),
+        ],
+    );
+    let what = if rev == "HEAD" {
+        format!("{} has no commit to copy (is it a git repository?)", repo.display())
+    } else {
+        format!("`{rev}` is not a commit in {}", repo.display())
+    };
+    match found {
+        Ok(id) if !id.is_empty() => Ok(id),
+        Ok(_) => bail!(what),
+        Err(e) => Err(e.context(what)),
+    }
+}
+
+/// An error when the folder `prefix` (from [`prefix`]) is not in `commit`:
+/// the sessions would have nowhere to start.
+pub fn has_folder(repo: &Path, commit: &str, prefix: &str) -> Result<()> {
+    let folder = prefix.trim_end_matches('/');
+    if folder.is_empty() {
+        return Ok(());
+    }
+    let spec = format!("{commit}:{folder}");
+    git(repo, &[OsStr::new("cat-file"), OsStr::new("-e"), OsStr::new(&spec)])
+        .map(|_| ())
+        .map_err(|_| {
+            anyhow::anyhow!("the folder {folder} is not in commit {commit}, so the sessions could not start in it")
+        })
 }
 
 /// Where `repo` sits inside its git repository (`""` at the top, `sub/dir/`
@@ -57,9 +92,9 @@ pub struct Worktree {
 }
 
 impl Worktree {
-    /// Check out HEAD of `repo` into `path`, a folder that must not hold
+    /// Check out `commit` of `repo` into `path`, a folder that must not hold
     /// anything else: what is left there from an earlier run is removed first.
-    pub fn add(repo: &Path, path: &Path) -> Result<Worktree> {
+    pub fn add(repo: &Path, path: &Path, commit: &str) -> Result<Worktree> {
         if path.exists() {
             remove(repo, path);
         }
@@ -70,7 +105,7 @@ impl Worktree {
                 OsStr::new("add"),
                 OsStr::new("--detach"),
                 path.as_os_str(),
-                OsStr::new("HEAD"),
+                OsStr::new(commit),
             ],
         );
         if let Err(e) = added {

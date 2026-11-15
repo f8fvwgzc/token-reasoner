@@ -14,6 +14,7 @@ use lge_core::{fact, method, EdgeRec, Hit, NodeLabel, NodeRec};
 use lge_store::GraphStore;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -86,20 +87,66 @@ pub(crate) fn provenance(how: &str, confidence: f64) -> String {
     }
 }
 
-/// One line for a symbol: where it is, what it is, and its signature.
+/// One line for a symbol: where it is, what it is, and its signature and
+/// the first line of its doc when `full`.
 pub(crate) fn symbol_line(n: &NodeRec, full: bool) -> String {
-    let mut line = format!("{}  {} {}", location(n), n.kind, n.qualified_name);
-    if full {
-        if !n.signature.is_empty() && n.signature != n.name {
-            line.push_str("  ");
-            line.push_str(&n.signature);
-        }
-        if !n.doc.is_empty() {
-            line.push_str("  -- ");
-            line.push_str(&n.doc);
-        }
+    let mut line = symbol_head(n, full);
+    if full && !n.doc.is_empty() {
+        line.push_str("  -- ");
+        line.push_str(&n.doc);
     }
     line
+}
+
+/// [`symbol_line`] without the doc.
+fn symbol_head(n: &NodeRec, full: bool) -> String {
+    let mut line = format!("{}  {} {}", location(n), n.kind, n.qualified_name);
+    if full && !n.signature.is_empty() && n.signature != n.name {
+        line.push_str("  ");
+        line.push_str(&n.signature);
+    }
+    line
+}
+
+/// The source of a symbol exactly as its file has it: the doc comments and
+/// attributes right above it, then its own lines (at most
+/// [`lge_index::BODY_CAP`] bytes of them, as much as the index keeps of a
+/// body). `None` when the file on disk is not the one that was indexed
+/// (changed, deleted, unreadable) or its lines do not hold the symbol's
+/// range: the stored body stands in then.
+fn exact_source(store: &dyn GraphStore, root: Option<&Path>, n: &NodeRec) -> Option<String> {
+    let root = root?;
+    if n.file_path.is_empty() || n.start_line < 1 || n.end_line < n.start_line {
+        return None;
+    }
+    let indexed = store.file_info(&n.file_path).ok()??;
+    let bytes = std::fs::read(root.join(&n.file_path)).ok()?;
+    if lge_core::content_hash(&bytes) != indexed.content_hash {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let (start, end) = (n.start_line as usize - 1, n.end_line as usize);
+    if end > lines.len() {
+        return None;
+    }
+    let first = lge_index::leading_start(&n.file_path, &lines, start);
+    let mut out = String::new();
+    for line in &lines[first..start] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let mut used = 0usize;
+    for (i, line) in lines[start..end].iter().enumerate() {
+        if i > 0 && used + line.len() > lge_index::BODY_CAP {
+            out.push_str("    ... (cut)\n");
+            break;
+        }
+        used += line.len() + 1;
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// One line for an endpoint, table or queue.
@@ -166,7 +213,8 @@ fn pick<'a>(
 
 /// Build the evidence pack for a task.
 pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> Result<EvidencePack> {
-    let commit = store.repository()?.map(|(_, c)| c).unwrap_or_default();
+    let (root, commit) = store.repository()?.unwrap_or_default();
+    let root = (!root.is_empty()).then(|| PathBuf::from(root));
     let seed_opts = SeedOptions {
         max_seeds: opts.max_seeds,
         service: opts.service.clone(),
@@ -304,16 +352,29 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
         let Some(node) = seed_nodes.get(&seed.hit.id) else {
             continue;
         };
-        emit_forced(&mut text, &mut budget, &symbol_line(node, true));
+        // The line is never cut; its doc comes after the notes and the
+        // source, and only when the source is not shown (it has the doc as
+        // written, which is what an edit has to match).
+        let head = symbol_head(node, true);
+        let head_cost = count(&head) + 1;
+        budget.force(head_cost);
         shown += 1;
+        let mut notes = String::new();
         for why in rationale.get(&node.id).into_iter().flatten().take(3) {
             let line = format!("  note: {why}");
             if budget.take(count(&line) + 1) {
-                text.push_str(&line);
-                text.push('\n');
+                notes.push_str(&line);
+                notes.push('\n');
             }
         }
-        let body = store.symbol_body(&node.id)?.unwrap_or_default();
+        // Only a symbol whose source the pack shows gets it from the file: a
+        // module has no stored body, and its whole file is not its source.
+        let stored = store.symbol_body(&node.id)?.unwrap_or_default();
+        let body = match stored.trim().is_empty() {
+            true => stored,
+            false => exact_source(store, root.as_deref(), node).unwrap_or(stored),
+        };
+        let mut block = String::new();
         if !body.trim().is_empty() {
             let (cut, tokens) = truncate_lines(
                 body.trim_end(),
@@ -321,11 +382,18 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
             );
             // A body cut down to its marker tells nothing.
             if cut.lines().count() > 1 && budget.take(tokens + 8) {
-                text.push_str("```\n");
-                text.push_str(&cut);
-                text.push_str("\n```\n");
+                block = format!("```\n{cut}\n```\n");
             }
         }
+        let with_doc = symbol_line(node, true);
+        if block.is_empty() && with_doc != head && budget.take((count(&with_doc) + 1).saturating_sub(head_cost)) {
+            text.push_str(&with_doc);
+        } else {
+            text.push_str(&head);
+        }
+        text.push('\n');
+        text.push_str(&notes);
+        text.push_str(&block);
     }
 
     let mut section = |text: &mut String, budget: &mut Budget, title: &str, lines: Vec<String>, count_symbols: bool| {

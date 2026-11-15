@@ -1,11 +1,12 @@
 //! A/B runner: the same tasks with the proxy's features off and on.
 //!
-//! For each task, run and arm: a fresh copy of the repository at HEAD (a
-//! detached git worktree), the daemon switched to the arm's settings through
-//! its page API, one agent session in the copy through a [`SessionRunner`]
-//! (Codex by default), the token usage read from its event stream, and the
-//! task's check command run in the copy. The daemon's own settings are put
-//! back at the end, also after an error, a panic or Ctrl-C.
+//! For each task, run and arm: a fresh copy of the repository at the base
+//! commit (a detached git worktree; HEAD, resolved once when the run starts,
+//! unless another revision is given), the daemon switched to the arm's
+//! settings through its page API, one agent session in the copy through a
+//! [`SessionRunner`] (Codex by default), the token usage read from its event
+//! stream, and the task's check command run in the copy. The daemon's own
+//! settings are put back at the end, also after an error, a panic or Ctrl-C.
 //!
 //! The two arms of a task alternate which goes first (off, on / on, off) so
 //! that whatever the first session warms (the provider's prompt cache, the
@@ -20,10 +21,10 @@ pub use daemon::{DaemonApi, HttpDaemon};
 pub use report::{
     median, render, summarize, verdict, AbReport, ArmSummary, Tally, TaskSummary, Verdict, TARGET_CHANGE,
 };
-pub use worktree::Worktree;
+pub use worktree::{resolve_commit, Worktree};
 
 use anyhow::{anyhow, bail, Context, Result};
-use lge_session::{SessionRequest, SessionRunner};
+use lge_session::{use_approve_for_me, SessionRequest, SessionRunner, WORKSPACE_WRITE};
 use lge_usage::{parse_codex_jsonl, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,12 +52,28 @@ pub struct AbTask {
 #[serde(deny_unknown_fields)]
 struct AbFile {
     #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
     task: Vec<AbTask>,
 }
 
+/// An A/B file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskFile {
+    pub tasks: Vec<AbTask>,
+    /// The top-level `note`: replaces [`DEFAULT_NOTE`]; `Some("")` turns it off.
+    pub note: Option<String>,
+}
+
+/// Appended to every task's prompt unless the task file or `--no-note` says
+/// otherwise: a session that installs dependencies or runs the whole test
+/// suite in the sandbox stalls, and the check runs after it anyway.
+pub const DEFAULT_NOTE: &str = "Do not install, download or sync dependencies and do not run long test suites: \
+the task's check runs after you finish.";
+
 /// Parse an A/B file. Every task needs a name, a prompt and a check, and the
 /// names must be unique.
-pub fn parse_tasks(text: &str) -> Result<Vec<AbTask>> {
+pub fn parse_task_file(text: &str) -> Result<TaskFile> {
     let file: AbFile = toml::from_str(text)?;
     if file.task.is_empty() {
         bail!("no [[task]] in the file");
@@ -72,12 +89,42 @@ pub fn parse_tasks(text: &str) -> Result<Vec<AbTask>> {
             bail!("two tasks are named `{}`", t.name);
         }
     }
-    Ok(file.task)
+    Ok(TaskFile {
+        tasks: file.task,
+        note: file.note,
+    })
 }
 
-pub fn load_tasks(path: &Path) -> Result<Vec<AbTask>> {
+/// The tasks of an A/B file (see [`parse_task_file`]).
+pub fn parse_tasks(text: &str) -> Result<Vec<AbTask>> {
+    Ok(parse_task_file(text)?.tasks)
+}
+
+pub fn load_task_file(path: &Path) -> Result<TaskFile> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    parse_tasks(&text).with_context(|| format!("{} is not a valid A/B task file", path.display()))
+    parse_task_file(&text).with_context(|| format!("{} is not a valid A/B task file", path.display()))
+}
+
+/// The note appended to every prompt: none with `--no-note` (`disabled`) or
+/// an empty `note` in the task file, the file's note when it has one, else
+/// [`DEFAULT_NOTE`].
+pub fn resolve_note(file_note: Option<&str>, disabled: bool) -> Option<String> {
+    if disabled {
+        return None;
+    }
+    match file_note {
+        Some(n) if n.trim().is_empty() => None,
+        Some(n) => Some(n.trim().to_string()),
+        None => Some(DEFAULT_NOTE.to_string()),
+    }
+}
+
+/// The prompt a session gets: the task's, then the note in a paragraph of its own.
+pub fn prompt_with_note(prompt: &str, note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{}\n\n{n}", prompt.trim_end()),
+        None => prompt.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,10 +190,19 @@ pub struct AbOptions {
     /// Where the copies are made. Created when missing, and removed at the end
     /// when it was created and is empty.
     pub work_dir: PathBuf,
+    /// The revision the copies are made from, resolved to a commit once when
+    /// the run starts.
+    pub base: String,
     /// Model for the sessions; `None` keeps the agent's own.
     pub model: Option<String>,
     /// Sandbox for the sessions; `None` keeps the agent's default.
     pub sandbox: Option<String>,
+    /// With the sandbox `workspace-write`, run the sessions with
+    /// `--approve-for-me` in its place when the agent has it (asked once per
+    /// run): approval requests are reviewed automatically instead of stalling.
+    pub approve_for_me: bool,
+    /// Appended to every prompt; see [`resolve_note`].
+    pub note: Option<String>,
     /// Longest wait for the daemon to index a copy.
     pub index_timeout: Duration,
     /// Pause between two looks at the daemon's indexing state.
@@ -158,9 +214,12 @@ impl AbOptions {
         AbOptions {
             runs: 1,
             work_dir,
+            base: "HEAD".to_string(),
             model: None,
             // `codex exec` is read-only by default; the tasks edit files.
-            sandbox: Some("workspace-write".to_string()),
+            sandbox: Some(WORKSPACE_WRITE.to_string()),
+            approve_for_me: true,
+            note: Some(DEFAULT_NOTE.to_string()),
             index_timeout: Duration::from_secs(20 * 60),
             poll: Duration::from_millis(250),
         }
@@ -293,8 +352,8 @@ impl Drop for Registered<'_> {
 }
 
 /// Run every task in both arms and report. `repo` is the repository (or a
-/// folder inside one) whose HEAD is copied; the sessions start in the same
-/// folder of each copy.
+/// folder inside one) whose commit `opts.base` is copied; the sessions start
+/// in the same folder of each copy.
 pub fn run_ab(repo: &Path, tasks: &[AbTask], opts: &AbOptions, env: &AbEnv) -> Result<AbReport> {
     if tasks.is_empty() {
         bail!("no task to run");
@@ -302,8 +361,10 @@ pub fn run_ab(repo: &Path, tasks: &[AbTask], opts: &AbOptions, env: &AbEnv) -> R
     let repo = repo
         .canonicalize()
         .with_context(|| format!("cannot open {}", repo.display()))?;
-    worktree::head(&repo)?;
+    // Once: a branch that moves during the run does not change the copies.
+    let base = resolve_commit(&repo, &opts.base)?;
     let prefix = worktree::prefix(&repo)?;
+    worktree::has_folder(&repo, &base, &prefix)?;
     let status = env.daemon.status().context("cannot read the daemon's status")?;
     let original = status
         .get("settings")
@@ -324,6 +385,18 @@ pub fn run_ab(repo: &Path, tasks: &[AbTask], opts: &AbOptions, env: &AbEnv) -> R
         return Err(e);
     }
 
+    let approve_for_me = use_approve_for_me(opts.approve_for_me, opts.sandbox.as_deref(), env.runner);
+    (env.log)(&format!("copies of commit {base}"));
+    if approve_for_me {
+        (env.log)(&format!(
+            "sessions run with --approve-for-me in place of -s {WORKSPACE_WRITE}: approval requests are reviewed automatically"
+        ));
+    } else if opts.approve_for_me && opts.sandbox.as_deref() == Some(WORKSPACE_WRITE) {
+        (env.log)(&format!(
+            "{} has no --approve-for-me: sessions run with -s {WORKSPACE_WRITE}",
+            env.runner.name()
+        ));
+    }
     let restore = Restore {
         daemon: env.daemon,
         original: original.clone(),
@@ -331,9 +404,11 @@ pub fn run_ab(repo: &Path, tasks: &[AbTask], opts: &AbOptions, env: &AbEnv) -> R
     };
     let plan = Plan {
         repo: &repo,
+        base: &base,
         prefix: &prefix,
         work_dir: &work_dir,
         original: &original,
+        approve_for_me,
     };
     let outcome = run_pairs(&plan, tasks, opts, env);
     let restored = restore.finish();
@@ -376,6 +451,9 @@ pub fn run_ab(repo: &Path, tasks: &[AbTask], opts: &AbOptions, env: &AbEnv) -> R
     let mut report = summarize(&names, runs);
     report.interrupted = interrupted;
     report.settings_restored = restored.is_ok();
+    report.base = base;
+    report.approve_for_me = approve_for_me;
+    report.note = opts.note.clone().filter(|n| !n.trim().is_empty());
     Ok(report)
 }
 
@@ -412,10 +490,14 @@ fn outside_repository(top: &Path, work_dir: &Path) -> Result<()> {
 /// What every arm of the run shares.
 struct Plan<'a> {
     repo: &'a Path,
+    /// The commit every copy is made from.
+    base: &'a str,
     /// Where `repo` sits in its git repository, to find it in a copy.
     prefix: &'a str,
     work_dir: &'a Path,
     original: &'a Value,
+    /// Sessions run with `--approve-for-me` in place of the sandbox.
+    approve_for_me: bool,
 }
 
 /// Every pair, in order; stops early when a stop is asked for. An error that
@@ -494,7 +576,7 @@ fn run_arm(
     env: &AbEnv,
     out: &mut ArmRun,
 ) -> Result<()> {
-    let copy = Worktree::add(plan.repo, dir)?;
+    let copy = Worktree::add(plan.repo, dir, plan.base)?;
     let cwd = match plan.prefix.trim_end_matches('/') {
         "" => copy.path().to_path_buf(),
         inner => copy.path().join(inner),
@@ -517,11 +599,16 @@ fn run_arm(
     let before = env.daemon.status().ok();
     let started = Instant::now();
     let session = env.runner.run(&SessionRequest {
-        prompt: task.prompt.clone(),
+        prompt: prompt_with_note(&task.prompt, opts.note.as_deref()),
         cwd: cwd.clone(),
         model: opts.model.clone(),
         effort: None,
-        sandbox: opts.sandbox.clone(),
+        sandbox: if plan.approve_for_me {
+            None
+        } else {
+            opts.sandbox.clone()
+        },
+        approve_for_me: plan.approve_for_me,
     });
     out.seconds = started.elapsed().as_secs_f64();
     let session = session.with_context(|| format!("the {} session could not run", env.runner.name()))?;

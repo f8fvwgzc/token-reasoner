@@ -3,13 +3,13 @@
 
 use anyhow::{bail, Result};
 use lge_bench::ab::{
-    median, parse_tasks, render, run_ab, summarize, verdict, AbEnv, AbOptions, AbTask, Arm, ArmRun, DaemonApi,
-    HttpDaemon, Tally,
+    median, parse_task_file, parse_tasks, prompt_with_note, render, resolve_commit, resolve_note, run_ab, summarize,
+    verdict, AbEnv, AbOptions, AbTask, Arm, ArmRun, DaemonApi, HttpDaemon, Tally, DEFAULT_NOTE,
 };
 use lge_session::{SessionRequest, SessionResult, SessionRunner};
 use lge_usage::TokenUsage;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -100,7 +100,9 @@ impl DaemonApi for FakeDaemon {
 /// What the agent saw when its session started.
 #[derive(Debug, Clone)]
 struct Seen {
+    /// The first line of the prompt: the task's own prompt.
     task: String,
+    prompt: String,
     cwd: PathBuf,
     arm: Arm,
     settings: Value,
@@ -108,6 +110,9 @@ struct Seen {
     registered: bool,
     setup_ran: bool,
     sandbox: Option<String>,
+    approve_for_me: bool,
+    /// `moved.txt` in the copy: what a session committed to the repository.
+    moved: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -126,6 +131,12 @@ struct FakeAgent<'a> {
     daemon: &'a FakeDaemon,
     seen: RefCell<Vec<Seen>>,
     mode: Mode,
+    /// What it answers when asked whether it has `--approve-for-me`.
+    approve_for_me: bool,
+    /// Times it was asked.
+    approve_asked: Cell<usize>,
+    /// Each session commits a new file to this repository: the branch moves during the run.
+    move_branch: Option<PathBuf>,
 }
 
 impl<'a> FakeAgent<'a> {
@@ -134,6 +145,9 @@ impl<'a> FakeAgent<'a> {
             daemon,
             seen: RefCell::new(Vec::new()),
             mode: Mode::Normal,
+            approve_for_me: false,
+            approve_asked: Cell::new(0),
+            move_branch: None,
         }
     }
 
@@ -155,6 +169,11 @@ impl SessionRunner for FakeAgent<'_> {
         "fake"
     }
 
+    fn approve_for_me_available(&self) -> bool {
+        self.approve_asked.set(self.approve_asked.get() + 1);
+        self.approve_for_me
+    }
+
     fn run(&self, request: &SessionRequest) -> Result<SessionResult> {
         let settings = self.daemon.state().settings.clone();
         let arm = if settings["inject_context"] == true {
@@ -170,14 +189,23 @@ impl SessionRunner for FakeAgent<'_> {
         assert!(cwd.join("README.md").is_file(), "the copy holds HEAD");
         let registered = self.daemon.state().repos.iter().any(|r| Path::new(r) == cwd);
         self.seen.borrow_mut().push(Seen {
-            task: request.prompt.clone(),
+            task: request.prompt.lines().next().unwrap_or_default().to_string(),
+            prompt: request.prompt.clone(),
             cwd: cwd.clone(),
             arm,
             settings,
             registered,
             setup_ran: cwd.join("setup.txt").exists(),
             sandbox: request.sandbox.clone(),
+            approve_for_me: request.approve_for_me,
+            moved: std::fs::read_to_string(cwd.join("moved.txt")).ok(),
         });
+        if let Some(repo) = &self.move_branch {
+            let n = self.seen.borrow().len();
+            std::fs::write(repo.join("moved.txt"), format!("{n}\n")).unwrap();
+            git(repo, &["add", "moved.txt"]);
+            git(repo, &["commit", "-q", "-m", &format!("move {n}")]);
+        }
         match self.mode {
             Mode::Fail => bail!("the agent crashed"),
             Mode::FailIn(a) if a == arm => bail!("the agent crashed"),
@@ -313,7 +341,14 @@ fn arms_alternate_and_each_session_sees_its_arm() {
         assert_eq!(s.registered, on, "{s:?}");
         assert!(s.setup_ran, "setup runs before the session");
         assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+        assert!(!s.approve_for_me, "this agent has no --approve-for-me");
+        assert_eq!(
+            s.prompt,
+            format!("{}\n\n{DEFAULT_NOTE}", s.task),
+            "the note ends every prompt"
+        );
     }
+    assert_eq!(agent.approve_asked.get(), 1, "asked once per run");
     assert_eq!(daemon.state().settings, original_settings(), "settings are back");
 
     assert_eq!(report.runs.len(), 6);
@@ -1047,12 +1082,15 @@ fn the_json_report_has_the_same_keys_for_every_session() {
     assert_eq!(
         keys(&value),
         [
+            "approve_for_me",
+            "base",
             "compared",
             "errored",
             "interrupted",
             "mean_change",
             "median_change",
             "not_proxied",
+            "note",
             "runs",
             "settings_restored",
             "success_off",
@@ -1184,4 +1222,271 @@ fn a_copy_that_cannot_be_removed_is_named() {
     }
     assert!(said.contains("2 copy folder(s) could not be removed"), "{said}");
     assert!(said.contains("git worktree prune"), "{said}");
+}
+
+// ---- base commit, prompt note, approvals ----------------------------------------
+
+/// The repository of [`repository`] with a second commit; returns the first commit.
+fn second_commit(repo: &Path) -> String {
+    let first = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("sub/new.txt"), "new\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "second"]);
+    first
+}
+
+#[test]
+fn copies_are_made_from_the_base_commit_resolved_once() {
+    let (_dir, repo, work) = repository();
+    let first = second_commit(&repo);
+    let head = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let daemon = FakeDaemon::new();
+    let mut agent = FakeAgent::new(&daemon);
+    // Every session moves the branch: later copies must not follow it.
+    agent.move_branch = Some(repo.clone());
+    let mut opts = options(&work);
+    opts.base = "HEAD~1".to_string();
+    let report = run_ab(
+        &repo,
+        &[task("one", "test -f done.txt && test ! -e sub/new.txt")],
+        &opts,
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert_eq!(report.base, first, "the full id of the base");
+    assert!(report.runs.iter().all(|r| r.success), "{report:#?}");
+    assert!(agent.seen().iter().all(|s| s.moved.is_none()), "{:?}", agent.seen());
+    assert!(render(&report).contains(&format!("base commit: {first}\n")));
+
+    // Default: HEAD when the run starts, kept while the branch moves.
+    let agent = {
+        let mut a = FakeAgent::new(&daemon);
+        a.move_branch = Some(repo.clone());
+        a
+    };
+    let start = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(start, head, "the first run moved the branch");
+    let report = run_ab(
+        &repo,
+        &[task("one", "test -f sub/new.txt"), task("two", "true")],
+        &options(&work),
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert_eq!(report.base, start);
+    let seen = agent.seen();
+    assert_eq!(seen.len(), 4);
+    // HEAD at the start holds what the first run's second session committed;
+    // what this run's sessions commit never reaches a later copy.
+    for s in &seen {
+        assert_eq!(s.moved.as_deref(), Some("2\n"), "{s:?}");
+    }
+    assert!(report.runs.iter().all(|r| r.success), "{report:#?}");
+    assert_eq!(worktrees(&repo), 1);
+}
+
+#[test]
+fn a_base_that_is_not_a_commit_stops_before_the_daemon_is_touched() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let mut opts = options(&work);
+    opts.base = "no-such-branch".to_string();
+    let err = run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("`no-such-branch` is not a commit"),
+        "{err:#}"
+    );
+    assert!(daemon.state().sets.is_empty() && agent.seen().is_empty());
+    for bad in ["", "--all"] {
+        assert!(resolve_commit(&repo, bad).is_err(), "{bad:?}");
+    }
+    let head = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(resolve_commit(&repo, &head[..8]).unwrap(), head);
+
+    // A folder of the repository that the base commit does not have.
+    let first = second_commit(&repo);
+    let mut opts = options(&work);
+    opts.base = first;
+    let err = run_ab(
+        &repo.join("sub"),
+        &[task("one", "true")],
+        &opts,
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("the folder sub is not in commit"),
+        "{err:#}"
+    );
+    assert!(daemon.state().sets.is_empty());
+}
+
+#[test]
+fn the_prompt_note_is_the_default_the_files_or_none() {
+    let file = parse_task_file("[[task]]\nname = \"a\"\nprompt = \"p\"\ncheck = \"true\"\n").unwrap();
+    assert_eq!(file.note, None);
+    assert_eq!(resolve_note(file.note.as_deref(), false).as_deref(), Some(DEFAULT_NOTE));
+    assert!(DEFAULT_NOTE.starts_with("Do not install, download or sync dependencies"));
+    assert!(DEFAULT_NOTE.ends_with("the task's check runs after you finish."));
+    let file = parse_task_file(
+        "note = \"Use the vendored packages.\"\n[[task]]\nname = \"a\"\nprompt = \"p\"\ncheck = \"true\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_note(file.note.as_deref(), false).as_deref(),
+        Some("Use the vendored packages.")
+    );
+    assert_eq!(resolve_note(file.note.as_deref(), true), None, "--no-note wins");
+    assert_eq!(resolve_note(Some(""), false), None, "an empty note turns it off");
+    assert_eq!(resolve_note(Some("  "), false), None);
+    assert_eq!(prompt_with_note("do it\n", Some("note")), "do it\n\nnote");
+    assert_eq!(prompt_with_note("do it", None), "do it");
+
+    // The sessions get it, and the report says which.
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let mut opts = options(&work);
+    opts.note = Some("Stay offline.".to_string());
+    let report = run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert!(agent.seen().iter().all(|s| s.prompt == "do one\n\nStay offline."));
+    assert_eq!(report.note.as_deref(), Some("Stay offline."));
+    assert!(render(&report).contains("note appended to every prompt: Stay offline.\n"));
+
+    let agent = FakeAgent::new(&daemon);
+    opts.note = None;
+    let report = run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert!(agent.seen().iter().all(|s| s.prompt == "do one"));
+    assert_eq!(report.note, None);
+    assert!(render(&report).contains("note appended to every prompt: none\n"));
+    let value = serde_json::to_value(&report).unwrap();
+    assert!(value["note"].is_null(), "{value}");
+}
+
+#[test]
+fn sessions_use_approve_for_me_in_place_of_the_sandbox_when_the_agent_has_it() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let mut agent = FakeAgent::new(&daemon);
+    agent.approve_for_me = true;
+    let report = run_ab(
+        &repo,
+        &[task("one", "true"), task("two", "true")],
+        &options(&work),
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert_eq!(agent.approve_asked.get(), 1, "asked once per run, not per session");
+    for s in agent.seen() {
+        assert!(s.approve_for_me, "{s:?}");
+        assert_eq!(s.sandbox, None, "-s is never passed with --approve-for-me");
+    }
+    assert!(report.approve_for_me);
+    assert!(render(&report).contains("sessions ran with --approve-for-me"));
+
+    // --no-approve-for-me: the sandbox as before, and the agent is not asked.
+    let mut agent = FakeAgent::new(&daemon);
+    agent.approve_for_me = true;
+    let mut opts = options(&work);
+    opts.approve_for_me = false;
+    let report = run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert_eq!(agent.approve_asked.get(), 0);
+    for s in agent.seen() {
+        assert!(!s.approve_for_me);
+        assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+    }
+    assert!(!report.approve_for_me);
+    assert!(!render(&report).contains("--approve-for-me"));
+
+    // Another sandbox is not the one the flag selects: kept as asked.
+    let mut agent = FakeAgent::new(&daemon);
+    agent.approve_for_me = true;
+    let mut opts = options(&work);
+    opts.sandbox = Some("danger-full-access".to_string());
+    run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert_eq!(agent.approve_asked.get(), 0);
+    assert!(agent
+        .seen()
+        .iter()
+        .all(|s| !s.approve_for_me && s.sandbox.as_deref() == Some("danger-full-access")));
+}
+
+// ---- adversarial: base, note, approvals -----------------------------------------
+
+#[test]
+fn an_annotated_tag_as_base_resolves_to_its_commit_and_the_copies_hold_it() {
+    let (_dir, repo, work) = repository();
+    let first = second_commit(&repo);
+    git(&repo, &["tag", "-a", "v1", "-m", "release", &first]);
+    let tag_object = git(&repo, &["rev-parse", "v1"]).trim().to_string();
+    assert_ne!(tag_object, first, "an annotated tag is an object of its own");
+    assert_eq!(resolve_commit(&repo, "v1").unwrap(), first);
+    assert_eq!(resolve_commit(&repo, " v1 ").unwrap(), first);
+    // A tree or a blob is not a commit.
+    let err = resolve_commit(&repo, "HEAD:README.md").unwrap_err();
+    assert!(format!("{err:#}").contains("is not a commit"), "{err:#}");
+
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let mut opts = options(&work);
+    opts.base = "v1".to_string();
+    let report = run_ab(
+        &repo,
+        &[task("one", "test ! -e sub/new.txt && test -f README.md")],
+        &opts,
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert_eq!(report.base, first);
+    assert!(report.runs.iter().all(|r| r.success), "{report:#?}");
+    let value = serde_json::to_value(&report).unwrap();
+    assert_eq!(value["base"], first.as_str());
+    // The user's checkout is where it was.
+    assert!(repo.join("sub/new.txt").exists());
+    assert_eq!(worktrees(&repo), 1);
+}
+
+#[test]
+fn the_note_is_appended_once_and_both_arms_get_the_same_prompt() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let mut opts = options(&work);
+    opts.runs = 2;
+    let mut t = task("one", "true");
+    t.prompt = "do one\n\n\n".to_string();
+    run_ab(&repo, &[t], &opts, &env(&daemon, &agent, &never)).unwrap();
+    let seen = agent.seen();
+    assert_eq!(seen.len(), 4);
+    for s in &seen {
+        assert_eq!(s.prompt.matches(DEFAULT_NOTE).count(), 1, "{:?}", s.prompt);
+        assert_eq!(s.prompt, format!("do one\n\n{DEFAULT_NOTE}"));
+    }
+    assert!(seen.iter().any(|s| s.arm == Arm::Off) && seen.iter().any(|s| s.arm == Arm::On));
+}
+
+#[test]
+fn the_log_says_when_the_agent_has_no_approve_for_me() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let lines = RefCell::new(Vec::<String>::new());
+    let log = |m: &str| lines.borrow_mut().push(m.to_string());
+    let env = AbEnv {
+        daemon: &daemon,
+        runner: &agent,
+        stop: &never,
+        log: &log,
+    };
+    let report = run_ab(&repo, &[task("one", "true")], &options(&work), &env).unwrap();
+    assert!(!report.approve_for_me);
+    for s in agent.seen() {
+        assert!(!s.approve_for_me);
+        assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+    }
+    let said = lines.borrow().join("\n");
+    assert!(said.contains("has no --approve-for-me"), "{said}");
+    assert!(said.contains(&format!("copies of commit {}", report.base)), "{said}");
 }

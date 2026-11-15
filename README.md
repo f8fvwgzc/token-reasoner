@@ -110,7 +110,7 @@ scripts/install-macos.sh --connect-codex --autostart
 Or every step yourself:
 
 ```bash
-export OPENSSL_DIR="$(brew --prefix openssl@3)"   # LadybugDB links against OpenSSL
+export OPENSSL_DIR="$(brew --prefix openssl@3)"   # LadybugDB links against OpenSSL 3, not 4
 cargo build --release -p lge-cli         # downloads the prebuilt LadybugDB library
 cp target/release/lge ~/.local/bin/lge   # any folder on your PATH
 lge --db ~/.lge/setup/graph.lbug setup   # full-text search extension, once
@@ -228,10 +228,19 @@ lge ab tasks.toml               # A/B: each task with lge off and on (spends tok
 `lge --help` lists everything.
 
 To measure the saving on your own work, `lge ab tasks.toml` runs each task as one Codex
-session with lge's features off and one with them on, each in a fresh copy of the
-repository, checks the result with the task's own command, and reports tokens, success
-and a verdict against the target: at least 25% lower median total tokens with no drop in
-success. The task file and the details are in [docs/AB.md](docs/AB.md).
+session with lge's features off and one with them on, checks the result with the task's
+own command, and reports tokens, success and a verdict against the target: at least 25%
+lower median total tokens with no drop in success. Every session runs in its own
+temporary git worktree of the base commit (`HEAD`, resolved once at the start, unless
+`--base <rev>` names another), the sessions run one after another, and nothing touches
+your checkout. Each prompt ends with a note not to install dependencies or run long test
+suites (the check runs afterwards; `note` in the task file or `--no-note` changes it), and
+when your Codex has `--approve-for-me` the sessions use it in place of
+`-s workspace-write`, so approval requests do not stall them (`--no-approve-for-me` turns
+that off). On a managed machine: build against OpenSSL 3, not 4
+(`export OPENSSL_DIR="$(brew --prefix openssl@3)"`), quote paths with spaces inside
+`check` commands, and keep checks fast and offline. The task file and the details are in
+[docs/AB.md](docs/AB.md).
 
 ---
 

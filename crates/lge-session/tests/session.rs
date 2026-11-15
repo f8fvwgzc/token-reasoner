@@ -223,3 +223,221 @@ fn failed_checks_retry_one_level_higher_with_only_the_failures() {
     assert!(asked[1].prompt.starts_with(STABLE_PREFIX));
     assert_eq!(store.list_usage(0).unwrap().len(), 2);
 }
+
+// ---- Codex's command line and --approve-for-me -----------------------------------
+
+fn request(sandbox: Option<&str>, approve_for_me: bool) -> SessionRequest {
+    SessionRequest {
+        prompt: "do it".to_string(),
+        cwd: PathBuf::from("/work/copy"),
+        model: Some("gpt-x".to_string()),
+        effort: None,
+        sandbox: sandbox.map(str::to_string),
+        approve_for_me,
+    }
+}
+
+#[test]
+fn approve_for_me_takes_the_place_of_the_sandbox_on_the_command_line() {
+    assert_eq!(
+        codex_args(&request(Some("workspace-write"), false)),
+        [
+            "exec",
+            "--json",
+            "-C",
+            "/work/copy",
+            "-m",
+            "gpt-x",
+            "-s",
+            "workspace-write",
+            "-"
+        ]
+    );
+    let args = codex_args(&request(Some("workspace-write"), true));
+    assert_eq!(
+        args,
+        [
+            "exec",
+            "--json",
+            "-C",
+            "/work/copy",
+            "-m",
+            "gpt-x",
+            "--approve-for-me",
+            "-"
+        ]
+    );
+    // Codex refuses the two together, whatever the request says.
+    let args = codex_args(&request(Some("read-only"), true));
+    assert!(!args.iter().any(|a| a == "-s" || a == "--sandbox"), "{args:?}");
+    assert!(!codex_args(&request(None, false)).iter().any(|a| a == "-s"));
+}
+
+#[test]
+fn the_help_text_says_whether_codex_has_approve_for_me() {
+    let help = "Options:\n  -s, --sandbox <SANDBOX_MODE>\n          Select the sandbox\n\n      --approve-for-me\n          Route approval requests through automatic review using the workspace-write sandbox\n";
+    assert!(help_lists_approve_for_me(help));
+    assert!(!help_lists_approve_for_me(
+        "Options:\n  -s, --sandbox <SANDBOX_MODE>\n      --approve-for-me-later\n"
+    ));
+    assert!(!help_lists_approve_for_me(""));
+}
+
+/// A stand-in `codex` that counts its `exec --help` calls in `calls` and
+/// prints `help`.
+#[cfg(unix)]
+fn fake_codex(dir: &Path, help: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("codex");
+    let calls = dir.join("calls");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = \"exec --help\" ]; then echo x >> '{}'; printf '%s\\n' '{help}'; exit 0; fi\nexit 2\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, calls)
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_is_asked_once_whether_it_has_approve_for_me() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_codex(dir.path(), "      --approve-for-me");
+    let runner = CodexRunner::new(bin.to_string_lossy());
+    assert!(runner.approve_for_me_available());
+    assert!(runner.approve_for_me_available());
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1, "cached");
+
+    // Only with the sandbox the flag selects, and only when wanted.
+    assert!(use_approve_for_me(true, Some("workspace-write"), &runner));
+    assert!(!use_approve_for_me(false, Some("workspace-write"), &runner));
+    assert!(!use_approve_for_me(true, Some("danger-full-access"), &runner));
+    assert!(!use_approve_for_me(true, None, &runner));
+    let cfg = SessionConfig {
+        sandbox: "workspace-write".to_string(),
+        ..SessionConfig::default()
+    };
+    assert_eq!(cfg.sandbox_for(&runner), (None, true));
+    let off = SessionConfig {
+        approve_for_me: false,
+        ..cfg.clone()
+    };
+    assert_eq!(off.sandbox_for(&runner), (Some("workspace-write".to_string()), false));
+
+    // An older Codex, and one that is not there.
+    let old = tempfile::tempdir().unwrap();
+    let (bin, _) = fake_codex(old.path(), "  -s, --sandbox <SANDBOX_MODE>");
+    let runner = CodexRunner::new(bin.to_string_lossy());
+    assert!(!runner.approve_for_me_available());
+    assert_eq!(cfg.sandbox_for(&runner), (Some("workspace-write".to_string()), false));
+    assert!(!CodexRunner::new(old.path().join("missing").to_string_lossy()).approve_for_me_available());
+}
+
+/// [`Fake`] that has `--approve-for-me`.
+struct Approving(Fake);
+
+impl SessionRunner for Approving {
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    fn run(&self, request: &SessionRequest) -> anyhow::Result<SessionResult> {
+        self.0.run(request)
+    }
+
+    fn approve_for_me_available(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn lge_run_uses_approve_for_me_with_the_workspace_write_sandbox() {
+    let (_dir, root, store) = repo("true");
+    let fake = Approving(Fake {
+        asked: Mutex::new(Vec::new()),
+    });
+    let cfg = SessionConfig {
+        sandbox: "workspace-write".to_string(),
+        ..SessionConfig::default()
+    };
+    run_task(
+        &store,
+        &root,
+        "create_order must validate the payload",
+        &cfg,
+        &IndexOptions::default(),
+        &fake,
+    )
+    .unwrap();
+    let asked = fake.0.asked.lock().unwrap();
+    assert!(asked[0].approve_for_me && asked[0].sandbox.is_none(), "{:?}", asked[0]);
+    drop(asked);
+
+    // The default sandbox ("": Codex's own) is left alone.
+    let fake = Approving(Fake {
+        asked: Mutex::new(Vec::new()),
+    });
+    run_task(
+        &store,
+        &root,
+        "create_order must validate the payload",
+        &SessionConfig::default(),
+        &IndexOptions::default(),
+        &fake,
+    )
+    .unwrap();
+    let asked = fake.0.asked.lock().unwrap();
+    assert!(!asked[0].approve_for_me && asked[0].sandbox.is_none(), "{:?}", asked[0]);
+}
+
+/// A stand-in `codex` whose `exec --help` runs `body` (shell).
+#[cfg(unix)]
+fn codex_script(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("codex");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\nif [ \"$1 $2\" = \"exec --help\" ]; then\n{body}\nfi\nexit 2\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[test]
+fn a_codex_that_hangs_or_fails_on_help_has_no_approve_for_me() {
+    let dir = tempfile::tempdir().unwrap();
+    // Hangs: killed after the timeout, and the answer is no.
+    let bin = codex_script(dir.path(), "exec sleep 30");
+    let started = std::time::Instant::now();
+    assert!(!codex_has_approve_for_me(
+        &bin.to_string_lossy(),
+        std::time::Duration::from_millis(500)
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // Lists the flag but fails: no.
+    let bin = codex_script(dir.path(), "echo '      --approve-for-me'; exit 1");
+    assert!(!codex_has_approve_for_me(&bin.to_string_lossy(), HELP_TIMEOUT));
+    // Lists it on standard error and succeeds: yes.
+    let bin = codex_script(dir.path(), "echo '      --approve-for-me' >&2; exit 0");
+    assert!(codex_has_approve_for_me(&bin.to_string_lossy(), HELP_TIMEOUT));
+    // A help text larger than a pipe's buffer does not block.
+    let bin = codex_script(
+        dir.path(),
+        "i=0; while [ $i -lt 4000 ]; do echo '  --some-option  with a long description line'; i=$((i+1)); done; echo '      --approve-for-me'; exit 0",
+    );
+    assert!(codex_has_approve_for_me(&bin.to_string_lossy(), HELP_TIMEOUT));
+    // Only the option itself counts.
+    let bin = codex_script(dir.path(), "echo '      --no-approve-for-me'; exit 0");
+    assert!(!codex_has_approve_for_me(&bin.to_string_lossy(), HELP_TIMEOUT));
+}

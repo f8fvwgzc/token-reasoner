@@ -51,13 +51,18 @@ fn a_named_symbol_is_the_seed_and_the_pack_follows_it_across_services() {
         text.starts_with("# Context for: create_order must validate the payload\n"),
         "{text}"
     );
+    // The seed's source as the file has it; its one-line doc is not repeated
+    // over it. A neighbour keeps its one line with the doc.
     assert!(
-        text.contains("## Start here\norders_api/routes.py:10-15  function orders_api.routes.create_order"),
+        text.contains(
+            "## Start here\norders_api/routes.py:10-15  function orders_api.routes.create_order  def create_order(payload: dict)\n```\n@router.post(\"\")\ndef create_order(payload: dict):\n    \"\"\"Create an order and announce it.\"\"\"\n"
+        ),
         "{text}"
     );
+    assert!(!text.contains("-- Create an order and announce it."), "{text}");
     assert!(
-        text.contains("def create_order(payload: dict):"),
-        "the seed body is shown\n{text}"
+        text.contains("def insert_order(customer_id, total)  -- Store a new order and return its id.\n"),
+        "{text}"
     );
     // The conclusions come first, worked out by the graph.
     assert!(
