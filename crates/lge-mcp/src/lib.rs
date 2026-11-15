@@ -39,7 +39,7 @@ Read raw files only for lines these tools located. Edges marked inferred or unre
 const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_BUDGET: usize = 20_000;
 /// Default for [`Server::fresh_for`].
-const FRESH_FOR: Duration = Duration::from_secs(2);
+const FRESH_FOR: Duration = Duration::from_millis(250);
 
 pub struct ToolDef {
     pub name: &'static str,
