@@ -551,7 +551,11 @@ impl Daemon {
 
         // Rewrite a Responses request; anything else, and any failure, passes as it came.
         let mut conv = None;
-        if method == "POST" && path.trim_end_matches('/').ends_with("/responses") {
+        // One line per model request in the log, without any content: what came
+        // in, what was done with it, and whether the usage was read.
+        let mut note = String::new();
+        let is_responses = method == "POST" && path.trim_end_matches('/').ends_with("/responses");
+        if is_responses {
             let encoding = headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
@@ -571,6 +575,7 @@ impl Daemon {
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("thread-id"))
                 .map(|(_, v)| v.clone());
+            let plain_ok = plain.is_some();
             let rewritten = plain.and_then(|plain| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     daemon.rewrite(&plain, thread.as_deref())
@@ -578,7 +583,18 @@ impl Daemon {
                 .ok()
                 .flatten()
             });
+            note = format!(
+                "{} {}B {}",
+                encoding.as_deref().unwrap_or("plain"),
+                body.len(),
+                match (&plain_ok, &rewritten) {
+                    (false, _) => "not decoded: forwarded as is",
+                    (true, None) => "not a request lge reads: forwarded as is",
+                    (true, Some(_)) => "read",
+                }
+            );
             if let Some((new_body, c)) = rewritten {
+                note.push_str(&format!(" -> {}B", new_body.len()));
                 body = new_body;
                 headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
                 conv = Some(c);
@@ -634,13 +650,20 @@ impl Daemon {
             status.canonical_reason().unwrap_or("")
         );
         let mut event_stream = false;
+        let (mut kind, mut response_encoding) = (String::new(), String::new());
         for (name, value) in response.headers() {
             if hop_by_hop(name.as_str()) {
                 continue;
             }
             let Ok(value) = value.to_str() else { continue };
-            if name.as_str().eq_ignore_ascii_case("content-type") && value.contains("text/event-stream") {
-                event_stream = true;
+            if name.as_str().eq_ignore_ascii_case("content-type") {
+                kind = value.to_string();
+                if value.contains("text/event-stream") {
+                    event_stream = true;
+                }
+            }
+            if name.as_str().eq_ignore_ascii_case("content-encoding") {
+                response_encoding = value.to_string();
             }
             head.push_str(&format!("{}: {value}\r\n", name.as_str()));
         }
@@ -657,9 +680,10 @@ impl Daemon {
                 if n == 0 {
                     break;
                 }
-                if event_stream {
-                    scanner.feed(&buf[..n]);
-                } else if whole.len() < 8 * 1024 * 1024 {
+                // Read the usage whatever the content type says: some backends
+                // stream events without naming them as such.
+                scanner.feed(&buf[..n]);
+                if !event_stream && whole.len() < 8 * 1024 * 1024 {
                     whole.extend_from_slice(&buf[..n]);
                 }
                 write!(writer, "{n:x}\r\n")?;
@@ -675,6 +699,20 @@ impl Daemon {
             let v: Value = serde_json::from_slice(&whole).ok()?;
             crate::responses::usage_of_event(&json!({ "type": "response.completed", "response": v }).to_string())
         });
+        if is_responses {
+            eprintln!(
+                "lge: {method} {path} {} | {note} | {} | usage {}",
+                status.as_u16(),
+                format!("{kind} {response_encoding}").trim(),
+                match usage {
+                    Some(u) => format!(
+                        "in {} (cached {}) out {} (reasoning {})",
+                        u.input_tokens, u.cached_input_tokens, u.output_tokens, u.reasoning_tokens
+                    ),
+                    None => "not found".to_string(),
+                }
+            );
+        }
         // Recorded before the last chunk goes out, so a client that asks for
         // the numbers right after the answer ends sees them.
         if let (Some(conv), Some(usage)) = (conv, usage) {
