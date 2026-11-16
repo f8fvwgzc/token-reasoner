@@ -28,6 +28,10 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
+//! The proxy reads tool outputs through [`filter_for_proxy`], which also says whether
+//! the tool's closing line ended the output, and cleans terminal noise with
+//! [`normalize_terminal`] and [`collapse_repeats`].
+//!
 //! The crate is standalone: no database, no other `lge` crate. It needs `sh` and, for
 //! the diff hunks, `git`; process groups and `/dev/null` make it Unix-only in practice.
 
@@ -41,13 +45,16 @@ mod diff;
 mod format;
 mod parse;
 mod render;
+mod repeat;
 mod run;
 
+pub use ansi::{normalize_terminal, strip_ansi};
 pub use config::load_config;
 pub use detect::detect_checks;
 pub use diff::relevant_diff_hunks;
-pub use parse::{filter_output, filter_with, tool_of, FilterOptions};
+pub use parse::{filter_for_proxy, filter_output, filter_with, tool_of, FilterOptions, ProxyFiltered};
 pub use render::render;
+pub use repeat::collapse_repeats;
 pub use run::{run_all, run_check};
 
 /// Cap on the filtered text of one check. Excerpts and then messages are shortened to

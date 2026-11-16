@@ -52,7 +52,13 @@ mod prices;
 mod record;
 mod report;
 
-pub use codex::{codex_home, find_rollout, parse_codex_jsonl, parse_rollout_file, ParsedSession, TokenUsage};
+pub use codex::{
+    codex_home, find_rollout, parse_codex_jsonl, parse_rollout_file, rollout_cwd, rollout_files, rollout_items,
+    rollout_requests, ParsedSession, RolloutItem, TokenUsage,
+};
 pub use prices::{load_prices, Prices, CONFIG_FILE};
 pub use record::{apply_session, new_record, task_id};
-pub use report::{render_report, report, LevelStats, Report};
+pub use report::{
+    bootstrap_interval, bootstrap_median_diff, compare_arms, render_report, report, ArmComparison, ArmStats,
+    LevelStats, MetricDiff, Report, ARM_METRICS, HOLDOUT_ARM, MIN_ARM_SESSIONS, PROXY_ARM,
+};

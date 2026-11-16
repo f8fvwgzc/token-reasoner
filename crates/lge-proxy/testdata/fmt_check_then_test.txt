@@ -1,0 +1,579 @@
+Diff in /repo/src/lib.rs:1:
+-pub fn total(xs: &[u32]) -> u32 {   xs.iter().sum::<u32>() + 1 }
++pub fn total(xs: &[u32]) -> u32 {
++    xs.iter().sum::<u32>() + 1
++}
+ 
+ #[cfg(test)]
+ mod tests {
+Diff in /repo/src/lib.rs:5:
+     #[test]
+-    fn totals_items() { assert_eq!(super::total(&[1, 2]), 4); }
++    fn totals_items() {
++        assert_eq!(super::total(&[1, 2]), 4);
++    }
+ }
+ 
+Diff in /repo/tests/api.rs:1:
+-#[test] fn api_checkout_flow_case_1() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_2() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_3() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_4() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_5() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_6() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_7() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_8() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_9() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_10() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_11() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_12() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_13() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_14() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_15() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_16() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_17() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_18() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_19() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_20() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_21() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_22() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_23() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_24() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_25() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_26() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_27() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_28() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_29() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_30() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_31() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_32() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_33() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_34() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_35() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_36() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_37() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_38() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_39() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_40() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_41() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_42() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_43() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_44() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_45() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_46() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_47() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_48() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_49() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_50() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_51() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_52() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_53() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_54() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_55() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_56() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_57() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_58() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_59() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_60() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_61() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_62() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_63() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_64() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_65() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_66() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_67() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_68() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_69() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_70() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_71() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_72() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_73() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_74() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_75() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_76() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_77() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_78() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_79() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_80() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_81() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_82() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_83() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_84() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_85() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_86() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_87() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_88() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_89() { assert_eq!(shop::total(&[]), 1); }
+-#[test] fn api_checkout_flow_case_90() { assert_eq!(shop::total(&[]), 1); }
++#[test]
++fn api_checkout_flow_case_1() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_2() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_3() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_4() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_5() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_6() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_7() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_8() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_9() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_10() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_11() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_12() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_13() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_14() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_15() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_16() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_17() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_18() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_19() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_20() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_21() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_22() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_23() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_24() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_25() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_26() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_27() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_28() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_29() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_30() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_31() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_32() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_33() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_34() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_35() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_36() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_37() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_38() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_39() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_40() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_41() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_42() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_43() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_44() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_45() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_46() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_47() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_48() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_49() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_50() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_51() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_52() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_53() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_54() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_55() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_56() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_57() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_58() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_59() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_60() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_61() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_62() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_63() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_64() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_65() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_66() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_67() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_68() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_69() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_70() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_71() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_72() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_73() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_74() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_75() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_76() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_77() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_78() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_79() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_80() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_81() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_82() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_83() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_84() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_85() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_86() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_87() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_88() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_89() {
++    assert_eq!(shop::total(&[]), 1);
++}
++#[test]
++fn api_checkout_flow_case_90() {
++    assert_eq!(shop::total(&[]), 1);
++}
+ 
+   Compiling shop v0.1.0 (/repo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s
+     Running unittests src/lib.rs (/repo/target/debug/deps/shop-d2bb84bc74e9c3da)
+
+running 1 test
+test tests::totals_items ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/api.rs (/repo/target/debug/deps/api-26a0575ba8ed00cc)
+
+running 90 tests
+test api_checkout_flow_case_13 ... ok
+test api_checkout_flow_case_10 ... ok
+test api_checkout_flow_case_11 ... ok
+test api_checkout_flow_case_12 ... ok
+test api_checkout_flow_case_15 ... ok
+test api_checkout_flow_case_1 ... ok
+test api_checkout_flow_case_14 ... ok
+test api_checkout_flow_case_16 ... ok
+test api_checkout_flow_case_17 ... ok
+test api_checkout_flow_case_18 ... ok
+test api_checkout_flow_case_19 ... ok
+test api_checkout_flow_case_2 ... ok
+test api_checkout_flow_case_20 ... ok
+test api_checkout_flow_case_21 ... ok
+test api_checkout_flow_case_22 ... ok
+test api_checkout_flow_case_23 ... ok
+test api_checkout_flow_case_24 ... ok
+test api_checkout_flow_case_25 ... ok
+test api_checkout_flow_case_26 ... ok
+test api_checkout_flow_case_27 ... ok
+test api_checkout_flow_case_28 ... ok
+test api_checkout_flow_case_29 ... ok
+test api_checkout_flow_case_3 ... ok
+test api_checkout_flow_case_30 ... ok
+test api_checkout_flow_case_31 ... ok
+test api_checkout_flow_case_32 ... ok
+test api_checkout_flow_case_33 ... ok
+test api_checkout_flow_case_34 ... ok
+test api_checkout_flow_case_35 ... ok
+test api_checkout_flow_case_36 ... ok
+test api_checkout_flow_case_37 ... ok
+test api_checkout_flow_case_38 ... ok
+test api_checkout_flow_case_39 ... ok
+test api_checkout_flow_case_40 ... ok
+test api_checkout_flow_case_4 ... ok
+test api_checkout_flow_case_41 ... ok
+test api_checkout_flow_case_42 ... ok
+test api_checkout_flow_case_43 ... ok
+test api_checkout_flow_case_44 ... ok
+test api_checkout_flow_case_45 ... ok
+test api_checkout_flow_case_46 ... ok
+test api_checkout_flow_case_47 ... ok
+test api_checkout_flow_case_48 ... ok
+test api_checkout_flow_case_49 ... ok
+test api_checkout_flow_case_5 ... ok
+test api_checkout_flow_case_50 ... ok
+test api_checkout_flow_case_51 ... ok
+test api_checkout_flow_case_52 ... ok
+test api_checkout_flow_case_53 ... ok
+test api_checkout_flow_case_54 ... ok
+test api_checkout_flow_case_55 ... ok
+test api_checkout_flow_case_56 ... ok
+test api_checkout_flow_case_57 ... ok
+test api_checkout_flow_case_58 ... ok
+test api_checkout_flow_case_59 ... ok
+test api_checkout_flow_case_6 ... ok
+test api_checkout_flow_case_60 ... ok
+test api_checkout_flow_case_61 ... ok
+test api_checkout_flow_case_62 ... ok
+test api_checkout_flow_case_63 ... ok
+test api_checkout_flow_case_64 ... ok
+test api_checkout_flow_case_65 ... ok
+test api_checkout_flow_case_66 ... ok
+test api_checkout_flow_case_67 ... ok
+test api_checkout_flow_case_68 ... ok
+test api_checkout_flow_case_69 ... ok
+test api_checkout_flow_case_7 ... ok
+test api_checkout_flow_case_70 ... ok
+test api_checkout_flow_case_71 ... ok
+test api_checkout_flow_case_72 ... ok
+test api_checkout_flow_case_73 ... ok
+test api_checkout_flow_case_74 ... ok
+test api_checkout_flow_case_75 ... ok
+test api_checkout_flow_case_76 ... ok
+test api_checkout_flow_case_77 ... ok
+test api_checkout_flow_case_78 ... ok
+test api_checkout_flow_case_79 ... ok
+test api_checkout_flow_case_8 ... ok
+test api_checkout_flow_case_80 ... ok
+test api_checkout_flow_case_81 ... ok
+test api_checkout_flow_case_82 ... ok
+test api_checkout_flow_case_83 ... ok
+test api_checkout_flow_case_84 ... ok
+test api_checkout_flow_case_85 ... ok
+test api_checkout_flow_case_86 ... ok
+test api_checkout_flow_case_87 ... ok
+test api_checkout_flow_case_88 ... ok
+test api_checkout_flow_case_89 ... ok
+test api_checkout_flow_case_9 ... ok
+test api_checkout_flow_case_90 ... ok
+
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests shop
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

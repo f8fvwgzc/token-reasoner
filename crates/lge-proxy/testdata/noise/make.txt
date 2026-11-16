@@ -1,0 +1,10 @@
+make: Entering directory `/repo'
+/Library/Developer/CommandLineTools/usr/bin/make -C sub
+make[1]: Entering directory `/repo/sub'
+built
+make[1]: Leaving directory `/repo/sub'
+/Library/Developer/CommandLineTools/usr/bin/make -C sub
+make[1]: Entering directory `/repo/sub'
+built
+make[1]: Leaving directory `/repo/sub'
+make: Leaving directory `/repo'

@@ -1,0 +1,136 @@
+   Compiling report v0.1.0 (/repo)
+warning: unused variable: `unused`
+ --> src/main.rs:2:9
+  |
+2 |     let unused = 1;
+  |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `report` (bin "report") generated 1 warning (run `cargo fix --bin "report" -p report` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running `target/debug/report`
+row   1: order total 137 cents, customer account number 7919
+row   2: order total 274 cents, customer account number 15838
+row   3: order total 411 cents, customer account number 23757
+row   4: order total 548 cents, customer account number 31676
+row   5: order total 685 cents, customer account number 39595
+row   6: order total 822 cents, customer account number 47514
+row   7: order total 959 cents, customer account number 55433
+row   8: order total 1096 cents, customer account number 63352
+row   9: order total 1233 cents, customer account number 71271
+row  10: order total 1370 cents, customer account number 79190
+row  11: order total 1507 cents, customer account number 87109
+row  12: order total 1644 cents, customer account number 95028
+row  13: order total 1781 cents, customer account number 102947
+row  14: order total 1918 cents, customer account number 110866
+row  15: order total 2055 cents, customer account number 118785
+row  16: order total 2192 cents, customer account number 126704
+row  17: order total 2329 cents, customer account number 134623
+row  18: order total 2466 cents, customer account number 142542
+row  19: order total 2603 cents, customer account number 150461
+row  20: order total 2740 cents, customer account number 158380
+row  21: order total 2877 cents, customer account number 166299
+row  22: order total 3014 cents, customer account number 174218
+row  23: order total 3151 cents, customer account number 182137
+row  24: order total 3288 cents, customer account number 190056
+row  25: order total 3425 cents, customer account number 197975
+row  26: order total 3562 cents, customer account number 205894
+row  27: order total 3699 cents, customer account number 213813
+row  28: order total 3836 cents, customer account number 221732
+row  29: order total 3973 cents, customer account number 229651
+row  30: order total 4110 cents, customer account number 237570
+row  31: order total 4247 cents, customer account number 245489
+row  32: order total 4384 cents, customer account number 253408
+row  33: order total 4521 cents, customer account number 261327
+row  34: order total 4658 cents, customer account number 269246
+row  35: order total 4795 cents, customer account number 277165
+row  36: order total 4932 cents, customer account number 285084
+row  37: order total 5069 cents, customer account number 293003
+row  38: order total 5206 cents, customer account number 300922
+row  39: order total 5343 cents, customer account number 308841
+row  40: order total 5480 cents, customer account number 316760
+row  41: order total 5617 cents, customer account number 324679
+row  42: order total 5754 cents, customer account number 332598
+row  43: order total 5891 cents, customer account number 340517
+row  44: order total 6028 cents, customer account number 348436
+row  45: order total 6165 cents, customer account number 356355
+row  46: order total 6302 cents, customer account number 364274
+row  47: order total 6439 cents, customer account number 372193
+row  48: order total 6576 cents, customer account number 380112
+row  49: order total 6713 cents, customer account number 388031
+row  50: order total 6850 cents, customer account number 395950
+row  51: order total 6987 cents, customer account number 403869
+row  52: order total 7124 cents, customer account number 411788
+row  53: order total 7261 cents, customer account number 419707
+row  54: order total 7398 cents, customer account number 427626
+row  55: order total 7535 cents, customer account number 435545
+row  56: order total 7672 cents, customer account number 443464
+row  57: order total 7809 cents, customer account number 451383
+row  58: order total 7946 cents, customer account number 459302
+row  59: order total 8083 cents, customer account number 467221
+row  60: order total 8220 cents, customer account number 475140
+row  61: order total 8357 cents, customer account number 483059
+row  62: order total 8494 cents, customer account number 490978
+row  63: order total 8631 cents, customer account number 498897
+row  64: order total 8768 cents, customer account number 506816
+row  65: order total 8905 cents, customer account number 514735
+row  66: order total 9042 cents, customer account number 522654
+row  67: order total 9179 cents, customer account number 530573
+row  68: order total 9316 cents, customer account number 538492
+row  69: order total 9453 cents, customer account number 546411
+row  70: order total 9590 cents, customer account number 554330
+row  71: order total 9727 cents, customer account number 562249
+row  72: order total 9864 cents, customer account number 570168
+row  73: order total 10001 cents, customer account number 578087
+row  74: order total 10138 cents, customer account number 586006
+row  75: order total 10275 cents, customer account number 593925
+row  76: order total 10412 cents, customer account number 601844
+row  77: order total 10549 cents, customer account number 609763
+row  78: order total 10686 cents, customer account number 617682
+row  79: order total 10823 cents, customer account number 625601
+row  80: order total 10960 cents, customer account number 633520
+row  81: order total 11097 cents, customer account number 641439
+row  82: order total 11234 cents, customer account number 649358
+row  83: order total 11371 cents, customer account number 657277
+row  84: order total 11508 cents, customer account number 665196
+row  85: order total 11645 cents, customer account number 673115
+row  86: order total 11782 cents, customer account number 681034
+row  87: order total 11919 cents, customer account number 688953
+row  88: order total 12056 cents, customer account number 696872
+row  89: order total 12193 cents, customer account number 704791
+row  90: order total 12330 cents, customer account number 712710
+row  91: order total 12467 cents, customer account number 720629
+row  92: order total 12604 cents, customer account number 728548
+row  93: order total 12741 cents, customer account number 736467
+row  94: order total 12878 cents, customer account number 744386
+row  95: order total 13015 cents, customer account number 752305
+row  96: order total 13152 cents, customer account number 760224
+row  97: order total 13289 cents, customer account number 768143
+row  98: order total 13426 cents, customer account number 776062
+row  99: order total 13563 cents, customer account number 783981
+row 100: order total 13700 cents, customer account number 791900
+row 101: order total 13837 cents, customer account number 799819
+row 102: order total 13974 cents, customer account number 807738
+row 103: order total 14111 cents, customer account number 815657
+row 104: order total 14248 cents, customer account number 823576
+row 105: order total 14385 cents, customer account number 831495
+row 106: order total 14522 cents, customer account number 839414
+row 107: order total 14659 cents, customer account number 847333
+row 108: order total 14796 cents, customer account number 855252
+row 109: order total 14933 cents, customer account number 863171
+row 110: order total 15070 cents, customer account number 871090
+row 111: order total 15207 cents, customer account number 879009
+row 112: order total 15344 cents, customer account number 886928
+row 113: order total 15481 cents, customer account number 894847
+row 114: order total 15618 cents, customer account number 902766
+row 115: order total 15755 cents, customer account number 910685
+row 116: order total 15892 cents, customer account number 918604
+row 117: order total 16029 cents, customer account number 926523
+row 118: order total 16166 cents, customer account number 934442
+row 119: order total 16303 cents, customer account number 942361
+row 120: order total 16440 cents, customer account number 950280
+
+thread 'main' (127081335) panicked at src/main.rs:7:23:
+index out of bounds: the len is 120 but the index is 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

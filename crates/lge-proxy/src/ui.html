@@ -30,6 +30,11 @@
   .folders div:hover { background:var(--bg); }
   label.switch { display:flex; gap:8px; align-items:center; }
   #msg { min-height:20px; }
+  .banner { background:var(--card); border:1px solid var(--bad); color:var(--bad); border-radius:10px; padding:10px 14px; margin-bottom:16px; }
+  select, input[type=number] { padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+  input[type=number] { width:90px; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; border:1px solid var(--line); font-size:12px; }
+  .sub { margin-top:14px; } .sub h3 { font-size:13px; margin:0 0 6px; color:var(--dim); font-weight:600; }
 </style>
 </head>
 <body>
@@ -38,6 +43,8 @@
     <h1>lge</h1>
     <span class="dim" id="sub">connecting…</span>
   </header>
+
+  <div class="banner" id="settings_error" hidden></div>
 
   <div class="grid" id="cards"></div>
 
@@ -70,6 +77,57 @@
   </section>
 
   <section>
+    <h2>Rules</h2>
+    <div class="card">
+      <div class="dim">Each rule runs <b>off</b>, in <b>shadow</b> (what it would save is counted, the output is sent as it is) or <b>on</b>. A change applies to outputs seen from then on; outputs already sent keep their bytes. A lossy rule whose outputs are recovered (re-run, re-read) more than <span id="th_demote"></span> of the time over at least <span id="th_min"></span> judged outputs moves to shadow by itself; below <span id="th_healthy"></span> it is healthy. Counts are over the stored sessions of the last <span id="th_days"></span> days.</div>
+      <div class="scroll" style="margin-top:10px"><table id="rules"></table></div>
+      <div class="sub"><h3>Skeletons of first reads, by language and size (measured)</h3><div class="scroll"><table id="cohorts"></table></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Holdout</h2>
+    <div class="card">
+      <div class="row">
+        <span>Share of new conversations held out (every rule in shadow, nothing added):</span>
+        <input type="number" id="holdout_share" min="0" max="1" step="0.05">
+        <button id="holdout_save">Save</button>
+      </div>
+      <div class="scroll" style="margin-top:10px"><table id="holdout"></table></div>
+      <div class="dim" id="holdout_note" style="margin-top:6px"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Prompt cache</h2>
+    <div class="card">
+      <div class="grid" id="monitor" style="margin-bottom:8px"></div>
+      <div class="dim">A break caused by lge is a bug: the bytes lge sent for an earlier item changed. A client break is Codex changing its own history (a compaction, an edit). A cold restart is a response after more than 5 idle minutes that read less than half of the previous request from the cache.</div>
+      <div class="scroll" style="margin-top:10px"><table id="breaks"></table></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Fixed prefix</h2>
+    <div class="card">
+      <div class="dim">What Codex sends at the start of every request, by tool group, since the daemon started. Report only: lge never changes tool definitions or your configuration. To drop a server you do not use, remove its <span class="mono">[mcp_servers.&lt;name&gt;]</span> entry from <span class="mono">~/.codex/config.toml</span>.</div>
+      <div class="scroll" style="margin-top:10px"><table id="groups"></table></div>
+      <div class="sub"><h3>Tools never called since the daemon started</h3><div class="scroll"><table id="ghosts"></table></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Past sessions replayed</h2>
+    <div class="card">
+      <div class="row">
+        <button id="discover">Replay past sessions</button>
+        <span class="dim">Runs every rule over the tool outputs of your Codex sessions of the last 30 days, in memory. Nothing is stored.</span>
+      </div>
+      <div id="discovered"></div>
+    </div>
+  </section>
+
+  <section>
     <h2>Before and after</h2>
     <div class="card">
       <div class="scroll"><table id="modes"></table></div>
@@ -84,8 +142,7 @@
     <h2>Settings</h2>
     <div class="card row">
       <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
-      <label class="switch"><input type="checkbox" id="s_shorten"> Shorten check output and long searches; point repeated output to its first copy</label>
-      <label class="switch"><input type="checkbox" id="s_reads"> Send a skeleton for whole-file reads (experimental)</label>
+      <label class="switch"><input type="checkbox" id="s_shorten"> Apply the rules to tool output (each rule's own switch is in the table above)</label>
       <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
     </div>
   </section>
@@ -105,6 +162,12 @@ const bulky = r => {
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, settingsDirty = false;
+const rate = r => r == null ? '–' : (100 * r).toFixed(1) + '%';
+const MODES = ['off', 'shadow', 'on'];
+function table(id, head, rows, empty) {
+  $(id).innerHTML = '<tr>' + head.map(h => h.startsWith('#') ? `<th class="n">${h.slice(1)}</th>` : `<th>${h}</th>`).join('') + '</tr>' +
+    (rows.length ? rows.join('') : `<tr><td colspan="${head.length}" class="dim">${empty}</td></tr>`);
+}
 
 async function api(path, method = 'GET', body) {
   const r = await fetch('/lge/api/' + path, { method, headers: body ? {'Content-Type': 'application/json'} : {}, body: body ? JSON.stringify(body) : undefined });
@@ -139,14 +202,67 @@ function render(s) {
       <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')
       : '<tr><td colspan="6" class="dim">No folder yet. Add one below, or start Codex in a git repository.</td></tr>');
 
-  $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Removed</th><th class="n">Added</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}</div></td>
+  $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}</div></td>
       <td class="n">${n(x.requests)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
-      <td class="n">${n(x.tokens_before - x.tokens_after)}</td><td class="n">${n(x.context_tokens)}</td></tr>`).join('')
-      : '<tr><td colspan="8" class="dim">No session has gone through the proxy yet.</td></tr>');
+      <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
+      : '<tr><td colspan="10" class="dim">No session has gone through the proxy yet.</td></tr>');
 
-  const label = { history: 'Past sessions (before lge)', proxy: 'Through the proxy' };
+  const err = $('settings_error');
+  err.hidden = !s.settings_error; err.textContent = s.settings_error || '';
+
+  const th = s.thresholds || {};
+  $('th_demote').textContent = rate(th.demote_above); $('th_healthy').textContent = rate(th.healthy_below);
+  $('th_min').textContent = n(th.min_judged); $('th_days').textContent = th.window_days;
+  table('rules', ['Rule', 'Mode', '#Outputs', '#Tokens before', '#After', '#Shadow would save', '#Recovered', '#Judged', 'Status'],
+    (s.rules || []).map(r => {
+      const st = r.stats || {};
+      const modes = r.kind === 'measure_only' ? ['off', 'shadow'] : MODES;
+      const select = `<select data-rule="${esc(r.id)}">${modes.map(m => `<option${(r.mode === m || (r.kind === 'measure_only' && m === 'shadow' && r.mode === 'on')) ? ' selected' : ''}>${m}</option>`).join('')}</select>`;
+      const status = r.demoted ? `<span class="warn">in shadow: ${esc(r.demoted)}</span> <button data-enable="${esc(r.id)}">Re-enable</button>`
+        : r.healthy ? '<span class="ok">healthy</span>' : (r.kind === 'lossy' && st.judged ? '<span class="dim">judging</span>' : '');
+      return `<tr><td class="mono">${esc(r.id)}<div class="dim">${esc(r.kind.replace('_', ' '))}</div></td><td>${select}</td>
+        <td class="n">${n(st.items)}</td><td class="n">${n(st.tokens_before)}</td><td class="n">${n(st.tokens_after)}</td>
+        <td class="n">${n((st.shadow_tokens_before || 0) - (st.shadow_tokens_after || 0))}</td>
+        <td class="n">${rate(r.rate)}</td><td class="n">${n(st.judged)}</td><td>${status}</td></tr>`;
+    }), 'No rule data yet.');
+  table('cohorts', ['Language and size', '#Reads', '#Would save', '#Patched within 5 calls'],
+    (s.cohorts || []).map(c => `<tr><td class="mono">${esc(c.cohort)}</td><td class="n">${n(c.reads)}</td><td class="n">${n(c.would_save_tokens)}</td><td class="n">${n(c.patched_within_5)}</td></tr>`),
+    'No first read of an indexed file of 16 KB or more yet.');
+
+  const h = s.holdout || {};
+  if (document.activeElement !== $('holdout_share')) $('holdout_share').value = s.settings.holdout_share;
+  const metric = { input_tokens: 'Input / session', cached_input_tokens: 'Cached', uncached_input_tokens: 'Uncached', output_tokens: 'Output', reasoning_tokens: 'Reasoning', requests: 'Requests', removed_tokens_sent: 'Kept out by lge' };
+  const diffs = Object.fromEntries((h.differences || []).map(d => [d.metric, d]));
+  table('holdout', ['Median per session', '#Through lge (' + n(h.proxy && h.proxy.sessions) + ')', '#Held out (' + n(h.holdout && h.holdout.sessions) + ')', '#Difference (95% interval)'],
+    Object.keys(metric).map(k => { const d = diffs[k];
+      return `<tr><td>${metric[k]}</td><td class="n">${n(Math.round(((h.proxy || {}).medians || {})[k] || 0))}</td><td class="n">${n(Math.round(((h.holdout || {}).medians || {})[k] || 0))}</td>
+        <td class="n">${d ? `${n(Math.round(d.difference))} (${n(Math.round(d.low))} to ${n(Math.round(d.high))})` : '–'}</td></tr>`; }), '');
+  $('holdout_note').textContent = h.note ? `${h.note}: each arm needs 30 sessions of the last 30 days.` : '';
+
+  const m = s.monitor || {};
+  $('monitor').innerHTML = [
+    ['Breaks caused by lge', n(m.lge_breaks), m.lge_breaks ? 'bad' : 'ok'],
+    ['Client breaks', n(m.client_breaks), ''],
+    ['Cold restarts', n(m.cold_restarts), ''],
+    ['Tokens not cached after them', n(m.cold_tokens), ''],
+    ['Requests sent again', n(m.raw_retries), ''],
+  ].map(([k, v, c]) => `<div class="card"><div class="dim">${k}</div><div class="big ${c}">${v}</div></div>`).join('');
+  const conv = ((s.prefix || {}).conversations || []).filter(c => c.lge_breaks || c.client_breaks || c.cold_restarts);
+  table('breaks', ['Session', '#lge breaks', '#Client breaks', '#Cold restarts'],
+    conv.map(c => `<tr><td>${esc(c.task || c.id)}${c.lge_breaks ? `<div class="bad">lge changed item ${c.first_lge_break_item}: a bug, please report it</div>` : ''}</td>
+      <td class="n ${c.lge_breaks ? 'bad' : ''}">${n(c.lge_breaks)}</td><td class="n">${n(c.client_breaks)}</td><td class="n">${n(c.cold_restarts)}</td></tr>`), 'No cache break and no cold restart.');
+
+  const fixed = (s.prefix || {}).fixed || {};
+  table('groups', ['Group', '#Tools', '#Tokens per request', 'Configuration entry'],
+    [`<tr><td>Instructions</td><td class="n"></td><td class="n">${n(fixed.instructions_tokens)}</td><td></td></tr>`].concat((fixed.groups || []).map(g =>
+      `<tr><td>${esc(g.group)}${g.mcp ? ' <span class="tag">MCP</span>' : ''}</td><td class="n">${n(g.tools)}</td><td class="n">${n(g.tokens)}</td><td class="mono">${esc(g.config)}</td></tr>`)), '');
+  table('ghosts', ['Tool', 'Group', '#Tokens per request', '#Requests seen', 'Configuration entry'],
+    (s.ghost_tools || []).slice(0, 50).map(g => `<tr><td class="mono">${esc(g.name)}</td><td>${esc(g.group)}</td><td class="n">${n(g.tokens)}</td><td class="n">${n(g.requests_seen)}</td><td class="mono">${esc(g.config)}</td></tr>`),
+    (fixed.groups || []).length ? 'Every tool in the definitions was called.' : 'No request seen since the daemon started.');
+
+  const label = { history: 'Past sessions (before lge)', proxy: 'Through the proxy', 'proxy-holdout': 'Held out (rules in shadow)' };
   $('modes').innerHTML = '<tr><th></th><th class="n">Sessions</th><th class="n">Input / session</th><th class="n">Cached</th><th class="n">Output / session</th><th class="n">Reasoning / session</th></tr>' +
     (s.modes.length ? s.modes.map(m => `<tr><td>${esc(label[m.mode] || m.mode)}</td><td class="n">${n(m.sessions)}</td>
       <td class="n">${n(Math.round(m.input_tokens / Math.max(1, m.sessions)))}</td><td class="n">${pct(m.cached_input_tokens, m.input_tokens)}</td>
@@ -154,7 +270,7 @@ function render(s) {
       : '<tr><td colspan="6" class="dim">Nothing measured yet.</td></tr>');
 
   if (!settingsDirty) {
-    $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_reads').checked = s.settings.shorten_reads; $('s_auto').checked = s.settings.auto_index;
+    $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_auto').checked = s.settings.auto_index;
   }
 }
 
@@ -194,11 +310,43 @@ $('import').onclick = async () => {
   catch (e) { say(e.message, 'bad'); }
   $('import').disabled = false;
 };
-for (const id of ['s_inject', 's_shorten', 's_reads', 's_auto']) $(id).onchange = async () => {
+for (const id of ['s_inject', 's_shorten', 's_auto']) $(id).onchange = async () => {
   settingsDirty = true;
-  const body = Object.assign({}, state ? state.settings : {}, { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, shorten_reads: $('s_reads').checked, auto_index: $('s_auto').checked });
+  const body = { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, auto_index: $('s_auto').checked };
   try { await api('settings', 'POST', body); } catch (e) { say(e.message, 'bad'); }
   settingsDirty = false; refresh();
+};
+$('rules').onchange = async e => {
+  const sel = e.target.closest('select[data-rule]'); if (!sel) return;
+  try { await api('settings', 'POST', { rules: { [sel.dataset.rule]: sel.value } }); } catch (err) { say(err.message, 'bad'); }
+  refresh();
+};
+$('rules').onclick = async e => {
+  const b = e.target.closest('button[data-enable]'); if (!b) return;
+  try { await api('settings', 'POST', { clear_demotion: b.dataset.enable }); } catch (err) { say(err.message, 'bad'); }
+  refresh();
+};
+$('holdout_save').onclick = async () => {
+  try { await api('settings', 'POST', { holdout_share: Number($('holdout_share').value) || 0 }); } catch (err) { say(err.message, 'bad'); }
+  refresh();
+};
+$('discover').onclick = async () => {
+  $('discover').disabled = true; $('discovered').innerHTML = '<div class="dim">Reading…</div>';
+  try {
+    const d = await api('discover', 'POST', {});
+    const rules = Object.entries(d.by_rule || {}).sort((a, b) => b[1] - a[1]);
+    const rq = d.requests || {}, sc = d.scripts || {};
+    $('discovered').innerHTML = `<div class="dim" style="margin-top:10px">${n(d.files)} sessions (${n(d.unreadable)} unreadable), ${n(d.outputs)} tool outputs, ${n(d.output_tokens)} tokens; ${n(d.unrecognised_tokens)} of them in outputs no rule changes. Requests per session: median ${n(rq.median)}, most ${n(rq.max)}. Code-mode scripts: ${n(sc.scripts)} (${n(sc.single_exec)} ran a single command).</div>
+      <div class="sub"><h3>Tokens each rule would remove</h3><div class="scroll"><table id="d_rules"></table></div></div>
+      <div class="sub"><h3>Command families, largest output first</h3><div class="scroll"><table id="d_families"></table></div></div>
+      <div class="sub"><h3>Commands corrected after a usage error</h3><div class="scroll"><table id="d_corrected"></table></div></div>`;
+    table('d_rules', ['Rule', '#Tokens'], rules.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="n">${n(v)}</td></tr>`), 'No rule would change anything.');
+    table('d_families', ['Family', '#Outputs', '#Tokens', '#Rules would remove', '#No rule'], (d.families || []).slice(0, 25).map(f =>
+      `<tr><td class="mono">${esc(f.family)}</td><td class="n">${n(f.outputs)}</td><td class="n">${n(f.output_tokens)}</td><td class="n">${n(Object.values(f.by_rule || {}).reduce((a, b) => a + b, 0))}</td><td class="n">${n(f.unrecognised_tokens)}</td></tr>`), 'No tool output found.');
+    table('d_corrected', ['Wrong', 'Right', 'Said', '#Times'], (d.corrected || []).slice(0, 25).map(c =>
+      `<tr><td class="mono">${esc(c.wrong)}</td><td class="mono">${esc(c.right)}</td><td>${esc(c.class)}</td><td class="n">${n(c.count)}</td></tr>`), 'None found.');
+  } catch (e) { $('discovered').innerHTML = `<div class="bad">${esc(e.message)}</div>`; }
+  $('discover').disabled = false;
 };
 refresh(); setInterval(refresh, 3000);
 </script>

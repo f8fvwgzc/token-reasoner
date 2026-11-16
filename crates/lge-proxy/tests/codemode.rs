@@ -1,9 +1,11 @@
 //! Code mode: the model runs tools from a JavaScript script
 //! (`custom_tool_call` named `exec`), and the result comes back as a list of
-//! parts: a status part, then what the script printed. The proxy reads the
-//! one shell command a script runs and shortens its output as it would the
-//! output of that command run directly. The script is never changed.
+//! parts: a status part, then what the script printed, one part per `text()`
+//! call. The proxy reads the shell commands a script runs and shortens each
+//! printed output as it would the output of that command run directly. The
+//! script is never changed.
 use lge_proxy::responses::transform;
+use lge_proxy::rules::Mode;
 use lge_proxy::session::{Options, Session};
 use serde_json::{json, Value};
 
@@ -116,8 +118,12 @@ fn a_search_run_from_a_script_is_capped_and_the_script_is_untouched() {
         "the agent's notes stay in place: {short}"
     );
     assert!(short.contains("…9120 tokens truncated…\n"), "{short}");
+    // Every file left out is named, with its number of matching lines.
+    let mut hidden: Vec<String> = (0..40).map(|f| format!("src/services/svc_{f}/orders.ts")).collect();
+    hidden.sort();
+    let hidden: Vec<String> = hidden[10..].iter().map(|p| format!("{p} (8)")).collect();
     assert!(
-        short.ends_with("lge: 60 of 320 matching lines shown, from 10 of 40 files. Not shown: src/services/svc_18/orders.ts, src/services/svc_19/orders.ts, src/services/svc_2/orders.ts, src/services/svc_20/orders.ts, src/services/svc_21/orders.ts, src/services/svc_22/orders.ts, src/services/svc_23/orders.ts, src/services/svc_24/orders.ts, .... Narrow the pattern or search one file to see the rest.\n"),
+        short.ends_with(&format!("lge: 60 of 320 matching lines shown, from 10 of 40 files. Not shown: {}. Narrow the pattern or search one file to see the rest, or run the same search again before changing anything to see it whole.\n", hidden.join(", "))),
         "{short}"
     );
     assert!(short.len() * 3 < rg.len());
@@ -148,13 +154,10 @@ fn test_runs_from_a_script_are_reduced_to_their_result() {
     let before = req.clone();
     let mut session = Session::default();
     let seen = transform(&mut req, &mut session, None, &Options::default());
-    assert_eq!(seen.outputs_replaced, 2);
-    let pytest = printed(&req, 3);
-    assert!(pytest.starts_with("ok") && pytest.contains("300 passed"), "{pytest}");
-    assert!(
-        pytest.contains("lge: output of `pytest` reduced to its result"),
-        "{pytest}"
-    );
+    assert_eq!(seen.outputs_replaced, 1);
+    // `| tail` without pipefail: the status is tail's and the run may be cut
+    // above its failure, so a pass is not vouched for and the output stays whole.
+    assert_eq!(printed(&req, 3), printed(&before, 3));
     let parts = req["input"][5]["output"].as_array().unwrap();
     assert_eq!(parts.len(), 3, "the number of parts never changes");
     assert_eq!(
@@ -190,7 +193,7 @@ fn reads_from_a_script_are_left_whole_and_a_repeat_points_to_the_first_copy() {
     );
     assert_eq!(
         printed(&req, 5),
-        "lge: identical to the output of `cat docs/notes.md` earlier in this conversation (200 lines, unchanged); it is not repeated here.\n"
+        "lge: identical to the output of run 1 of `cat docs/notes.md` earlier in this conversation (200 lines, first line: \"docs/notes_0.md:0: remember to check the order totals here\"); it is not repeated here.\n"
     );
     assert_eq!(session.saved.outputs_shortened, 1);
 }
@@ -267,6 +270,35 @@ fn the_same_items_get_the_same_bytes_on_every_turn_and_are_counted_once() {
     let prefix = |v: &Value| serde_json::to_string(&v["input"].as_array().unwrap()[..10]).unwrap();
     assert_eq!(prefix(&next), prefix(&first), "the cached prefix must not change");
     assert_eq!(session.saved, saved, "decided once, counted once");
+
+    // Settings change mid-conversation (rules switched, shortening off, the
+    // holdout arm): past items keep their bytes.
+    let mut switched = opts.clone();
+    switched.rules.check = Mode::Off;
+    switched.rules.search_cap = Mode::Shadow;
+    switched.rules.repeat_pointer = Mode::Off;
+    for later in [
+        switched,
+        Options {
+            shorten_outputs: false,
+            ..opts.clone()
+        },
+        Options {
+            holdout: true,
+            ..opts.clone()
+        },
+    ] {
+        let mut turn = body(items.clone());
+        turn["input"].as_array_mut().unwrap().push(user("thanks, now fix it"));
+        let seen = transform(&mut turn, &mut session, None, &later);
+        assert_eq!(
+            prefix(&turn),
+            prefix(&first),
+            "the cached prefix must not change: {later:?}"
+        );
+        assert_eq!(seen.lge_break_item, None);
+    }
+    assert_eq!(session.saved, saved);
 
     // A fresh session (a restarted daemon) decides the same from the same items.
     let mut again = body(items);
@@ -350,4 +382,154 @@ fn a_script_that_repeats_its_command_in_a_loop_body_is_not_read() {
         "judged by its content, as a script with no single command"
     );
     assert_eq!(req["input"][2], before["input"][2], "the script is never touched");
+}
+
+fn fixture(name: &str) -> (Value, Value) {
+    let path = format!("{}/../../tests/fixtures/codex/{name}", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    (v["call"].clone(), v["result"].clone())
+}
+
+/// The text of part `part` of the output of item `item`.
+fn part(body: &Value, item: usize, part: usize) -> String {
+    body["input"][item]["output"][part]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn whole_exec_results_printed_as_json_lines_are_shortened_inside_their_line() {
+    // Built as Codex lays it out: a script printed three exec results with
+    // text(obj); over budget, Codex merged them under its truncation note and
+    // cut the third line in the middle.
+    let (call, result) = fixture("exec_json_lines.json");
+    let mut req = body(vec![call.clone(), result.clone()]);
+    let before = req.clone();
+    let mut session = Session::default();
+    let seen = transform(&mut req, &mut session, None, &Options::default());
+    assert_eq!(seen.outputs_replaced, 1);
+    let old = part(&before, 3, 1);
+    let new = part(&req, 3, 1);
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    assert_eq!(old_lines.len(), new_lines.len());
+    // The note, the first line and the cut third line stay byte for byte.
+    for k in [0, 1, 2, 3, 5] {
+        assert_eq!(old_lines[k], new_lines[k], "line {k}");
+    }
+    // The second line is still one exec result, with the run reduced to its
+    // result and every other field as it was.
+    let was: Value = serde_json::from_str(old_lines[4]).unwrap();
+    let now: Value = serde_json::from_str(new_lines[4]).unwrap();
+    let output = now["output"].as_str().unwrap();
+    assert!(output.starts_with("ok: 300 passed"), "{output}");
+    for key in ["chunk_id", "wall_time_seconds", "exit_code", "original_token_count"] {
+        assert_eq!(now[key], was[key], "{key}");
+    }
+    let prefix_len = old_lines[4].find("\"output\":").unwrap();
+    assert_eq!(&new_lines[4][..prefix_len], &old_lines[4][..prefix_len]);
+    assert!(new_lines[4].ends_with("\"}"));
+    assert_eq!(req["input"][3]["output"][0], before["input"][3]["output"][0]);
+    assert_eq!(req["input"][2], before["input"][2], "the script is never touched");
+
+    // Stable across turns, and for a fresh session.
+    let mut next = body(vec![call.clone(), result.clone()]);
+    transform(&mut next, &mut session, None, &Options::default());
+    assert_eq!(next, req);
+    let mut fresh = body(vec![call, result]);
+    transform(&mut fresh, &mut Session::default(), None, &Options::default());
+    assert_eq!(fresh, req);
+}
+
+/// One exec result as Codex returns it to a script and `JSON.stringify` prints it.
+fn exec_line(exit: Option<i64>, output: &str) -> String {
+    let mut object = serde_json::Map::new();
+    object.insert("chunk_id".into(), json!("4b1e9c"));
+    object.insert("wall_time_seconds".into(), json!(9.912834));
+    match exit {
+        Some(code) => object.insert("exit_code".into(), json!(code)),
+        None => object.insert("session_id".into(), json!(41)),
+    };
+    object.insert("original_token_count".into(), json!(5460));
+    object.insert("output".into(), json!(output));
+    serde_json::to_string(&object).unwrap()
+}
+
+#[test]
+fn a_script_printing_its_one_result_whole_is_judged_by_its_command() {
+    let printing =
+        "const r = await tools.exec_command({cmd: 'pytest -v tests/test_orders.py', workdir: '/repo'});\ntext(r);";
+    let passed = exec_line(Some(0), &pytest_run());
+    let mut req = body(vec![exec("j1", printing), result("j1", &passed)]);
+    let mut session = Session::default();
+    let seen = transform(&mut req, &mut session, None, &Options::default());
+    assert_eq!(seen.outputs_replaced, 1);
+    let line: Value = serde_json::from_str(&printed(&req, 3)).unwrap();
+    let output = line["output"].as_str().unwrap();
+    assert!(output.starts_with("ok"), "{output}");
+    assert!(
+        output.contains("lge: output of `pytest` reduced"),
+        "by its command: {output}"
+    );
+    let again = req.clone();
+    let mut next = body(vec![exec("j1", printing), result("j1", &passed)]);
+    transform(&mut next, &mut session, None, &Options::default());
+    assert_eq!(next, again, "the decision is stable across turns");
+
+    // Exit code 1 with a passing tally, a process still running, a line Codex
+    // cut: each is sent as it is.
+    let mut cut = passed.clone();
+    cut.truncate(passed.len() / 2);
+    cut.push_str("…812 tokens truncated…\"}");
+    for text in [exec_line(Some(1), &pytest_run()), exec_line(None, &pytest_run()), cut] {
+        let mut req = body(vec![exec("j2", printing), result("j2", &text)]);
+        let before = req.clone();
+        let seen = transform(&mut req, &mut Session::default(), None, &Options::default());
+        assert_eq!(seen.outputs_replaced, 0, "{}", &text[..80]);
+        assert_eq!(req, before);
+    }
+}
+
+#[test]
+fn each_printed_part_of_a_three_command_script_gets_its_own_decision() {
+    let (call, result) = fixture("multi_command_parts.json");
+    let mut req = body(vec![call.clone(), result.clone()]);
+    let before = req.clone();
+    let mut session = Session::default();
+    let seen = transform(&mut req, &mut session, None, &Options::default());
+    assert_eq!(seen.outputs_replaced, 2);
+    assert_eq!(part(&req, 3, 1), part(&before, 3, 1), "the sed read stays whole");
+    let search = part(&req, 3, 2);
+    assert!(search.contains("lge: 60 of 320 matching lines shown"), "{search}");
+    let tests = part(&req, 3, 3);
+    assert!(tests.starts_with("ok: 300 passed"), "{tests}");
+    assert!(
+        tests.contains("lge: output of `pytest` reduced"),
+        "matched to its command: {tests}"
+    );
+    assert_eq!(req["input"][3]["output"][0], before["input"][3]["output"][0]);
+    assert_eq!(req["input"][2], before["input"][2]);
+    let mut next = body(vec![call.clone(), result.clone()]);
+    next["input"].as_array_mut().unwrap().push(user("ok"));
+    transform(&mut next, &mut session, None, &Options::default());
+    assert_eq!(next["input"][3], req["input"][3], "identical bytes next turn");
+
+    // The script failed after printing: Codex added its error as one more
+    // part, so the parts no longer match the text() calls one to one. Each
+    // part is then judged by its content alone.
+    let mut failed = result.clone();
+    failed["output"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "input_text", "text": "Script error:\nError: boom" }));
+    let mut req = body(vec![call, failed]);
+    let seen = transform(&mut req, &mut Session::default(), None, &Options::default());
+    assert_eq!(seen.outputs_replaced, 2);
+    let tests = part(&req, 3, 3);
+    assert!(
+        tests.contains("lge: output of the command reduced"),
+        "by content: {tests}"
+    );
 }

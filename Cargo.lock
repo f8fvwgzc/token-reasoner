@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "lge-bench"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "lge-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -783,11 +783,12 @@ dependencies = [
  "lge-store",
  "lge-usage",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "lge-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "serde",
@@ -795,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "lge-filter"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -808,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "lge-index"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -861,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "lge-mcp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -875,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "lge-memory"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -888,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "lge-proxy"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -900,6 +901,7 @@ dependencies = [
  "lge-router",
  "lge-store",
  "lge-usage",
+ "regex",
  "ruzstd",
  "serde",
  "serde_json",
@@ -910,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "lge-resolve"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -920,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "lge-retrieve"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -935,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "lge-router"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -947,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "lge-session"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",
@@ -964,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "lge-store"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lbug",
@@ -975,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "lge-usage"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "lge-core",

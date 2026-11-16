@@ -1,0 +1,4 @@
+# example.com/shop/broken
+broken/broken.go:4:9: undefined: undefinedThing
+broken/broken.go:8:14: cannot use "s" (untyped string constant) as int value in variable declaration
+broken/broken.go:9:9: cannot use x (variable of type int) as string value in return statement

@@ -1,7 +1,10 @@
 //! The proxy's decisions for one conversation, against a real indexed repository.
+use lge_proxy::responses::transform;
+use lge_proxy::rules::{Mode, RuleModes};
 use lge_proxy::session::{pack_budget, Graph, Options, Session, CONTEXT_CLOSE, CONTEXT_OPEN, LOCAL_CONTEXT_BUDGET};
 use lge_retrieve::{budget::count, index_repo, IndexOptions};
 use lge_store::Store;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -207,7 +210,10 @@ fn a_file_read_from_the_top_becomes_a_skeleton_once() {
         root: &root,
     };
     let opts = Options {
-        shorten_reads: true,
+        rules: RuleModes {
+            skeleton: Mode::On,
+            ..RuleModes::default()
+        },
         ..Options::default()
     };
     let mut session = Session::default();
@@ -304,7 +310,10 @@ fn a_read_is_left_alone_when_the_proxy_cannot_be_sure_of_it() {
         root: &root,
     };
     let opts = Options {
-        shorten_reads: true,
+        rules: RuleModes {
+            skeleton: Mode::On,
+            ..RuleModes::default()
+        },
         ..Options::default()
     };
     let file = billing_module();
@@ -346,7 +355,7 @@ fn a_read_is_left_alone_when_the_proxy_cannot_be_sure_of_it() {
         ),
         None
     );
-    // Whole-file skeletons are opt-in: with the defaults a read passes through.
+    // Whole-file skeletons are in shadow by default: a read passes through.
     assert_eq!(
         Session::default().rewrite_output(
             Some(&graph),
@@ -413,4 +422,175 @@ fn searches_and_check_runs_are_shortened_without_a_graph_too() {
         .expect("a pytest run behind npm");
     assert!(via_npm.starts_with("ok"), "{via_npm}");
     assert_eq!(session.saved.outputs_shortened, 3);
+}
+
+/// A module over 16 KB: ten functions of forty lines each.
+fn ledger_module() -> String {
+    let mut text = String::from("\"\"\"Ledger operations.\"\"\"\n\n");
+    for f in 0..10 {
+        text.push_str(&format!(
+            "def post_entry_{f}(account, amount):\n    \"\"\"Post entry kind {f}.\"\"\"\n"
+        ));
+        for i in 0..40 {
+            text.push_str(&format!(
+                "    line_{i} = journal.write(account, amount, kind=\"entry_{f}\", position={i})\n"
+            ));
+        }
+        text.push_str("    return account\n\n\n");
+    }
+    text
+}
+
+/// The repository with the ledger module indexed too.
+fn ledger_repo() -> (tempfile::TempDir, PathBuf, Store, String) {
+    let (dir, root, store) = repo();
+    let ledger = ledger_module();
+    assert!(ledger.len() > 16 * 1024, "{}", ledger.len());
+    std::fs::write(root.join("orders_api/ledger.py"), &ledger).unwrap();
+    index_repo(&store, &root, &IndexOptions::default()).unwrap();
+    (dir, root, store, ledger)
+}
+
+fn exec_call(id: &str, command: &str, workdir: &Path) -> Value {
+    json!({ "type": "function_call", "name": "exec_command", "call_id": id, "arguments": json!({ "cmd": command, "workdir": workdir }).to_string() })
+}
+
+fn exec_output(id: &str, text: &str) -> Value {
+    json!({ "type": "function_call_output", "call_id": id, "output": text })
+}
+
+#[test]
+fn a_shadow_skeleton_records_its_cohort_and_leaves_reads_alone() {
+    let (_dir, root, store, ledger) = ledger_repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    assert_eq!(
+        session.rewrite_call_output(Some(&graph), "c1", "cat orders_api/ledger.py", None, &ledger, &opts),
+        None,
+        "shadow forwards the original"
+    );
+    let cohort = session.saved.cohorts["python:16-64K"];
+    assert_eq!(cohort.reads, 1);
+    assert!(cohort.would_save_tokens > 1000, "{cohort:?}");
+    let s = session.saved.by_rule["skeleton"];
+    assert_eq!((s.items, s.shadow_items), (0, 1));
+    // The read in shadow did not count as a shortened file: promoted, the
+    // next first read of it gets the skeleton.
+    let on = Options {
+        rules: RuleModes {
+            skeleton: Mode::On,
+            ..RuleModes::default()
+        },
+        ..Options::default()
+    };
+    let short = session
+        .rewrite_call_output(Some(&graph), "c2", "cat orders_api/ledger.py", None, &ledger, &on)
+        .expect("a skeleton in on");
+    assert!(short.contains("sed -n '"), "{short}");
+    assert_eq!(session.saved.cohorts["python:16-64K"].reads, 2);
+    // A numbered read gets a skeleton that keeps the real line numbers.
+    let numbered: String = ledger
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!("{:6}\t{l}\n", i + 1))
+        .collect();
+    let short = Session::default()
+        .rewrite_call_output(Some(&graph), "c1", "nl -ba orders_api/ledger.py", None, &numbered, &on)
+        .expect("a numbered read is shortened");
+    assert!(short.contains("     3\tdef post_entry_0(account, amount):"), "{short}");
+    assert!(
+        short.contains("read them with: sed -n '5,45p' orders_api/ledger.py"),
+        "{short}"
+    );
+}
+
+#[test]
+fn follow_ups_of_a_skeleton_are_counted_with_its_cohort() {
+    let (_dir, root, store, ledger) = ledger_repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let filler = |id: &str| [exec_call(id, "git status", &root), exec_output(id, "On branch main\n")];
+    // Shadow skeleton, then a patch of the read file within five calls.
+    let mut items = vec![
+        exec_call("c1", "cat orders_api/ledger.py", &root),
+        exec_output("c1", &ledger),
+        json!({ "type": "custom_tool_call", "call_id": "p1", "name": "apply_patch", "input": "*** Begin Patch\n*** Update File: orders_api/ledger.py\n@@\n-a\n+b\n*** End Patch\n" }),
+        json!({ "type": "custom_tool_call_output", "call_id": "p1", "output": "Success." }),
+    ];
+    for id in ["c3", "c4", "c5", "c6"] {
+        items.extend(filler(id));
+    }
+    let mut session = Session::default();
+    let mut body = json!({ "input": items });
+    transform(&mut body, &mut session, Some(&graph), &Options::default());
+    let s = session.saved.by_rule["skeleton"];
+    assert_eq!((s.shadow_judged, s.shadow_followed), (1, 1));
+    assert_eq!(session.saved.cohorts["python:16-64K"].patched_within_5, 1);
+
+    // A skeleton in on, then a read of a range its marker named: recovered.
+    let on = Options {
+        rules: RuleModes {
+            skeleton: Mode::On,
+            ..RuleModes::default()
+        },
+        ..Options::default()
+    };
+    let mut first =
+        json!({ "input": [exec_call("c1", "cat orders_api/ledger.py", &root), exec_output("c1", &ledger)] });
+    let mut session = Session::default();
+    transform(&mut first, &mut session, Some(&graph), &on);
+    let short = first["input"][1]["output"].as_str().unwrap().to_string();
+    let range = short
+        .split("read them with: ")
+        .nth(1)
+        .and_then(|r| r.lines().next())
+        .unwrap()
+        .to_string();
+    let mut items = vec![
+        exec_call("c1", "cat orders_api/ledger.py", &root),
+        exec_output("c1", &ledger),
+        exec_call("c2", &range, &root),
+        exec_output("c2", "    line_0 = ...\n"),
+    ];
+    for id in ["c3", "c4", "c5", "c6"] {
+        items.extend(filler(id));
+    }
+    let mut body = json!({ "input": items });
+    transform(&mut body, &mut session, Some(&graph), &on);
+    assert_eq!(body["input"][1]["output"], short.as_str(), "the same bytes");
+    let s = session.saved.by_rule["skeleton"];
+    assert_eq!((s.judged, s.recovered), (1, 1));
+    assert_eq!(session.saved.cohorts["python:16-64K"].patched_within_5, 0);
+}
+
+#[test]
+fn a_holdout_conversation_decides_packs_but_never_adds_them() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options {
+        holdout: true,
+        ..Options::default()
+    };
+    let mut session = Session::default();
+    assert_eq!(
+        session.context_for(&graph, "create_order must validate the payload", &opts),
+        None
+    );
+    assert_eq!(session.saved.contexts_added, 0);
+    assert_eq!(session.saved.contexts_would_add, 1);
+    assert!(session.saved.context_tokens_would_add > 100);
+    let mut body = json!({ "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "create_order must validate the payload" }] }] });
+    let before = body.clone();
+    let seen = transform(&mut body, &mut Session::default(), Some(&graph), &opts);
+    assert_eq!(body, before);
+    assert_eq!((seen.contexts_present, seen.added_present), (0, 0));
 }

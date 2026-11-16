@@ -1,0 +1,53 @@
+   Compiling shop v0.1.0 (/repo)
+warning: unused import: `std::collections::HashMap`
+ --> src/lib.rs:1:5
+  |
+1 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::fs`
+ --> src/lib.rs:2:5
+  |
+2 | use std::fs;
+  |     ^^^^^^^
+
+warning: use of deprecated function `old_total`: use total
+  --> src/lib.rs:14:28
+   |
+14 | pub fn uses_old() -> u32 { old_total() }
+   |                            ^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `unused_a`
+ --> src/lib.rs:5:9
+  |
+5 |     let unused_a = 1;
+  |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_a`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `unused_b`
+ --> src/lib.rs:6:9
+  |
+6 |     let unused_b = 2;
+  |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_b`
+
+warning: function `helper_never_called` is never used
+  --> src/lib.rs:10:4
+   |
+10 | fn helper_never_called() {}
+   |    ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `NeverBuilt` is never constructed
+  --> src/lib.rs:11:8
+   |
+11 | struct NeverBuilt { field: u32 }
+   |        ^^^^^^^^^^
+
+warning: `shop` (lib) generated 7 warnings (run `cargo fix --lib -p shop` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.49s

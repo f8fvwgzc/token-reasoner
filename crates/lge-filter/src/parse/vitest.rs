@@ -2,7 +2,7 @@
 //! separated by `⎯⎯⎯` rules, then `Test Files` and `Tests` totals.
 
 use super::jest::is_library_frame;
-use super::{count_of, number, pattern, squeeze, Parsed};
+use super::{closing_state, count_of, number, pattern, squeeze, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -15,6 +15,9 @@ pattern!(FILES, r"^\s*Test Files\s{2,}(.*)$");
 pattern!(WHOLE_FILE, r"^(\S+) \[ .* \]$");
 // A workspace project in front of the file: `|unit| src/a.test.ts > adds`.
 pattern!(PROJECT, r"^\|[^|]*\|\s+");
+pattern!(CLOSING, r"^\s*Tests\s+\d+ ");
+// What vitest prints after its `Tests` line.
+pattern!(EPILOGUE, r"^\s*(?:Start at|Duration|Type Errors|Test Files)\b");
 
 const SUITE_FAILED: &str = "suite failed to run";
 
@@ -101,6 +104,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
     parsed.summary = tests
         .map(|t| format!("Tests {t}"))
         .or(files.map(|f| format!("Test Files {f}")));
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&CLOSING], &[&EPILOGUE]);
     parsed
 }
 

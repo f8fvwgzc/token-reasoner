@@ -3,8 +3,10 @@
 
 use anyhow::{bail, Result};
 use lge_bench::ab::{
-    median, parse_task_file, parse_tasks, prompt_with_note, render, resolve_commit, resolve_note, run_ab, summarize,
-    verdict, AbEnv, AbOptions, AbTask, Arm, ArmRun, DaemonApi, HttpDaemon, Tally, DEFAULT_NOTE,
+    clustered_interval, median, parse_task_file, parse_tasks, prompt_with_note, render, resolve_commit, resolve_note,
+    run_ab, run_preflight, summarize, summarize_with, verdict, AbEnv, AbOptions, AbTask, Arm, ArmRun, DaemonApi,
+    HttpDaemon, Tally, Variant, Weights, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, DEFAULT_NOTE, DEFAULT_WEIGHTS,
+    NOISE_SPREAD, RESULTS_FILE, TRACES_DIR,
 };
 use lge_session::{SessionRequest, SessionResult, SessionRunner};
 use lge_usage::TokenUsage;
@@ -32,6 +34,10 @@ struct State {
     workspaces: Vec<String>,
     /// Registered copies stay in the `indexing` state.
     never_ready: bool,
+    /// Answers `requests()` with a trace for each thread it is asked about.
+    traces: bool,
+    /// Threads whose trace was asked for.
+    traced: Vec<String>,
 }
 
 struct FakeDaemon(Mutex<State>);
@@ -93,6 +99,23 @@ impl DaemonApi for FakeDaemon {
         s.removed.push(root.to_string());
         Ok(())
     }
+
+    fn requests(&self, thread: &str) -> Result<Value> {
+        let mut s = self.state();
+        if !s.traces {
+            bail!("no traces here");
+        }
+        s.traced.push(thread.to_string());
+        let big = if thread.ends_with("on") { 2_000 } else { 9_000 };
+        Ok(json!({ "thread": thread, "known": true, "requests": [
+            { "request": 1, "status": 200, "usage_found": true, "input_tokens": 4_000, "cached_input_tokens": 0,
+              "output_tokens": 100, "reasoning_tokens": 50, "lge_added_tokens": 0, "lge_removed_tokens": 0,
+              "largest_outputs": [{ "command": "rg -n create_order", "tokens": 1_200, "shortened": false }] },
+            { "request": 2, "status": 200, "usage_found": true, "input_tokens": 8_000, "cached_input_tokens": 3_000,
+              "output_tokens": 100, "reasoning_tokens": 50, "lge_added_tokens": 0, "lge_removed_tokens": 7_000,
+              "largest_outputs": [{ "command": "cargo test", "tokens": big, "shortened": thread.ends_with("on") }] }
+        ]}))
+    }
 }
 
 // ---- a stand-in agent --------------------------------------------------------
@@ -113,6 +136,8 @@ struct Seen {
     approve_for_me: bool,
     /// `moved.txt` in the copy: what a session committed to the repository.
     moved: Option<String>,
+    /// AGENTS.md at the top of the copy.
+    agents_md: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -199,6 +224,7 @@ impl SessionRunner for FakeAgent<'_> {
             sandbox: request.sandbox.clone(),
             approve_for_me: request.approve_for_me,
             moved: std::fs::read_to_string(cwd.join("moved.txt")).ok(),
+            agents_md: std::fs::read_to_string(cwd.join("AGENTS.md")).ok(),
         });
         if let Some(repo) = &self.move_branch {
             let n = self.seen.borrow().len();
@@ -279,9 +305,12 @@ fn task(name: &str, check: &str) -> AbTask {
     }
 }
 
+/// The options of the runner tests: the preflight is off (most of their
+/// checks pass on the base commit); its own tests turn it on.
 fn options(work: &Path) -> AbOptions {
     let mut o = AbOptions::new(work.to_path_buf());
     o.poll = Duration::from_millis(1);
+    o.preflight = false;
     o
 }
 
@@ -294,6 +323,24 @@ fn worktrees(repo: &Path) -> usize {
 
 fn never() -> bool {
     false
+}
+
+/// Forget the results of an earlier run in `work`, so the next run starts
+/// afresh (a run refuses a work dir that holds another run's results).
+fn clear(work: &Path) {
+    let _ = std::fs::remove_file(work.join(RESULTS_FILE));
+    let _ = std::fs::remove_dir_all(work.join(TRACES_DIR));
+}
+
+/// What a run leaves in its work dir: the results file, and no copy.
+fn only_results(work: &Path) {
+    let mut left: Vec<String> = std::fs::read_dir(work)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    left.sort();
+    assert_eq!(left, [RESULTS_FILE], "{work:?}");
 }
 
 fn quiet(_: &str) {}
@@ -336,7 +383,10 @@ fn arms_alternate_and_each_session_sees_its_arm() {
         assert_eq!(s.settings["shorten_outputs"], on, "{s:?}");
         assert_eq!(s.settings["shorten_reads"], false, "{s:?}");
         assert_eq!(s.settings["auto_index"], false, "{s:?}");
+        assert_eq!(s.settings["holdout_share"], 0.0, "no holdout in either arm: {s:?}");
+        assert_eq!(s.settings["inject_context"], on, "{s:?}");
         assert_eq!(s.settings["context_budget"], 1500, "other settings are kept");
+        assert_eq!(s.agents_md, None, "the features variant leaves AGENTS.md as committed");
         // The arm with features on starts in a copy whose graph is ready.
         assert_eq!(s.registered, on, "{s:?}");
         assert!(s.setup_ran, "setup runs before the session");
@@ -423,10 +473,8 @@ fn every_copy_is_removed_and_dropped_from_the_daemon() {
         assert!(!s.cwd.exists(), "{:?} was removed", s.cwd);
         assert!(s.cwd.starts_with(&work), "{:?}", s.cwd);
     }
-    assert!(
-        !work.exists(),
-        "the folder for the copies was created by the run and removed"
-    );
+    // Every copy is gone; the results file stays, for a resume.
+    only_results(&work);
     assert_eq!(worktrees(&repo), 1, "git forgot the copies");
     let state = daemon.state();
     assert_eq!(
@@ -460,6 +508,7 @@ fn the_check_decides_success_and_a_failed_session_does_not_stop_the_run() {
     assert_eq!(report.compared, 1);
 
     // An agent that cannot run: every session is recorded with the error.
+    clear(&work);
     agent.mode = Mode::Fail;
     let env = AbEnv {
         daemon: &daemon,
@@ -490,6 +539,7 @@ fn the_check_decides_success_and_a_failed_session_does_not_stop_the_run() {
         ..task("broken", "true")
     };
     let before = agent.seen().len();
+    clear(&work);
     let report = run_ab(&repo, &[broken], &options(&work), &env).unwrap();
     assert_eq!(agent.seen().len(), before, "no session after a failed setup");
     assert!(
@@ -531,7 +581,7 @@ fn settings_are_restored_when_the_daemon_refuses_a_switch() {
     assert!(state.repos.is_empty());
     drop(state);
     assert_eq!(worktrees(&repo), 1);
-    assert!(!work.exists());
+    only_results(&work);
 }
 
 #[test]
@@ -569,6 +619,7 @@ fn settings_are_restored_after_ctrl_c() {
     assert!(render(&report).contains("interrupted"));
 
     // Ctrl-C while the check runs: the check's failure is not the agent's.
+    clear(&work);
     let agent = FakeAgent::new(&daemon);
     let stop = || {
         agent
@@ -680,6 +731,7 @@ fn result(task: &str, run: usize, arm: Arm, total: i64, success: bool) -> ArmRun
         error: None,
         interrupted: false,
         check_tail: String::new(),
+        ..ArmRun::new(task, run, arm, 1)
     }
 }
 
@@ -820,6 +872,10 @@ fn http_daemon() -> (String, Calls) {
                     json!({ "root": format!("/canonical{}", parsed["path"].as_str().unwrap()) }),
                 ),
                 ("DELETE", "/lge/api/repos") => (200, json!({ "removed": true })),
+                ("GET", u) if u.starts_with("/lge/api/sessions/") && u.ends_with("/requests") => (
+                    200,
+                    json!({ "thread": u.trim_start_matches("/lge/api/sessions/").trim_end_matches("/requests"), "known": true, "requests": [] }),
+                ),
                 _ => (400, json!({ "error": "no such endpoint" })),
             };
             let response = tiny_http::Response::from_string(answer.to_string()).with_status_code(status);
@@ -840,6 +896,14 @@ fn the_http_client_speaks_the_daemons_page_api() {
     assert_eq!(daemon.status().unwrap()["settings"], off);
     assert_eq!(daemon.add_repo(Path::new("/tmp/copy")).unwrap(), "/canonical/tmp/copy");
     daemon.remove_repo("/canonical/tmp/copy").unwrap();
+    let trace = daemon.requests("0199a1b2-c3d4-7e5f").unwrap();
+    assert_eq!(trace["thread"], "0199a1b2-c3d4-7e5f");
+    let calls_before = log.lock().unwrap().len();
+    assert!(
+        daemon.requests("../status").is_err(),
+        "a thread id that is not plain never reaches the URL"
+    );
+    assert_eq!(log.lock().unwrap().len(), calls_before);
     let err = daemon.set_settings(&json!({ "bad": 1 })).unwrap_err();
     assert!(
         format!("{err:#}").contains("answered 400: invalid type"),
@@ -966,6 +1030,7 @@ fn ctrl_c_that_makes_a_setup_or_a_session_fail_is_an_interruption() {
     assert_eq!(worktrees(&repo), 1);
 
     // The agent dies of the same Ctrl-C and its runner reports an error.
+    clear(&work);
     let mut agent = FakeAgent::new(&daemon);
     agent.mode = Mode::Fail;
     let stop = || !agent.seen.borrow().is_empty();
@@ -1016,9 +1081,10 @@ fn ctrl_c_while_the_copy_is_indexed_removes_it_everywhere() {
     assert_eq!(state.settings, original_settings());
     drop(state);
     assert_eq!(worktrees(&repo), 1);
-    assert!(!work.exists());
+    only_results(&work);
 
     // A copy that is never ready: an error of that arm after the timeout, cleaned up the same way.
+    clear(&work);
     let agent = FakeAgent::new(&daemon);
     let mut opts = options(&work);
     opts.index_timeout = Duration::from_millis(20);
@@ -1086,11 +1152,18 @@ fn the_json_report_has_the_same_keys_for_every_session() {
             "base",
             "compared",
             "errored",
+            "geo_mean_ratio",
             "interrupted",
+            "interval",
             "mean_change",
+            "mean_change_billed",
             "median_change",
+            "median_change_billed",
+            "noisy",
             "not_proxied",
             "note",
+            "per_arm",
+            "resumed",
             "runs",
             "settings_restored",
             "success_off",
@@ -1098,7 +1171,11 @@ fn the_json_report_has_the_same_keys_for_every_session() {
             "target_change",
             "tasks",
             "unmeasured",
-            "verdict"
+            "variant",
+            "verdict",
+            "verdict_billed",
+            "weights",
+            "work_dir"
         ]
     );
     let runs = value["runs"].as_array().unwrap();
@@ -1112,6 +1189,10 @@ fn the_json_report_has_the_same_keys_for_every_session() {
         "input_tokens",
         "cached_input_tokens",
         "reasoning_tokens",
+        "thread",
+        "trace",
+        "started_at",
+        "ended_at",
     ] {
         assert!(first.iter().any(|f| f == k), "{k} in {first:?}");
     }
@@ -1260,6 +1341,7 @@ fn copies_are_made_from_the_base_commit_resolved_once() {
     assert!(render(&report).contains(&format!("base commit: {first}\n")));
 
     // Default: HEAD when the run starts, kept while the branch moves.
+    clear(&work);
     let agent = {
         let mut a = FakeAgent::new(&daemon);
         a.move_branch = Some(repo.clone());
@@ -1355,6 +1437,7 @@ fn the_prompt_note_is_the_default_the_files_or_none() {
     assert_eq!(report.note.as_deref(), Some("Stay offline."));
     assert!(render(&report).contains("note appended to every prompt: Stay offline.\n"));
 
+    clear(&work);
     let agent = FakeAgent::new(&daemon);
     opts.note = None;
     let report = run_ab(&repo, &[task("one", "true")], &opts, &env(&daemon, &agent, &never)).unwrap();
@@ -1387,6 +1470,7 @@ fn sessions_use_approve_for_me_in_place_of_the_sandbox_when_the_agent_has_it() {
     assert!(render(&report).contains("sessions ran with --approve-for-me"));
 
     // --no-approve-for-me: the sandbox as before, and the agent is not asked.
+    clear(&work);
     let mut agent = FakeAgent::new(&daemon);
     agent.approve_for_me = true;
     let mut opts = options(&work);
@@ -1401,6 +1485,7 @@ fn sessions_use_approve_for_me_in_place_of_the_sandbox_when_the_agent_has_it() {
     assert!(!render(&report).contains("--approve-for-me"));
 
     // Another sandbox is not the one the flag selects: kept as asked.
+    clear(&work);
     let mut agent = FakeAgent::new(&daemon);
     agent.approve_for_me = true;
     let mut opts = options(&work);
@@ -1489,4 +1574,607 @@ fn the_log_says_when_the_agent_has_no_approve_for_me() {
     let said = lines.borrow().join("\n");
     assert!(said.contains("has no --approve-for-me"), "{said}");
     assert!(said.contains(&format!("copies of commit {}", report.base)), "{said}");
+}
+
+// ---- v0.0.2: variants, preflight, resume, traces, billed tokens, noise ---------
+
+#[test]
+fn a_variant_run_writes_the_variants_text_into_one_arm_only() {
+    use lge_bench::agents::{AGENTS_BLOCK, AGENTS_BLOCK_BATCH, BATCH_LINE, TERSE_SECTION};
+    let (_dir, repo, work) = repository();
+    // The commit has its own AGENTS.md, with an lge block that has the batch line.
+    std::fs::write(repo.join("AGENTS.md"), format!("# Rules\n\n{AGENTS_BLOCK_BATCH}")).unwrap();
+    git(&repo, &["add", "AGENTS.md"]);
+    git(&repo, &["commit", "-q", "-m", "agents"]);
+    let daemon = FakeDaemon::new();
+    for (variant, off_text, on_text) in [
+        (
+            Variant::Terse,
+            format!("# Rules\n\n{AGENTS_BLOCK}"),
+            format!("# Rules\n\n{}\n\n{TERSE_SECTION}", AGENTS_BLOCK.trim_end()),
+        ),
+        (
+            Variant::Batch,
+            format!("# Rules\n\n{AGENTS_BLOCK}"),
+            format!("# Rules\n\n{AGENTS_BLOCK_BATCH}"),
+        ),
+    ] {
+        clear(&work);
+        let agent = FakeAgent::new(&daemon);
+        let mut opts = options(&work);
+        opts.variant = variant;
+        let sets_before = daemon.state().sets.len();
+        let report = run_ab(
+            &repo,
+            &[task("one", "test -f done.txt"), task("two", "test -f done.txt")],
+            &opts,
+            &env(&daemon, &agent, &never),
+        )
+        .unwrap();
+        assert_eq!(report.variant, variant);
+        let seen = agent.seen();
+        assert_eq!(seen.len(), 4);
+        for (run, s) in report.runs.iter().zip(&seen) {
+            let want = if run.arm == Arm::On { &on_text } else { &off_text };
+            assert_eq!(s.agents_md.as_ref(), Some(want), "{variant} {:?}", run.arm);
+            // The user's settings in both arms (graph context on here), with
+            // no holdout; the copy is indexed in both, since both use the graph.
+            assert_eq!(s.settings["inject_context"], true);
+            assert_eq!(s.settings["holdout_share"], 0.0);
+            assert!(s.registered, "{s:?}");
+        }
+        assert!(!off_text.contains(BATCH_LINE.trim_end()));
+        let sets = daemon.state().sets[sets_before..].to_vec();
+        assert!(
+            sets[..4].windows(2).all(|w| w[0] == w[1]),
+            "both arms get the same settings"
+        );
+        assert!(render(&report).contains(&format!("variant: {variant}:")));
+        assert_eq!(serde_json::to_value(&report).unwrap()["variant"], variant.as_str());
+        // The user's checkout is untouched.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            format!("# Rules\n\n{AGENTS_BLOCK_BATCH}")
+        );
+    }
+}
+
+#[test]
+fn the_report_has_requests_output_and_reasoning_per_arm() {
+    let run = |task: &str, n: usize, arm: Arm, total: i64, requests: u64, output: i64, reasoning: i64| ArmRun {
+        requests: Some(requests),
+        usage: TokenUsage {
+            input_tokens: total - output,
+            cached_input_tokens: (total - output) / 2,
+            reasoning_tokens: reasoning,
+            output_tokens: output,
+        },
+        ..result(task, n, arm, total, true)
+    };
+    let runs = vec![
+        run("a", 1, Arm::Off, 10_000, 20, 1_000, 400),
+        run("a", 1, Arm::On, 8_000, 14, 800, 300),
+        run("b", 1, Arm::On, 5_000, 9, 500, 200),
+        run("b", 1, Arm::Off, 6_000, 12, 600, 250),
+    ];
+    let r = summarize(&names(&["a", "b"]), runs);
+    assert_eq!(r.tasks[0].off.median_requests, Some(20.0));
+    assert_eq!(r.tasks[0].on.median_output, Some(800.0));
+    assert_eq!(r.tasks[1].off.median_reasoning, Some(250.0));
+    assert_eq!(r.per_arm.off.sessions, 2);
+    assert_eq!(r.per_arm.off.median_requests, Some(16.0));
+    assert_eq!(r.per_arm.on.median_requests, Some(11.5));
+    assert_eq!(r.per_arm.on.median_output, Some(650.0));
+    assert_eq!(r.per_arm.on.median_reasoning, Some(250.0));
+    // Output already holds reasoning: the total is input plus output, nothing more.
+    assert_eq!(r.per_arm.off.median_total, Some(8_000.0));
+    let table = render(&r);
+    assert!(table.contains("per arm, medians"), "{table}");
+    let line = table.lines().find(|l| l.starts_with("on ")).unwrap();
+    assert!(line.contains("11.5") || line.contains(" 12 "), "{line}");
+    assert!(line.contains("650") && line.contains("250"), "{line}");
+}
+
+#[test]
+fn billed_equivalent_tokens_get_their_own_change_and_a_second_reading() {
+    assert_eq!(Weights::parse("1,0.1,8").unwrap(), DEFAULT_WEIGHTS);
+    assert_eq!(
+        Weights::parse(" 2 , 0.5 , 10 ").unwrap(),
+        Weights {
+            input: 2.0,
+            cached: 0.5,
+            output: 10.0
+        }
+    );
+    for bad in ["", "1,2", "1,2,3,4", "a,b,c", "-1,0,1", "0,0,0", "1,NaN,1"] {
+        assert!(Weights::parse(bad).is_err(), "{bad}");
+    }
+    let u = TokenUsage {
+        input_tokens: 10_000,
+        cached_input_tokens: 9_000,
+        reasoning_tokens: 300,
+        output_tokens: 500,
+    };
+    // 1,000 uncached + 9,000 x 0.1 + 500 x 8 (reasoning is part of output).
+    assert_eq!(DEFAULT_WEIGHTS.billed(&u), 1_000.0 + 900.0 + 4_000.0);
+
+    // Fewer cached tokens but much more output: total tokens fall, billed rise.
+    let with = |task: &str, arm: Arm, input: i64, cached: i64, output: i64| ArmRun {
+        usage: TokenUsage {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            reasoning_tokens: 0,
+            output_tokens: output,
+        },
+        ..result(task, 1, arm, input + output, true)
+    };
+    let runs = vec![
+        with("a", Arm::Off, 100_000, 90_000, 1_000),
+        with("a", Arm::On, 60_000, 54_000, 3_000),
+    ];
+    let r = summarize(&names(&["a"]), runs);
+    assert!(r.median_change.unwrap() < -0.3, "{:?}", r.median_change);
+    // off: 10,000 + 9,000 + 8,000 = 27,000; on: 6,000 + 5,400 + 24,000 = 35,400.
+    let billed = r.median_change_billed.unwrap();
+    assert!((billed - (35_400.0 - 27_000.0) / 27_000.0).abs() < 1e-9, "{billed}");
+    assert_eq!(r.verdict.met, Some(true), "the verdict stays on total tokens");
+    assert_eq!(r.verdict_billed.met, Some(false));
+    assert!(r.verdict_billed.text.contains("billed-equivalent tokens"));
+    let table = render(&r);
+    assert!(
+        table.contains("billed-equivalent tokens (uncached input x1, cached input x0.1, output x8): median +31.1%"),
+        "{table}"
+    );
+    assert!(
+        table.contains("second reading, on billed-equivalent tokens (not the verdict): target not met"),
+        "{table}"
+    );
+    assert!(table.contains("\nverdict: target met"), "{table}");
+    let custom = summarize_with(&names(&["a"]), r.runs.clone(), Weights::parse("1,1,1").unwrap());
+    assert_eq!(custom.median_change_billed, custom.median_change);
+}
+
+#[test]
+fn noisy_arms_are_marked_and_the_geometric_mean_is_reported() {
+    let runs = vec![
+        result("a", 1, Arm::Off, 1_000, true),
+        result("a", 1, Arm::On, 1_000, true),
+        result("a", 2, Arm::On, 2_000, true),
+        result("a", 2, Arm::Off, 1_400, true),
+        result("b", 1, Arm::Off, 4_000, true),
+        result("b", 1, Arm::On, 2_000, true),
+        result("b", 2, Arm::On, 2_000, true),
+        result("b", 2, Arm::Off, 4_000, true),
+    ];
+    let r = summarize(&names(&["a", "b"]), runs);
+    assert_eq!(r.tasks[0].on.spread, Some(2.0));
+    assert!(r.tasks[0].on.noisy);
+    assert!(!r.tasks[0].off.noisy, "1.4x is within {NOISE_SPREAD}x");
+    assert_eq!(r.tasks[1].off.spread, Some(1.0));
+    assert_eq!(r.noisy, 1);
+    // a: 1,500 / 1,200 = 1.25; b: 2,000 / 4,000 = 0.5; geometric mean sqrt(0.625).
+    let g = r.geo_mean_ratio.unwrap();
+    assert!((g - 0.625f64.sqrt()).abs() < 1e-9, "{g}");
+    let table = render(&r);
+    assert!(
+        table.contains("noisy: a with lge on: total tokens of its passing runs differ 2.0x"),
+        "{table}"
+    );
+    assert!(
+        table.contains("geometric mean of the tasks' on/off ratios: 0.791 (-20.9%)"),
+        "{table}"
+    );
+    assert!(
+        table.lines().any(|l| l.starts_with("a ") && l.ends_with("on 2.0x")),
+        "{table}"
+    );
+    // One passing run: no spread, never noisy.
+    let r = summarize(
+        &names(&["a"]),
+        vec![
+            result("a", 1, Arm::Off, 1_000, true),
+            result("a", 1, Arm::On, 9_000, true),
+        ],
+    );
+    assert_eq!((r.tasks[0].on.spread, r.noisy), (None, 0));
+}
+
+/// Totals for a task: `runs` values around `base` (within 10%), times `factor`.
+fn synthetic(base: f64, factor: f64, runs: usize, seed: u64) -> Vec<f64> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..runs)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let noise = 0.9 + 0.2 * ((x >> 11) as f64 / (1u64 << 53) as f64);
+            base * factor * noise
+        })
+        .collect()
+}
+
+#[test]
+fn the_clustered_bootstrap_is_deterministic_and_brackets_the_true_difference() {
+    // Six tasks of very different sizes, three runs per arm; lge on costs 20% less.
+    let clusters: Vec<(Vec<f64>, Vec<f64>)> = [40_000.0, 150_000.0, 600_000.0, 900_000.0, 1_500_000.0, 3_000_000.0]
+        .iter()
+        .enumerate()
+        .map(|(i, &base)| {
+            (
+                synthetic(base, 1.0, 3, 2 * i as u64 + 1),
+                synthetic(base, 0.8, 3, 2 * i as u64 + 2),
+            )
+        })
+        .collect();
+    let first = clustered_interval(&clusters, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED).unwrap();
+    assert_eq!(
+        Some(first),
+        clustered_interval(&clusters, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED),
+        "same results, same interval"
+    );
+    let (low, high) = first;
+    assert!(low < -0.2 && -0.2 < high, "{first:?}");
+    assert!(high - low < 0.3, "{first:?}");
+    assert!(clustered_interval(&[], 100, 1).is_none());
+
+    // Through the report: only with two or more tasks over two or more runs.
+    let mut runs = Vec::new();
+    for (t, (off, on)) in clusters.iter().enumerate() {
+        for k in 0..3 {
+            let name = format!("t{t}");
+            runs.push(result(&name, k + 1, Arm::Off, off[k] as i64, true));
+            runs.push(result(&name, k + 1, Arm::On, on[k] as i64, true));
+        }
+    }
+    let task_names: Vec<String> = (0..6).map(|t| format!("t{t}")).collect();
+    let r = summarize(&task_names, runs.clone());
+    let i = r.interval.unwrap();
+    assert_eq!((i.resamples, i.seed), (BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED));
+    assert!(
+        i.low <= r.median_change.unwrap() && r.median_change.unwrap() <= i.high,
+        "{r:#?}"
+    );
+    assert!(render(&r).contains("95% interval of the median change"));
+    let one_run: Vec<ArmRun> = runs.iter().filter(|r| r.run == 1).cloned().collect();
+    assert_eq!(summarize(&task_names, one_run).interval, None);
+    let one_task: Vec<ArmRun> = runs.iter().filter(|r| r.task == "t0").cloned().collect();
+    assert_eq!(summarize(&task_names, one_task).interval, None);
+}
+
+fn preflight_options(work: &Path) -> AbOptions {
+    let mut o = options(work);
+    o.preflight = true;
+    o
+}
+
+#[test]
+fn the_preflight_stops_the_run_before_any_session_and_names_each_bad_task() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let tasks = [
+        task("good", "test -f done.txt"),
+        task("done-already", "true"),
+        task("missing-tool", "nosuch_tool_for_lge_ab --fast"),
+        task("bad-quoting", "python -m pytest 'tests/order flow"),
+        AbTask {
+            setup: Some("echo cannot install >&2; exit 3".to_string()),
+            ..task("broken-setup", "test -f done.txt")
+        },
+        task("not-executable", "./README.md"),
+    ];
+    let err = run_ab(&repo, &tasks, &preflight_options(&work), &env(&daemon, &agent, &never)).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("5 task(s) cannot be measured, so no session was started"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- done-already: the check passes on the base commit"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- missing-tool: the shell could not run the check (exit 127)"),
+        "{text}"
+    );
+    assert!(text.contains("command not found"), "{text}");
+    assert!(
+        text.contains("- bad-quoting: the shell could not run the check (exit 2)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- broken-setup: the setup failed (exit 3): cannot install"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- not-executable: the check could not run (exit 126"),
+        "{text}"
+    );
+    assert!(!text.contains("- good:"), "{text}");
+    assert!(text.contains("--no-preflight"), "{text}");
+    assert!(agent.seen().is_empty(), "no session");
+    assert!(daemon.state().sets.is_empty(), "the daemon was not touched");
+    assert_eq!(worktrees(&repo), 1, "the preflight copies are gone");
+    assert!(!work.exists(), "the folder the run made is removed");
+}
+
+#[test]
+fn a_task_whose_check_fails_on_the_base_passes_the_preflight_and_runs() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let lines = RefCell::new(Vec::<String>::new());
+    let log = |m: &str| lines.borrow_mut().push(m.to_string());
+    let env = AbEnv {
+        daemon: &daemon,
+        runner: &agent,
+        stop: &never,
+        log: &log,
+    };
+    let report = run_ab(
+        &repo,
+        &[task("good", "test -f done.txt")],
+        &preflight_options(&work),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(report.runs.len(), 2);
+    assert!(report.runs.iter().all(|r| r.success));
+    let said = lines.borrow().join("\n");
+    assert!(said.contains("preflight: good"), "{said}");
+    assert!(said.contains("fails on the base commit, as it should"), "{said}");
+    assert!(agent.seen().iter().all(|s| s.setup_ran));
+    assert_eq!(worktrees(&repo), 1);
+}
+
+#[test]
+fn preflight_only_needs_neither_daemon_nor_agent() {
+    let (_dir, repo, work) = repository();
+    let tasks = [task("good", "test -f done.txt"), task("done-already", "true")];
+    let checked = run_preflight(&repo, &tasks, &preflight_options(&work), &never, &quiet).unwrap();
+    assert!(!checked.ok());
+    assert_eq!(checked.rows.len(), 2);
+    assert_eq!(
+        (checked.rows[0].setup.as_str(), checked.rows[0].check.as_str()),
+        ("ok", "exit 1")
+    );
+    assert_eq!(checked.rows[0].problem, None);
+    assert!(checked.rows[1].problem.is_some());
+    let table = checked.render();
+    assert!(table.contains("preflight on base commit"), "{table}");
+    assert!(table.contains("fails as expected"), "{table}");
+    assert!(table.contains("the check passes on the base commit"), "{table}");
+    assert_eq!(worktrees(&repo), 1);
+    assert!(!work.exists());
+    // Ctrl-C during it: an error, and the copies are still removed.
+    let stop = || true;
+    assert!(run_preflight(&repo, &tasks, &preflight_options(&work), &stop, &quiet).is_err());
+    assert_eq!(worktrees(&repo), 1);
+}
+
+fn result_lines(work: &Path) -> Vec<Value> {
+    std::fs::read_to_string(work.join(RESULTS_FILE))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn every_session_is_appended_to_the_results_and_a_resume_runs_only_what_is_missing() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let tasks = [task("one", "test -f done.txt"), task("two", "test -f done.txt")];
+    let mut opts = options(&work);
+    opts.runs = 2;
+    opts.tasks_hash = "hash-1".to_string();
+    opts.model = Some("gpt-test".to_string());
+    // Ctrl-C while the third session runs.
+    let agent = FakeAgent::new(&daemon);
+    let stop = || agent.seen.borrow().len() >= 3;
+    let report = run_ab(&repo, &tasks, &opts, &env(&daemon, &agent, &stop)).unwrap();
+    assert!(report.interrupted);
+    assert_eq!(report.runs.len(), 3);
+    // Ctrl-C left a valid file: one line per session, the cut one marked.
+    let lines = result_lines(&work);
+    assert_eq!(lines.len(), 3);
+    for (line, run) in lines.iter().zip(&report.runs) {
+        assert_eq!(line["task"], run.task.as_str());
+        assert_eq!(line["arm"], run.arm.as_str());
+        assert_eq!(line["base"], report.base.as_str());
+        assert_eq!(line["tasks_hash"], "hash-1");
+        assert_eq!(line["model"], "gpt-test");
+        assert_eq!(line["sandbox"], "workspace-write");
+        assert_eq!(line["approve_for_me"], false);
+        assert_eq!(line["variant"], "features");
+        assert_eq!(line["note"], DEFAULT_NOTE);
+        assert!(line["started_at"].as_i64().unwrap() > 0);
+        assert!(line["ended_at"].as_i64().unwrap() >= line["started_at"].as_i64().unwrap());
+        assert!(line["total_tokens"].is_i64() && line["success"].is_boolean());
+    }
+    assert_eq!(lines[2]["interrupted"], true);
+
+    // A fresh run in the same folder would mix two runs: refused.
+    let agent = FakeAgent::new(&daemon);
+    let err = run_ab(&repo, &tasks, &opts, &env(&daemon, &agent, &never)).unwrap_err();
+    assert!(format!("{err:#}").contains("--resume"), "{err:#}");
+    assert!(agent.seen().is_empty());
+
+    // Resume: the two finished sessions are not run again; the cut one is.
+    // A line cut by a second Ctrl-C is skipped.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(work.join(RESULTS_FILE))
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"{\"task\":\"one\",\"ru").unwrap();
+    drop(file);
+    opts.resume = true;
+    let agent = FakeAgent::new(&daemon);
+    let report = run_ab(&repo, &tasks, &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert_eq!(agent.seen().len(), 6, "8 sessions in all, 2 already finished");
+    assert!(!report.interrupted);
+    assert_eq!(report.resumed, 2);
+    assert_eq!(report.runs.len(), 8, "the report covers every session once");
+    let mut keys: Vec<(String, usize, Arm)> = report.runs.iter().map(|r| (r.task.clone(), r.run, r.arm)).collect();
+    keys.sort_by(|a, b| (a.0.as_str(), a.1, a.2.as_str()).cmp(&(b.0.as_str(), b.1, b.2.as_str())));
+    keys.dedup();
+    assert_eq!(keys.len(), 8);
+    assert!(report.runs.iter().all(|r| r.success && !r.interrupted), "{report:#?}");
+    assert_eq!(report.compared, 2);
+    assert!(render(&report).contains("resumed: 2 session(s)"));
+    assert_eq!(worktrees(&repo), 1);
+
+    // Everything finished: a resume runs nothing and reports the same.
+    let agent = FakeAgent::new(&daemon);
+    let again = run_ab(&repo, &tasks, &opts, &env(&daemon, &agent, &never)).unwrap();
+    assert!(agent.seen().is_empty());
+    assert_eq!(again.runs.len(), 8);
+    assert_eq!(again.median_change, report.median_change);
+}
+
+#[test]
+fn a_resume_refuses_results_of_another_base_task_file_or_model_unless_forced() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let tasks = [task("one", "test -f done.txt")];
+    let mut opts = options(&work);
+    opts.tasks_hash = "hash-1".to_string();
+    let agent = FakeAgent::new(&daemon);
+    run_ab(&repo, &tasks, &opts, &env(&daemon, &agent, &never)).unwrap();
+    opts.resume = true;
+    opts.runs = 2;
+
+    let refused = |opts: &AbOptions, why: &str| {
+        let agent = FakeAgent::new(&daemon);
+        let err = run_ab(&repo, &tasks, opts, &env(&daemon, &agent, &never)).unwrap_err();
+        assert!(format!("{err:#}").contains(why), "{err:#}");
+        assert!(agent.seen().is_empty());
+    };
+    let mut other = opts.clone();
+    other.tasks_hash = "hash-2".to_string();
+    refused(&other, "the task file changed");
+    let mut other = opts.clone();
+    other.model = Some("another".to_string());
+    refused(&other, "used model the agent's default, this run uses `another`");
+    let mut other = opts.clone();
+    other.variant = Variant::Terse;
+    refused(&other, "variant `features`");
+    let first = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    second_commit(&repo);
+    refused(&opts, &format!("pass --base {first}"));
+
+    // --force mixes them; with the old base given, a resume adds the second run.
+    let mut forced = opts.clone();
+    forced.base = first.clone();
+    let agent = FakeAgent::new(&daemon);
+    let report = run_ab(&repo, &tasks, &forced, &env(&daemon, &agent, &never)).unwrap();
+    assert_eq!(agent.seen().len(), 2, "run 2 only");
+    assert_eq!(report.runs.len(), 4);
+    forced.base = "HEAD".to_string();
+    forced.force = true;
+    forced.runs = 3;
+    let agent = FakeAgent::new(&daemon);
+    let report = run_ab(&repo, &tasks, &forced, &env(&daemon, &agent, &never)).unwrap();
+    assert_eq!(agent.seen().len(), 2, "run 3 only");
+    assert_eq!(report.runs.len(), 6);
+    // A resume needs the folder.
+    let mut missing = opts.clone();
+    missing.work_dir = work.join("nope");
+    let agent = FakeAgent::new(&daemon);
+    let err = run_ab(&repo, &tasks, &missing, &env(&daemon, &agent, &never)).unwrap_err();
+    assert!(format!("{err:#}").contains("nothing to resume"), "{err:#}");
+}
+
+#[test]
+fn tasks_whose_names_give_the_same_slug_keep_their_own_traces() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    daemon.state().traces = true;
+    let agent = FakeAgent::new(&daemon);
+    run_ab(
+        &repo,
+        &[task("a b", "test -f done.txt"), task("a-b", "test -f done.txt")],
+        &options(&work),
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    let mut files: Vec<String> = std::fs::read_dir(work.join(TRACES_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "01-a-b-1-off.json",
+            "01-a-b-1-on.json",
+            "02-a-b-1-off.json",
+            "02-a-b-1-on.json"
+        ]
+    );
+}
+
+#[test]
+fn each_sessions_trace_is_saved_and_reported() {
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    daemon.state().traces = true;
+    let agent = FakeAgent::new(&daemon);
+    let report = run_ab(
+        &repo,
+        &[task("Fix the parser!", "test -f done.txt")],
+        &options(&work),
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert_eq!(daemon.state().traced, ["t-off", "t-on"]);
+    for run in &report.runs {
+        assert_eq!(run.thread, format!("t-{}", run.arm));
+        let file = work
+            .join(TRACES_DIR)
+            .join(format!("01-fix-the-parser-1-{}.json", run.arm));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(saved["thread"], run.thread.as_str());
+        let t = run.trace.as_ref().unwrap();
+        assert_eq!((t.requests, t.measured), (2, 2));
+        assert_eq!((t.mean_context, t.max_context), (Some(6_000.0), Some(8_000)));
+        assert_eq!(t.largest_outputs.len(), 2);
+    }
+    let on = report.runs.iter().find(|r| r.arm == Arm::On).unwrap();
+    let top = &on.trace.as_ref().unwrap().largest_outputs[0];
+    assert_eq!(
+        (top.command.as_str(), top.tokens, top.shortened),
+        ("cargo test", 2_000, true)
+    );
+    let table = render(&report);
+    assert!(
+        table.contains("context per request, from the daemon's traces"),
+        "{table}"
+    );
+    assert!(
+        table.contains("largest outputs: 9,000 tokens `cargo test`; 1,200 tokens `rg -n create_order`"),
+        "{table}"
+    );
+    assert!(
+        table.contains("2,000 tokens `cargo test` (shortened by lge)"),
+        "{table}"
+    );
+    // Saved with the results, and read back on a resume.
+    let lines = result_lines(&work);
+    assert_eq!(lines[0]["trace"]["requests"], 2);
+
+    // A daemon without traces: no trace, no file, and the run goes on.
+    let (_dir, repo, work) = repository();
+    let daemon = FakeDaemon::new();
+    let agent = FakeAgent::new(&daemon);
+    let report = run_ab(
+        &repo,
+        &[task("one", "true")],
+        &options(&work),
+        &env(&daemon, &agent, &never),
+    )
+    .unwrap();
+    assert!(report.runs.iter().all(|r| r.trace.is_none() && r.success));
+    assert!(!work.join(TRACES_DIR).exists());
+    assert!(!render(&report).contains("context per request"));
 }

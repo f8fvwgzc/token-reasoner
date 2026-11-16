@@ -16,10 +16,12 @@ macro_rules! sample {
 const FAILED: FilterOptions = FilterOptions {
     passed: Some(false),
     max_bytes: MAX_FILTERED_BYTES,
+    keep_warnings: false,
 };
 const PASSED: FilterOptions = FilterOptions {
     passed: Some(true),
     max_bytes: MAX_FILTERED_BYTES,
+    keep_warnings: false,
 };
 
 /// (tool, output of a failing run, the name of every failure the tool reports in it)
@@ -471,6 +473,7 @@ fn a_small_cap_is_respected_as_far_as_the_names_allow() {
         let opts = FilterOptions {
             passed: Some(false),
             max_bytes,
+            keep_warnings: false,
         };
         let (failures, text) = filter_with("pytest", &raw, &opts);
         assert_eq!(failures.len(), 20);

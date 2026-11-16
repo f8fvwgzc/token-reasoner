@@ -266,6 +266,177 @@ fn looks_like_uuid(s: &str) -> bool {
         })
 }
 
+/// One tool call or tool output a rollout file recorded (a `response_item`
+/// line). Read for replaying past sessions; nothing of it is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutItem {
+    /// The item's type: `function_call`, `function_call_output`,
+    /// `custom_tool_call`, `custom_tool_call_output`, `local_shell_call` or
+    /// `local_shell_call_output`.
+    pub kind: String,
+    pub call_id: String,
+    /// The tool's name, after its namespace when it has one other than Codex's
+    /// default (`mcp__server__` + `tool`), as Codex names the tool. Empty for
+    /// outputs.
+    pub name: String,
+    /// A function call's arguments (a JSON string); a local shell call's
+    /// action, as JSON.
+    pub arguments: String,
+    /// A custom tool call's input (a code-mode script, a patch).
+    pub input: String,
+    /// An output's text: the string, or the text of each `input_text` part in
+    /// order. Empty for calls.
+    pub outputs: Vec<String>,
+}
+
+/// Codex's namespace for its own tools (codex-rs/protocol/src/tool_name.rs).
+const DEFAULT_TOOL_NAMESPACE: &str = "functions";
+
+/// The tool calls and outputs of one rollout file, in file order. Other lines,
+/// lines that are not JSON and items of other types are skipped. The file is
+/// read line by line and invalid UTF-8 is replaced.
+pub fn rollout_items(path: &Path) -> Result<Vec<RolloutItem>> {
+    let mut items = Vec::new();
+    for_each_line(path, |v| {
+        if text(v, "type") != "response_item" {
+            return;
+        }
+        let p = &v["payload"];
+        let kind = text(p, "type");
+        let mut item = RolloutItem {
+            kind: kind.to_string(),
+            call_id: text(p, "call_id").to_string(),
+            ..RolloutItem::default()
+        };
+        match kind {
+            "function_call" | "custom_tool_call" => {
+                let namespace = text(p, "namespace");
+                item.name = if namespace.is_empty() || namespace == DEFAULT_TOOL_NAMESPACE {
+                    text(p, "name").to_string()
+                } else {
+                    format!("{namespace}{}", text(p, "name"))
+                };
+                item.arguments = text(p, "arguments").to_string();
+                item.input = text(p, "input").to_string();
+            }
+            "local_shell_call" => {
+                item.name = "local_shell".to_string();
+                item.arguments = p.get("action").map(Value::to_string).unwrap_or_default();
+            }
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
+                item.outputs = match &p["output"] {
+                    Value::String(s) => vec![s.clone()],
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter(|part| text(part, "type") == "input_text")
+                        .map(|part| text(part, "text").to_string())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+            }
+            _ => return,
+        }
+        items.push(item);
+    })?;
+    Ok(items)
+}
+
+/// Model requests a rollout file records: its `token_count` events that carry
+/// the usage of one response (`info.last_token_usage`). Events that only carry
+/// rate limits are not requests.
+pub fn rollout_requests(path: &Path) -> Result<u64> {
+    let mut n = 0;
+    for_each_line(path, |v| {
+        if text(v, "type") == "event_msg"
+            && text(&v["payload"], "type") == "token_count"
+            && v["payload"]["info"]["last_token_usage"].is_object()
+        {
+            n += 1;
+        }
+    })?;
+    Ok(n)
+}
+
+/// The folder a rollout file's session worked in: its `session_meta` line's
+/// `cwd`, else its first `turn_context` line's. `None` when neither is there
+/// or the file cannot be read.
+pub fn rollout_cwd(path: &Path) -> Option<String> {
+    let mut meta: Option<String> = None;
+    let mut turn: Option<String> = None;
+    for_each_line(path, |v| {
+        let cwd = text(&v["payload"], "cwd");
+        if cwd.is_empty() {
+            return;
+        }
+        match text(v, "type") {
+            "session_meta" if meta.is_none() => meta = Some(cwd.to_string()),
+            "turn_context" if turn.is_none() => turn = Some(cwd.to_string()),
+            _ => {}
+        }
+    })
+    .ok()?;
+    meta.or(turn)
+}
+
+fn for_each_line(path: &Path, mut each: impl FnMut(&Value)) -> Result<()> {
+    let file = fs::File::open(path).with_context(|| format!("open rollout file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader
+            .read_until(b'\n', &mut buf)
+            .with_context(|| format!("read rollout file {}", path.display()))?;
+        if read == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            each(&v);
+        }
+    }
+}
+
+/// The rollout files under the Codex home (`sessions` and
+/// `archived_sessions`) last written at or after `since_unix`, oldest name
+/// first. A file whose time cannot be read is left out.
+pub fn rollout_files(codex_home: &Path, since_unix: i64) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in ROLLOUT_DIRS {
+        collect_rollouts(&codex_home.join(dir), since_unix, 0, &mut found);
+    }
+    found.sort();
+    found
+}
+
+fn collect_rollouts(dir: &Path, since: i64, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > MAX_ROLLOUT_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollouts(&path, since, depth + 1, found);
+            continue;
+        }
+        let named = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        if named && modified.is_some_and(|m| m >= since) {
+            found.push(path);
+        }
+    }
+}
+
 /// The token readings of one thread.
 #[derive(Default)]
 struct ThreadUsage {
@@ -1002,5 +1173,95 @@ mod tests {
         );
         assert_eq!(codex_home_from(None, None), PathBuf::from(".codex"));
         assert!(codex_home().ends_with(".codex") || std::env::var_os("CODEX_HOME").is_some());
+    }
+
+    /// Function calls, custom tool calls (a code-mode script, a patch), a
+    /// namespaced MCP call, a local shell call and outputs as strings and as
+    /// part lists; ids and text are made up. The last line is cut.
+    const CALLS: &str = include_str!("../tests/fixtures/rollout_calls.jsonl");
+
+    #[test]
+    fn rollout_items_reads_calls_and_outputs_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(&path, CALLS).unwrap();
+        let items = rollout_items(&path).unwrap();
+        let kinds: Vec<(&str, &str, &str)> = items
+            .iter()
+            .map(|i| (i.kind.as_str(), i.call_id.as_str(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("function_call", "call_1", "exec_command"),
+                ("function_call_output", "call_1", ""),
+                ("custom_tool_call", "call_2", "exec"),
+                ("custom_tool_call_output", "call_2", ""),
+                ("function_call", "call_3", "mcp__docs__lookup"),
+                ("function_call_output", "call_3", ""),
+                ("custom_tool_call", "call_4", "apply_patch"),
+                ("custom_tool_call_output", "call_4", ""),
+                ("local_shell_call", "call_5", "local_shell"),
+                ("function_call_output", "call_5", ""),
+                ("function_call", "call_6", "shell"),
+                ("function_call_output", "call_6", ""),
+            ]
+        );
+        let args: Value = serde_json::from_str(&items[0].arguments).unwrap();
+        assert_eq!(args["cmd"], "pytest -q");
+        assert_eq!(
+            items[1].outputs,
+            ["Exit code: 0\nWall time: 1.2 seconds\nOutput:\n3 passed in 0.10s\n"]
+        );
+        assert!(items[2].input.contains("tools.exec_command"));
+        // Text parts only, in order; the image part is not text.
+        assert_eq!(
+            items[3].outputs,
+            [
+                "Script completed\nWall time 0.4 seconds\nOutput:\n",
+                "src/a.py:3:def helper():\n"
+            ]
+        );
+        assert_eq!(items[5].outputs, ["{\"hits\": 1}"]);
+        assert!(items[6].input.starts_with("*** Begin Patch"));
+        let action: Value = serde_json::from_str(&items[8].arguments).unwrap();
+        assert_eq!(action["command"][2], "git status --short");
+        assert!(items
+            .iter()
+            .filter(|i| i.kind.ends_with("_call"))
+            .all(|i| i.outputs.is_empty()));
+        assert_eq!(
+            rollout_requests(&path).unwrap(),
+            2,
+            "the rate-limit event is not a request"
+        );
+        assert!(rollout_items(&dir.path().join("missing.jsonl")).is_err());
+    }
+
+    #[test]
+    fn rollout_files_lists_recent_rollouts_in_both_folders() {
+        let home = tempfile::tempdir().unwrap();
+        let day = home.path().join("sessions/2026/01/03");
+        let archived = home.path().join("archived_sessions");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        let a = day.join(format!("rollout-2026-01-03T04-05-00-{ROLLOUT_ID}.jsonl"));
+        let b = archived.join(format!("rollout-2026-01-02T04-05-00-{EXEC_ID}.jsonl"));
+        fs::write(&a, CALLS).unwrap();
+        fs::write(&b, ROLLOUT).unwrap();
+        fs::write(day.join("notes.jsonl"), "").unwrap();
+        let found = rollout_files(home.path(), 0);
+        assert_eq!(found, {
+            let mut v = vec![a.clone(), b.clone()];
+            v.sort();
+            v
+        });
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        assert!(rollout_files(home.path(), future).is_empty(), "older than the window");
+        assert!(rollout_files(&home.path().join("nowhere"), 0).is_empty());
     }
 }

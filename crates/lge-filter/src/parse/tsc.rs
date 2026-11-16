@@ -1,7 +1,7 @@
 //! tsc: `file(line,col): error TS2322: message` when piped, and
 //! `file:line:col - error TS2322: message` followed by the source line with `--pretty`.
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -12,6 +12,9 @@ pattern!(GLOBAL, r"^error (TS\d+): (.*)$");
 pattern!(FOUND, r"^Found (\d+) errors?\b");
 // Under a diagnostic: indented elaboration and related locations, or the numbered source line.
 pattern!(DETAIL, r"^(?:\s+\S|\d+\s)");
+// The table of files tsc prints after `Found N errors in M files.`
+pattern!(TABLE_HEAD, r"^\s*Errors\s+Files\s*$");
+pattern!(TABLE_ROW, r"^\s+\d+\s+\S+:\d+\s*$");
 
 struct Open {
     file: String,
@@ -76,6 +79,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
         parsed.summary = Some(summary);
         parsed.reported = reported;
     }
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&FOUND], &[&TABLE_HEAD, &TABLE_ROW]);
     parsed
 }
 

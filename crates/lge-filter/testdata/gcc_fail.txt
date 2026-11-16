@@ -1,0 +1,9 @@
+src/main.c: In function 'main':
+src/main.c:7:20: error: 'totl' undeclared (first use in this function); did you mean 'total'?
+    7 |     printf("%d\n", totl);
+      |                    ^~~~
+      |                    total
+src/main.c:7:20: note: each undeclared identifier is reported only once for each function it appears in
+src/main.c:5:9: warning: unused variable 'unused' [-Wunused-variable]
+    5 |     int unused = 3;
+      |         ^~~~~~

@@ -8,7 +8,8 @@ use lge_core::{HandoffNote, UsageRecord};
 
 const USAGE_COLS: &str = "u.id, u.task_id, u.task, u.attempt, u.level, u.reason, u.runner, u.model, u.session_id, \
      u.started_at, u.finished_at, u.input_tokens, u.cached_input_tokens, u.reasoning_tokens, u.output_tokens, \
-     u.pack_tokens, u.outcome, u.escalated, u.files, u.services, u.recommended_level, u.mode";
+     u.pack_tokens, u.outcome, u.escalated, u.files, u.services, u.recommended_level, u.mode, u.rule_stats, u.monitor, \
+     u.removed_tokens_sent, u.added_tokens_sent";
 
 /// Insert or replace a usage record by id.
 pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
@@ -20,7 +21,8 @@ pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
          u.cached_input_tokens = $cached_input_tokens, u.reasoning_tokens = $reasoning_tokens, \
          u.output_tokens = $output_tokens, u.pack_tokens = $pack_tokens, u.outcome = $outcome, \
          u.escalated = $escalated, u.files = $files, u.services = $services, \
-         u.recommended_level = $recommended_level, u.mode = $mode;",
+         u.recommended_level = $recommended_level, u.mode = $mode, u.rule_stats = $rule_stats, \
+         u.monitor = $monitor, u.removed_tokens_sent = $removed_tokens_sent, u.added_tokens_sent = $added_tokens_sent;",
         vec![
             ("id", st(&rec.id)),
             ("task_id", st(&rec.task_id)),
@@ -44,9 +46,46 @@ pub(crate) fn put_usage(conn: &Connection, rec: &UsageRecord) -> Result<()> {
             ("services", strings(&rec.services)),
             ("recommended_level", st(&rec.recommended_level)),
             ("mode", st(&rec.mode)),
+            ("rule_stats", st(&rec.rule_stats)),
+            ("monitor", st(&rec.monitor)),
+            ("removed_tokens_sent", int(rec.removed_tokens_sent)),
+            ("added_tokens_sent", int(rec.added_tokens_sent)),
         ],
     )?;
     Ok(())
+}
+
+/// A usage record as read back. A column added after the row was written
+/// reads as its default (empty, or zero).
+fn usage_of_row(r: &[Value]) -> UsageRecord {
+    UsageRecord {
+        id: col_s(r, 0),
+        task_id: col_s(r, 1),
+        task: col_s(r, 2),
+        attempt: col_i(r, 3),
+        level: col_s(r, 4),
+        reason: col_s(r, 5),
+        runner: col_s(r, 6),
+        model: col_s(r, 7),
+        session_id: col_s(r, 8),
+        started_at: col_i(r, 9),
+        finished_at: col_i(r, 10),
+        input_tokens: col_i(r, 11),
+        cached_input_tokens: col_i(r, 12),
+        reasoning_tokens: col_i(r, 13),
+        output_tokens: col_i(r, 14),
+        pack_tokens: col_i(r, 15),
+        outcome: col_s(r, 16),
+        escalated: col_b(r, 17),
+        files: col_list(r, 18),
+        services: col_list(r, 19),
+        recommended_level: col_s(r, 20),
+        mode: col_s(r, 21),
+        rule_stats: col_s(r, 22),
+        monitor: col_s(r, 23),
+        removed_tokens_sent: col_i(r, 24),
+        added_tokens_sent: col_i(r, 25),
+    }
 }
 
 /// Usage records with `started_at >= since`, oldest first. The attempts of
@@ -57,34 +96,14 @@ pub(crate) fn list_usage(conn: &Connection, since: i64) -> Result<Vec<UsageRecor
          RETURN {USAGE_COLS} ORDER BY u.started_at, u.task_id, u.attempt, u.id;"
     );
     let found = rows(conn, &q, vec![("since", int(since))])?;
-    Ok(found
-        .iter()
-        .map(|r| UsageRecord {
-            id: col_s(r, 0),
-            task_id: col_s(r, 1),
-            task: col_s(r, 2),
-            attempt: col_i(r, 3),
-            level: col_s(r, 4),
-            reason: col_s(r, 5),
-            runner: col_s(r, 6),
-            model: col_s(r, 7),
-            session_id: col_s(r, 8),
-            started_at: col_i(r, 9),
-            finished_at: col_i(r, 10),
-            input_tokens: col_i(r, 11),
-            cached_input_tokens: col_i(r, 12),
-            reasoning_tokens: col_i(r, 13),
-            output_tokens: col_i(r, 14),
-            pack_tokens: col_i(r, 15),
-            outcome: col_s(r, 16),
-            escalated: col_b(r, 17),
-            files: col_list(r, 18),
-            services: col_list(r, 19),
-            // Empty on a record written before the columns existed.
-            recommended_level: col_s(r, 20),
-            mode: col_s(r, 21),
-        })
-        .collect())
+    Ok(found.iter().map(|r| usage_of_row(r)).collect())
+}
+
+/// The usage record with this id, if there is one.
+pub(crate) fn get_usage(conn: &Connection, id: &str) -> Result<Option<UsageRecord>> {
+    let q = format!("MATCH (u:UsageRecord) WHERE u.id = $id RETURN {USAGE_COLS};");
+    let found = rows(conn, &q, vec![("id", st(id))])?;
+    Ok(found.first().map(|r| usage_of_row(r)))
 }
 
 /// Insert or replace a handoff note by id.

@@ -153,6 +153,10 @@ fn v2_usage_and_note() -> (UsageRecord, HandoffNote) {
         // Version 2 did not record these: they read back empty.
         recommended_level: String::new(),
         mode: String::new(),
+        rule_stats: String::new(),
+        monitor: String::new(),
+        removed_tokens_sent: 0,
+        added_tokens_sent: 0,
     };
     let note = HandoffNote {
         id: "n1".to_string(),
@@ -506,7 +510,8 @@ fn a_version_2_database_is_migrated() {
     // The tables have the columns of version 3, and the new tables are there.
     for query in [
         "MATCH (s:Symbol) RETURN s.body, s.search_text, s.rank, s.community, s.degree, s.embedding;",
-        "MATCH (u:UsageRecord) RETURN u.recommended_level, u.mode;",
+        "MATCH (u:UsageRecord) RETURN u.recommended_level, u.mode, u.rule_stats, u.monitor, \
+         u.removed_tokens_sent, u.added_tokens_sent;",
         "MATCH (m:Memory) RETURN m.id, m.kind, m.text, m.key, m.tags, m.tags_text, m.source, m.created_at, \
          m.valid_at, m.invalid_at, m.expired_at, m.proof_count, m.links, m.signals, m.embedding;",
         "MATCH (p:Page) RETURN p.slug, p.id, p.title, p.body, p.tags, p.kind, p.updated_at, p.last_memory_seen_at;",
@@ -717,4 +722,49 @@ fn version_2_usage_and_notes_survive_with_empty_new_fields() {
     };
     store.put_usage(&routed).unwrap();
     assert_eq!(store.list_usage(0).unwrap(), vec![routed]);
+}
+
+/// The usage table of version 3 as lge 0.0.1 created it: without the proxy's
+/// rule counts, monitor and annuity columns.
+const V3_001_USAGE: &[&str] = &[
+    "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key));",
+    "CREATE NODE TABLE IF NOT EXISTS UsageRecord(id STRING, task_id STRING, task STRING, attempt INT64, level STRING, reason STRING, runner STRING, model STRING, session_id STRING, started_at INT64, finished_at INT64, input_tokens INT64, cached_input_tokens INT64, reasoning_tokens INT64, output_tokens INT64, pack_tokens INT64, outcome STRING, escalated BOOLEAN, files STRING[], services STRING[], recommended_level STRING DEFAULT '', mode STRING DEFAULT '', PRIMARY KEY(id));",
+    "CREATE (:UsageRecord {id:'p1', task_id:'conv-1', task:'fix the tasks endpoint', attempt:1, level:'top', reason:'', runner:'codex', model:'gpt-5-codex', session_id:'conv-1', started_at:2000, finished_at:2090, input_tokens:5000, cached_input_tokens:4000, reasoning_tokens:100, output_tokens:300, pack_tokens:0, outcome:'unknown', escalated:false, files:[], services:[], recommended_level:'top', mode:'proxy'});",
+];
+
+#[test]
+fn a_version_3_usage_table_gains_the_proxy_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.lbug");
+    create_database(&path, &[V3_001_USAGE], Some("3"), false);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(stored_version(&store), vec!["3"]);
+    // The row written before reads the defaults of the new columns.
+    let old = store.get_usage("p1").unwrap().expect("the record is kept");
+    assert_eq!(
+        (
+            old.mode.as_str(),
+            old.input_tokens,
+            old.rule_stats.as_str(),
+            old.monitor.as_str(),
+            old.removed_tokens_sent,
+            old.added_tokens_sent
+        ),
+        ("proxy", 5000, "", "", 0, 0)
+    );
+    assert_eq!(store.list_usage(0).unwrap(), vec![old.clone()]);
+    // And takes them like any other.
+    let counted = UsageRecord {
+        rule_stats: r#"{"by_rule":{"check":{"items":2}}}"#.to_string(),
+        monitor: r#"{"raw_retries":1}"#.to_string(),
+        removed_tokens_sent: 1234,
+        added_tokens_sent: 56,
+        ..old
+    };
+    store.put_usage(&counted).unwrap();
+    assert_eq!(store.get_usage("p1").unwrap(), Some(counted.clone()));
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.list_usage(0).unwrap(), vec![counted]);
+    assert_eq!(store.get_usage("nope").unwrap(), None);
 }

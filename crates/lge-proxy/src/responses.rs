@@ -1,16 +1,27 @@
 //! Rewriting one OpenAI Responses request body.
 //!
 //! The body's `input` is the whole conversation as a list of items. This
-//! module finds the two kinds of item the proxy acts on, the output of a shell
-//! command and a message the user typed, and leaves every other item, and
-//! every other field of the body, exactly as it was. Items that carry ids or
-//! encrypted reasoning are never opened.
+//! module finds the two kinds of item the proxy acts on, the output of a tool
+//! call and a message the user typed, and leaves every other item, and every
+//! other field of the body, exactly as it was. Items that carry ids or
+//! encrypted reasoning are never opened; tool calls, scripts and patches are
+//! read, never changed.
+//!
+//! Each output is decided once per conversation and replayed byte for byte on
+//! every later request ([`Session`]). What a decision may depend on beyond the
+//! item itself (a pointer to an identical earlier copy, a re-run sent whole
+//! after a shortened one) is read from the earlier items of the request, which
+//! never change, so the same request always gives the same bytes.
 
-use crate::command::script_command;
-use crate::session::{Graph, Options, Session};
+use crate::command::{is_read_only, normalise, patch_paths, purpose, script_edits, script_plan, Purpose, ScriptPlan};
+use crate::rules::{Mode, RuleId};
+use crate::session::{output_key, producer_of, same_path, CallView, Draft, Graph, Options, Session};
+use crate::shorten::RunStatus;
+use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 /// What a request said about itself, and what was changed in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,13 +37,52 @@ pub struct Seen {
     pub outputs_replaced: usize,
     /// Context messages present in this request.
     pub contexts_present: usize,
+    /// Tokens not sent in this request: over the items replaced in it, the
+    /// tokens before less the tokens after.
+    pub removed_present: i64,
+    /// Tokens of the context items present in this request.
+    pub added_present: i64,
+    /// One hash per input item as the client sent it.
+    pub client_hashes: Vec<u64>,
+    /// One hash per client input item as forwarded, with the context item
+    /// inserted right after it, if any.
+    pub forwarded_hashes: Vec<u64>,
+    /// Names of the tools called in the request, each once, in order.
+    pub called_tools: Vec<String>,
+    /// Items first decided in this request (outputs, pointers, contexts).
+    pub new_decisions: usize,
+    /// The input item at which this request's forwarded prefix differs from
+    /// the previous request's while the client's does not: a cache break lge
+    /// caused.
+    pub lge_break_item: Option<usize>,
+    /// The first input item the client changed since the previous request.
+    pub client_break_item: Option<usize>,
+    /// The largest tool outputs new in this request (not in the previous
+    /// request of the conversation), largest first, at most
+    /// [`LARGEST_NEW_OUTPUTS`].
+    pub largest_new_outputs: Vec<OutputFact>,
+}
+
+/// Outputs kept in [`Seen::largest_new_outputs`].
+pub const LARGEST_NEW_OUTPUTS: usize = 3;
+
+/// One tool output as a request trace shows it. No output text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputFact {
+    /// What produced it, cut to 120 characters: the shell command, the
+    /// commands of a script, or the tool's name.
+    pub command: String,
+    /// Tokens of the output as the client sent it.
+    pub tokens: usize,
+    /// lge sent something else in its place.
+    pub shortened: bool,
 }
 
 /// A shell command a tool call ran, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Ran {
-    command: String,
-    workdir: Option<String>,
+pub(crate) struct Ran {
+    pub command: String,
+    pub workdir: Option<String>,
 }
 
 /// An output smaller than this is cheaper to repeat than to point at.
@@ -40,10 +90,30 @@ const REPEAT_MIN_BYTES: usize = 2000;
 
 const SHELLS: [&str; 6] = ["bash", "zsh", "sh", "/bin/bash", "/bin/zsh", "/bin/sh"];
 
+/// Names of the function tools that run a shell command.
+pub(crate) const SHELL_TOOLS: [&str; 6] = [
+    "shell",
+    "container.exec",
+    "exec_command",
+    "local_shell",
+    "shell_command",
+    "bash",
+];
+
+/// Codex tools that change no file (their handlers in codex-rs/core/src/tools/handlers).
+const READ_ONLY_TOOLS: [&str; 6] = [
+    "update_plan",
+    "view_image",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+    "tool_search",
+];
+
 /// The command line of a shell-type tool call, from its arguments object.
 /// Understands `{"command": ["bash", "-lc", "..."]}`, `{"command": "..."}`
 /// and `{"cmd": "..."}`.
-fn command_of(args: &Value) -> Option<Ran> {
+pub(crate) fn command_of(args: &Value) -> Option<Ran> {
     let workdir = ["workdir", "cwd", "working_directory"]
         .iter()
         .find_map(|k| args.get(*k).and_then(Value::as_str))
@@ -113,22 +183,255 @@ fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     Some(text[start..end].trim())
 }
 
-/// Splits a tool output string into what frames it and the command's own
-/// text. Handles the plain layout (`Exit code: ..` lines, then `Output:`) and
-/// the JSON layout (`{"output": "...", "metadata": {...}}`).
-enum Framed {
-    /// `prefix` + text.
-    Plain { prefix: String, text: String },
-    /// A JSON object whose `output` field is the text.
-    Json { object: Value, text: String },
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+/// One exec result Codex printed as a JSON line in a code-mode part
+/// (`{"chunk_id":..,"wall_time_seconds":..,"exit_code":..,"output":".."}`),
+/// split around the bytes of its `output` string token.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExecLine {
+    /// The line's bytes before the `output` string token, and after it.
+    prefix: String,
+    suffix: String,
+    /// The decoded `output`.
+    pub output: String,
+    pub status: RunStatus,
 }
 
-fn unframe(raw: &str) -> Framed {
+/// A tool output string split into what frames it and the command's own text.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Framed {
+    /// `prefix` + text. The prefix is the agent's status lines ending in
+    /// `Output:` (exit code, wall time, chunk id), or empty.
+    Plain {
+        prefix: String,
+        text: String,
+        status: RunStatus,
+    },
+    /// A JSON object whose `output` field is the text.
+    Json {
+        object: Value,
+        text: String,
+        status: RunStatus,
+    },
+    /// Code mode: a script printed whole exec results, one JSON object per
+    /// line, after `head` (Codex's truncation note, other printed lines).
+    /// Each line is kept as it was, with its exec result when the line can be
+    /// rewritten exactly.
+    JsonLines {
+        head: String,
+        lines: Vec<(String, Option<ExecLine>)>,
+    },
+}
+
+/// The status the prefix lines of a plain frame give.
+fn plain_status(prefix: &str) -> RunStatus {
+    static EXIT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(?:Exit code: |Process exited with code )(-?\d+)$").expect("valid regex"));
+    static RUNNING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:Process running with session ID \S+|Script running with cell ID \S+)$").expect("valid regex")
+    });
+    let mut status = RunStatus::default();
+    for line in prefix.lines() {
+        if let Some(c) = EXIT.captures(line) {
+            status.exit = c[1].parse().ok();
+        } else if RUNNING.is_match(line) {
+            status.running = true;
+        }
+    }
+    status
+}
+
+/// Keys of the object `tools.exec_command` returns in code mode
+/// (codex-rs/core/src/tools/context.rs, `UnifiedExecCodeModeResult`).
+const EXEC_KEYS: [&str; 6] = [
+    "chunk_id",
+    "wall_time_seconds",
+    "exit_code",
+    "session_id",
+    "original_token_count",
+    "output",
+];
+
+/// The end (exclusive) of the JSON string token that starts at `i`.
+fn string_end(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// The end (exclusive) of the JSON value that starts at `i`.
+fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => string_end(b, i),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        j = string_end(b, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => Some(
+            (i..b.len())
+                .find(|&j| matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
+                .unwrap_or(b.len()),
+        ),
+    }
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// The byte spans of the values of a JSON object's top-level keys, in order.
+/// `None` when `s` is not exactly one JSON object.
+fn top_level_spans(s: &str) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    let b = s.as_bytes();
+    let mut i = skip_ws(b, 0);
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    let mut out = Vec::new();
+    if b.get(i) == Some(&b'}') {
+        return (skip_ws(b, i + 1) == b.len()).then_some(out);
+    }
+    loop {
+        let key_end = string_end(b, i)?;
+        let key: String = serde_json::from_str(&s[i..key_end]).ok()?;
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws(b, i + 1);
+        let end = value_end(b, i)?;
+        out.push((key, i..end));
+        i = skip_ws(b, end);
+        match b.get(i) {
+            Some(b',') => i = skip_ws(b, i + 1),
+            Some(b'}') => {
+                i += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    (skip_ws(b, i) == b.len()).then_some(out)
+}
+
+/// A line that is an exec result printed as JSON: it starts with `{"`, ends
+/// with `}`, and is one object with a string `output`, an `exit_code` or
+/// `chunk_id`, and no key the exec result does not have. The inner result is
+/// given when the `output` token re-encodes to exactly its bytes; otherwise
+/// the line must be left alone.
+fn exec_line(line: &str) -> Option<Option<ExecLine>> {
+    if !line.starts_with("{\"") || !line.ends_with('}') {
+        return None;
+    }
+    let object: serde_json::Map<String, Value> = serde_json::from_str(line).ok()?;
+    let output = object.get("output")?.as_str()?;
+    if !(object.contains_key("exit_code") || object.contains_key("chunk_id"))
+        || object.keys().any(|k| !EXEC_KEYS.contains(&k.as_str()))
+    {
+        return None;
+    }
+    let exit = object.get("exit_code").and_then(Value::as_i64);
+    let status = RunStatus {
+        exit: exit.and_then(|e| i32::try_from(e).ok()),
+        running: exit.is_none() && object.get("session_id").is_some_and(|s| !s.is_null()),
+        masked: false,
+    };
+    let exact = || {
+        let spans = top_level_spans(line)?;
+        let mut outputs = spans.iter().filter(|(k, _)| k == "output");
+        let (_, span) = outputs.next()?;
+        if outputs.next().is_some() {
+            return None;
+        }
+        let token = &line[span.clone()];
+        let decoded: String = serde_json::from_str(token).ok()?;
+        (decoded == output && serde_json::to_string(&decoded).ok()? == token).then(|| ExecLine {
+            prefix: line[..span.start].to_string(),
+            suffix: line[span.end..].to_string(),
+            output: decoded,
+            status,
+        })
+    };
+    Some(exact())
+}
+
+/// Split a tool output into its frame and its text. `json_lines`: the text is
+/// a code-mode part a script printed, which may hold whole exec results as
+/// JSON lines.
+pub(crate) fn unframe(raw: &str, json_lines: bool) -> Framed {
+    if json_lines {
+        let mut at = 0usize;
+        let mut first = None;
+        for line in raw.split('\n') {
+            if exec_line(line).is_some() {
+                first = Some(at);
+                break;
+            }
+            at += line.len() + 1;
+        }
+        if let Some(start) = first {
+            let lines = raw[start..]
+                .split('\n')
+                .map(|l| (l.to_string(), exec_line(l).flatten()))
+                .collect();
+            return Framed::JsonLines {
+                head: raw[..start].to_string(),
+                lines,
+            };
+        }
+    }
     if raw.trim_start().starts_with('{') {
         if let Ok(object) = serde_json::from_str::<Value>(raw) {
             if let Some(text) = object.get("output").and_then(Value::as_str) {
                 let text = text.to_string();
-                return Framed::Json { object, text };
+                let exit = object
+                    .get("metadata")
+                    .and_then(|m| m.get("exit_code"))
+                    .and_then(Value::as_i64)
+                    .and_then(|e| i32::try_from(e).ok());
+                return Framed::Json {
+                    object,
+                    text,
+                    status: RunStatus {
+                        exit,
+                        running: false,
+                        masked: false,
+                    },
+                };
             }
         }
     }
@@ -140,15 +443,18 @@ fn unframe(raw: &str) -> Framed {
             return Framed::Plain {
                 prefix: raw[..cut].to_string(),
                 text: raw[cut..].to_string(),
+                status: plain_status(&raw[..at]),
             };
         }
     }
     Framed::Plain {
         prefix: String::new(),
         text: raw.to_string(),
+        status: RunStatus::default(),
     }
 }
 
+/// A plain or JSON frame with its text replaced.
 fn reframe(framed: Framed, new_text: String) -> String {
     match framed {
         Framed::Plain { prefix, .. } => prefix + &new_text,
@@ -156,7 +462,28 @@ fn reframe(framed: Framed, new_text: String) -> String {
             object["output"] = Value::String(new_text);
             object.to_string()
         }
+        Framed::JsonLines { .. } => new_text,
     }
+}
+
+/// JSON lines put back together, each rewritten line's new output spliced
+/// between its original prefix and suffix bytes.
+fn rejoin(head: &str, lines: &[(String, Option<ExecLine>)], new: &[Option<String>]) -> String {
+    let mut out = String::from(head);
+    for (k, (raw, exec)) in lines.iter().enumerate() {
+        if k > 0 {
+            out.push('\n');
+        }
+        match (exec, new.get(k).and_then(Option::as_ref)) {
+            (Some(e), Some(text)) => {
+                out.push_str(&e.prefix);
+                out.push_str(&serde_json::to_string(text).unwrap_or_default());
+                out.push_str(&e.suffix);
+            }
+            _ => out.push_str(raw),
+        }
+    }
+    out
 }
 
 /// The extra item that carries graph context, right after the user's message.
@@ -165,13 +492,229 @@ fn context_item(text: &str) -> Value {
 }
 
 /// The status part a code-mode script's result starts with
-/// (`Script completed\nWall time 0.1 seconds\nOutput:\n`).
+/// (`Script completed\nWall time 0.1 seconds\nOutput:\n`; codex-rs/core/src/tools/code_mode/output.rs).
 fn is_script_header(part: &Value) -> bool {
     part.get("type").and_then(Value::as_str) == Some("input_text")
         && part
             .get("text")
             .and_then(Value::as_str)
-            .is_some_and(|t| t.len() < 600 && t.contains("Wall time") && t.trim_end().ends_with("Output:"))
+            .is_some_and(is_script_header_text)
+}
+
+/// The text of a code-mode status part.
+pub(crate) fn is_script_header_text(t: &str) -> bool {
+    t.len() < 600 && t.contains("Wall time") && t.trim_end().ends_with("Output:")
+}
+
+/// The status of what a script printed so far: still running when Codex
+/// returned before the script finished.
+fn script_status(header: &Value) -> RunStatus {
+    let text = header.get("text").and_then(Value::as_str).unwrap_or("");
+    RunStatus {
+        exit: None,
+        running: text.starts_with("Script running"),
+        masked: false,
+    }
+}
+
+/// A hash of an input item as JSON, as 16 hex characters of its content hash.
+fn hash_of(parts: &[&Value]) -> u64 {
+    let mut bytes = Vec::new();
+    for v in parts {
+        bytes.extend_from_slice(serde_json::to_string(v).unwrap_or_default().as_bytes());
+        bytes.push(b'\n');
+    }
+    u64::from_str_radix(&lge_core::content_hash(&bytes)[..16], 16).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// The calls of a request
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum CallKind {
+    /// A shell command.
+    Shell(Ran),
+    /// A code-mode script; its plan when what it runs is certain.
+    Script { plan: Option<ScriptPlan>, edits: bool },
+    /// `apply_patch`, with the paths it names.
+    Patch(Vec<String>),
+    /// Any other tool, by its name (`write_stdin` included).
+    Tool(String),
+}
+
+#[derive(Debug, Clone)]
+struct Call {
+    call_id: String,
+    name: String,
+    kind: CallKind,
+    /// It may have changed files.
+    edit: bool,
+}
+
+/// The namespace Codex puts its own tools in when it groups them.
+const DEFAULT_TOOL_NAMESPACE: &str = "functions";
+
+/// True for the tools lge itself serves (`search_code_context`, ...), with
+/// or without an MCP server prefix.
+fn is_lge_tool(name: &str) -> bool {
+    let last = name.rsplit("__").next().unwrap_or(name);
+    lge_mcp::tools().iter().any(|t| t.name == last)
+}
+
+/// A tool whose output may be a file the model will patch against: its JSON
+/// is never minified.
+fn file_tool(name: &str) -> bool {
+    static FILE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(read|file|open|view|cat|source|content|document)").expect("valid regex"));
+    FILE.is_match(name)
+}
+
+/// The tool calls of a request, in order.
+fn history(items: &[Value]) -> Vec<Call> {
+    let mut calls = Vec::new();
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        // Codex's own tools may come back in its default namespace; they are
+        // named without it, as Codex names them (codex-rs/protocol/src/tool_name.rs).
+        let namespace = item
+            .get("namespace")
+            .and_then(Value::as_str)
+            .filter(|n| *n != DEFAULT_TOOL_NAMESPACE)
+            .unwrap_or("");
+        let kind = match item_type {
+            "function_call" => {
+                let raw = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                let args = serde_json::from_str::<Value>(raw).ok();
+                if !namespace.is_empty() {
+                    CallKind::Tool(format!("{namespace}{name}"))
+                } else if SHELL_TOOLS.contains(&name) {
+                    match args.as_ref().and_then(command_of) {
+                        Some(ran) => CallKind::Shell(ran),
+                        None => CallKind::Tool(name.to_string()),
+                    }
+                } else if name == "apply_patch" {
+                    let patch = args
+                        .as_ref()
+                        .and_then(|a| a.get("input").or_else(|| a.get("patch")))
+                        .and_then(Value::as_str)
+                        .unwrap_or(raw);
+                    CallKind::Patch(patch_paths(patch))
+                } else {
+                    CallKind::Tool(name.to_string())
+                }
+            }
+            "local_shell_call" => match item.get("action").and_then(command_of) {
+                Some(ran) => CallKind::Shell(ran),
+                None => CallKind::Tool("local_shell".to_string()),
+            },
+            "custom_tool_call" => {
+                let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                match name {
+                    "exec" => {
+                        let plan = script_plan(input);
+                        let edits = plan.as_ref().map_or_else(|| script_edits(input), |p| p.edits);
+                        CallKind::Script { plan, edits }
+                    }
+                    "apply_patch" => CallKind::Patch(patch_paths(input)),
+                    _ => CallKind::Tool(name.to_string()),
+                }
+            }
+            _ => continue,
+        };
+        let edit = match &kind {
+            CallKind::Shell(ran) => !is_read_only(&ran.command),
+            CallKind::Script { edits, .. } => *edits,
+            CallKind::Patch(_) => true,
+            CallKind::Tool(name) => !(is_lge_tool(name) || READ_ONLY_TOOLS.contains(&name.as_str())),
+        };
+        let name = if !namespace.is_empty() {
+            format!("{namespace}{name}")
+        } else if item_type == "local_shell_call" {
+            // Named by its tool type, as the request's tool list names it.
+            "local_shell".to_string()
+        } else {
+            name.to_string()
+        };
+        calls.push(Call {
+            call_id: call_id.to_string(),
+            name,
+            kind,
+            edit,
+        });
+    }
+    calls
+}
+
+impl Call {
+    /// What a trace names the call by: its command, its script's commands,
+    /// or the tool's name, cut to 120 characters.
+    fn label(&self) -> String {
+        let full = match &self.kind {
+            CallKind::Shell(ran) => ran.command.clone(),
+            CallKind::Script { plan: Some(plan), .. } => {
+                let cmds: Vec<&str> = plan.commands.iter().map(|c| c.cmd.as_str()).collect();
+                format!("exec: {}", cmds.join("; "))
+            }
+            CallKind::Script { plan: None, .. } => "exec (script)".to_string(),
+            CallKind::Patch(_) => "apply_patch".to_string(),
+            CallKind::Tool(name) => name.clone(),
+        };
+        full.chars().take(120).collect()
+    }
+
+    /// The shell commands the call ran, as far as it is known.
+    fn commands(&self) -> Vec<String> {
+        match &self.kind {
+            CallKind::Shell(ran) => vec![ran.command.clone()],
+            CallKind::Script { plan: Some(plan), .. } => plan.commands.iter().map(|c| c.cmd.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn view(&self) -> CallView {
+        CallView {
+            call_id: self.call_id.clone(),
+            edit: self.edit,
+            commands: self.commands(),
+            patched: match &self.kind {
+                CallKind::Patch(paths) => paths.clone(),
+                _ => Vec::new(),
+            },
+        }
+    }
+}
+
+/// The string two calls share when they ran the same command.
+fn normalised_command(command: &str) -> String {
+    normalise(command).map_or_else(|| command.trim().to_string(), |n| n.command)
+}
+
+// ---------------------------------------------------------------------------
+// Outputs whose command is known
+// ---------------------------------------------------------------------------
+
+/// A large output sent whole, which a later identical copy can point at.
+struct Whole {
+    key: String,
+    /// Its normalised command, and its run among the calls of the request
+    /// that ran it.
+    command: String,
+    run: usize,
+}
+
+/// A read sent whole, which a later read of the same lines is compared with.
+struct ReadCopy {
+    path: String,
+    numbered: bool,
+    start: usize,
+    end: usize,
+    text: String,
+    command: String,
 }
 
 /// The tool outputs of one request whose command is known, rewritten in
@@ -181,101 +724,367 @@ struct Known<'s, 'g> {
     graph: Option<&'g Graph<'g>>,
     opts: &'s Options,
     default_dir: Option<String>,
-    /// Text of large outputs sent in full so far in this request -> the command that produced it.
-    sent_in_full: HashMap<String, String>,
+    calls: &'s [Call],
+    /// Edit calls before each call index: `edits_before[i]` counts calls `< i`.
+    edits_before: Vec<usize>,
+    /// (call index, command index) -> its run among the request's calls of
+    /// the same normalised command, from 1.
+    runs: HashMap<(usize, usize), usize>,
+    /// Keys of the items seen so far in this request.
+    present: HashSet<String>,
+    /// Content hash -> the first large output sent whole with it.
+    sent_in_full: HashMap<String, Whole>,
+    /// Normalised command -> (call index, key) of each earlier output.
+    by_command: HashMap<String, Vec<(usize, String)>>,
+    /// Normalised command -> (run, text) of its latest output sent whole.
+    last_whole: HashMap<String, (usize, String)>,
+    reads: Vec<ReadCopy>,
 }
 
-impl Known<'_, '_> {
-    /// What to send instead of one text `call` printed: the command-aware
-    /// rewrite, or a pointer to an identical earlier copy. `id` names the text
-    /// (its call id, and its part): the rewrite is decided once for it, and a
-    /// pointer is counted once.
-    fn text(&mut self, call: &Ran, id: &str, text: &str) -> Option<String> {
-        let dir: Option<PathBuf> = call
-            .workdir
-            .clone()
-            .or_else(|| self.default_dir.clone())
-            .map(PathBuf::from);
-        if let Some(shorter) =
-            self.session
-                .rewrite_call_output(self.graph, id, &call.command, dir.as_deref(), text, self.opts)
-        {
-            return Some(shorter);
+impl<'s, 'g> Known<'s, 'g> {
+    fn new(
+        session: &'s mut Session,
+        graph: Option<&'g Graph<'g>>,
+        opts: &'s Options,
+        default_dir: Option<String>,
+        calls: &'s [Call],
+    ) -> Self {
+        let mut edits_before = Vec::with_capacity(calls.len() + 1);
+        let mut edits = 0;
+        for call in calls {
+            edits_before.push(edits);
+            edits += usize::from(call.edit);
         }
-        if !self.opts.shorten_outputs || text.len() < REPEAT_MIN_BYTES {
-            return None;
-        }
-        // The same large output again (a file read twice, a command rerun with
-        // nothing changed): point to the first copy, which is still in this
-        // request. Decided from the request alone, so it is the same on every
-        // turn and right after a compaction.
-        let hash = lge_core::content_hash(text.as_bytes());
-        match self.sent_in_full.get(&hash) {
-            Some(earlier) => {
-                let first: String = earlier.chars().take(120).collect();
-                let pointer = format!(
-                    "lge: identical to the output of `{first}` earlier in this conversation ({} lines, unchanged); it is not repeated here.\n",
-                    text.lines().count()
-                );
-                self.session.count_pointer(id, text, &pointer);
-                Some(pointer)
+        edits_before.push(edits);
+        let mut counter: HashMap<String, usize> = HashMap::new();
+        let mut runs = HashMap::new();
+        for (i, call) in calls.iter().enumerate() {
+            for (j, command) in call.commands().iter().enumerate() {
+                let n = counter.entry(normalised_command(command)).or_insert(0);
+                *n += 1;
+                runs.insert((i, j), *n);
             }
-            None => {
-                self.sent_in_full.insert(hash, call.command.clone());
-                None
+        }
+        Known {
+            session,
+            graph,
+            opts,
+            default_dir,
+            calls,
+            edits_before,
+            runs,
+            present: HashSet::new(),
+            sent_in_full: HashMap::new(),
+            by_command: HashMap::new(),
+            last_whole: HashMap::new(),
+            reads: Vec::new(),
+        }
+    }
+
+    /// Edit calls strictly between call indexes `a` and `b` (`a <= b`).
+    fn edits_between(&self, a: usize, b: usize) -> usize {
+        if b <= a + 1 {
+            return 0;
+        }
+        self.edits_before[b] - self.edits_before[a + 1]
+    }
+
+    /// The re-run recovery rule: an earlier call ran the same normalised
+    /// command, its output was shortened by a lossy rule, and no call that
+    /// may have changed files lies between them.
+    fn recovery(&self, at: usize, command: &str) -> bool {
+        let Some(earlier) = self.by_command.get(command) else {
+            return false;
+        };
+        for (e, key) in earlier.iter().rev() {
+            if self.edits_between(*e, at) > 0 {
+                return false;
+            }
+            if self.session.lossy(key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// What to send instead of one text that command `j` of call `at`
+    /// printed, or `None` to send it as it is. `id` names the text (its call
+    /// id, its part and line): decided once for it, and replayed after.
+    fn text(&mut self, at: usize, j: usize, ran: &Ran, id: &str, text: &str, status: RunStatus) -> Option<String> {
+        let key = output_key(id, &ran.command, text);
+        let command = normalised_command(&ran.command);
+        let present = &self.present;
+        let replayed = self.session.replay(&key, &|target| present.contains(target));
+        let result = match replayed {
+            Some(known) => known,
+            None => self.decide(at, ran, &key, &command, text, status),
+        };
+        self.present.insert(key.clone());
+        if result.is_none() {
+            self.keep_whole(at, j, ran, &key, &command, text);
+        }
+        self.by_command.entry(command).or_default().push((at, key));
+        result
+    }
+
+    /// Remember an output sent whole: later identical copies point at it, and
+    /// later re-runs and re-reads are measured against it.
+    fn keep_whole(&mut self, at: usize, j: usize, ran: &Ran, key: &str, command: &str, text: &str) {
+        let run = self.runs.get(&(at, j)).copied().unwrap_or(1);
+        if text.len() >= REPEAT_MIN_BYTES {
+            self.sent_in_full
+                .entry(lge_core::content_hash(text.as_bytes()))
+                .or_insert_with(|| Whole {
+                    key: key.to_string(),
+                    command: command.to_string(),
+                    run,
+                });
+        }
+        if !self.opts.shorten_outputs {
+            return;
+        }
+        if self.opts.mode(RuleId::RerunDelta) != Mode::Off {
+            self.last_whole.insert(command.to_string(), (run, text.to_string()));
+        }
+        if self.opts.mode(RuleId::ReadDelta) != Mode::Off {
+            if let Some((path, numbered, start)) = read_of(&purpose(&ran.command)) {
+                let lines = text.lines().count();
+                if lines > 0 {
+                    self.reads.push(ReadCopy {
+                        path,
+                        numbered,
+                        start,
+                        end: start + lines - 1,
+                        text: text.to_string(),
+                        command: command.to_string(),
+                    });
+                }
             }
         }
     }
 
-    /// Rewrite the output of `item`, whose command is `call`. Returns how many
-    /// texts were replaced, or `None` when the output has a shape this does not
-    /// read (it is then judged by its content). The JSON type of `output`, the
-    /// number of its parts and every part that is not text never change.
-    fn output(&mut self, item: &mut Value, kind: &str, call: &Ran) -> Option<usize> {
-        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string();
-        match item.get_mut("output")? {
-            Value::String(raw) => {
-                let framed = unframe(raw);
-                let text = match &framed {
-                    Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
+    /// The first decision for an output: the rules for its purpose, else a
+    /// pointer to an identical earlier copy, else the measured deltas.
+    #[allow(clippy::too_many_arguments)]
+    fn decide(
+        &mut self,
+        at: usize,
+        ran: &Ran,
+        key: &str,
+        command: &str,
+        text: &str,
+        status: RunStatus,
+    ) -> Option<String> {
+        let dir: Option<PathBuf> = ran
+            .workdir
+            .clone()
+            .or_else(|| self.default_dir.clone())
+            .map(PathBuf::from);
+        let p = purpose(&ran.command);
+        // Decided before the daemon restarted: the rules it got then, and only those.
+        let pinned = self.session.pinned(key).map(|mask| self.opts.pinned(mask));
+        let opts = pinned.as_ref().unwrap_or(self.opts);
+        let active = opts.shorten_outputs && p != Purpose::Raw;
+        let recovery = active && self.recovery(at, command);
+        let mut draft: Draft =
+            self.session
+                .draft_known(self.graph, &ran.command, dir.as_deref(), text, status, opts, recovery);
+        draft.pinned = pinned.is_some();
+        let call_id = self.calls[at].call_id.clone();
+        if draft.text.is_none() && active && text.len() >= REPEAT_MIN_BYTES {
+            // The same large output again (a file read twice, a command rerun
+            // with nothing changed): point to the first copy sent whole, which
+            // is still in this request. Never to a shortened copy.
+            if let Some(first) = self.sent_in_full.get(&lge_core::content_hash(text.as_bytes())) {
+                let pointer = pointer_text(first, text);
+                let target = first.key.clone();
+                match opts.mode(RuleId::RepeatPointer) {
+                    Mode::On => {
+                        return Some(self.session.commit_pointer(
+                            key.to_string(),
+                            target,
+                            pointer,
+                            draft,
+                            text,
+                            &call_id,
+                        ));
+                    }
+                    Mode::Shadow => draft.add_shadow(RuleId::RepeatPointer, text, &pointer),
+                    Mode::Off => {}
+                }
+            }
+        }
+        if draft.text.is_none() && active && !draft.pinned {
+            self.deltas(&mut draft, &p, command, text);
+        }
+        let producer = normalise(&ran.command).map(|n| producer_of(&n));
+        self.session.commit(key.to_string(), draft, text, &call_id, producer)
+    }
+
+    /// What a diff against an earlier whole copy would save, counted in shadow.
+    fn deltas(&self, draft: &mut Draft, p: &Purpose, command: &str, text: &str) {
+        match read_of(p) {
+            Some((path, numbered, start)) => {
+                if self.opts.mode(RuleId::ReadDelta) == Mode::Off {
+                    return;
+                }
+                let lines = text.lines().count();
+                if lines == 0 {
+                    return;
+                }
+                let end = start + lines - 1;
+                let covering =
+                    self.reads.iter().rev().find(|r| {
+                        r.numbered == numbered && same_path(&r.path, &path) && r.start <= start && r.end >= end
+                    });
+                if let Some(e) = covering {
+                    let cmd: String = e.command.chars().take(120).collect();
+                    if let Some(out) = crate::delta::read_delta(&e.text, e.start, text, start, &cmd) {
+                        draft.add_shadow(RuleId::ReadDelta, text, &out);
+                    }
+                }
+            }
+            None if *p == Purpose::Diff => {}
+            None => {
+                if self.opts.mode(RuleId::RerunDelta) == Mode::Off {
+                    return;
+                }
+                if let Some((run, earlier)) = self.last_whole.get(command) {
+                    let cmd: String = command.chars().take(120).collect();
+                    if let Some(out) = crate::delta::rerun_delta(earlier, text, *run, &cmd) {
+                        draft.add_shadow(RuleId::RerunDelta, text, &out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One text of an output, with its frame: replaced in place when the
+    /// decision says so. `json_lines`: a code-mode part that may hold exec
+    /// results; each line is then decided on its own, by `ran` when the
+    /// script runs one command, else by its content.
+    #[allow(clippy::too_many_arguments)]
+    fn part(
+        &mut self,
+        raw: &mut String,
+        at: usize,
+        j: usize,
+        ran: &Ran,
+        id: &str,
+        json_lines: bool,
+        single: bool,
+        outer: RunStatus,
+    ) -> usize {
+        match unframe(raw, json_lines) {
+            Framed::JsonLines { head, lines } => {
+                let skip = head.matches('\n').count();
+                let mut new: Vec<Option<String>> = Vec::with_capacity(lines.len());
+                let mut replaced = 0;
+                for (k, (_, exec)) in lines.iter().enumerate() {
+                    let decided = exec.as_ref().and_then(|e| {
+                        if single {
+                            let line_id = format!("{id}#{}", skip + k);
+                            self.text(at, j, ran, &line_id, &e.output, e.status)
+                        } else {
+                            self.session
+                                .decide_content(&self.calls[at].call_id, &e.output, e.status, false, self.opts)
+                        }
+                    });
+                    replaced += usize::from(decided.is_some());
+                    new.push(decided);
+                }
+                if replaced > 0 {
+                    *raw = rejoin(&head, &lines, &new);
+                }
+                replaced
+            }
+            framed => {
+                let (text, status) = match &framed {
+                    Framed::Plain { text, status, .. } | Framed::Json { text, status, .. } => (text.clone(), *status),
+                    Framed::JsonLines { .. } => unreachable!("handled above"),
                 };
-                let id = if call_id.is_empty() {
-                    lge_core::content_hash(text.as_bytes())
-                } else {
-                    call_id
+                let status = RunStatus {
+                    exit: status.exit.or(outer.exit),
+                    running: status.running || outer.running,
+                    masked: false,
                 };
-                Some(match self.text(call, &id, &text) {
+                match self.text(at, j, ran, id, &text, status) {
                     Some(new) => {
                         *raw = reframe(framed, new);
                         1
                     }
                     None => 0,
-                })
+                }
+            }
+        }
+    }
+
+    /// Rewrite the output of `item`, the result of call `at`. Returns how many
+    /// texts were replaced, or `None` when the output has a shape this does not
+    /// read (it is then judged by its content). The JSON type of `output`, the
+    /// number of its parts and every part that is not text never change.
+    fn output(&mut self, item: &mut Value, kind: &str, at: usize) -> Option<usize> {
+        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let calls = self.calls;
+        let call = &calls[at];
+        let (commands, prints): (Vec<Ran>, Option<&Vec<usize>>) = match &call.kind {
+            CallKind::Shell(ran) => (vec![ran.clone()], None),
+            CallKind::Script { plan: Some(plan), .. } => (
+                plan.commands
+                    .iter()
+                    .map(|c| Ran {
+                        command: c.cmd.clone(),
+                        workdir: c.workdir.clone(),
+                    })
+                    .collect(),
+                plan.prints.as_ref(),
+            ),
+            _ => return None,
+        };
+        let script = matches!(call.kind, CallKind::Script { .. });
+        match item.get_mut("output")? {
+            Value::String(raw) => {
+                // One text: a shell's output, or a script's whole result as one string.
+                if prints.is_some() {
+                    return None;
+                }
+                let id = if call_id.is_empty() {
+                    lge_core::content_hash(raw.as_bytes())
+                } else {
+                    call_id.clone()
+                };
+                let id = if script { format!("{id}#0") } else { id };
+                Some(self.part(raw, at, 0, &commands[0], &id, script, true, RunStatus::default()))
             }
             // A code-mode script's result: its status part, then what the
             // script printed. The status part stays as it is.
-            Value::Array(parts) if kind == "custom_tool_call_output" && parts.first().is_some_and(is_script_header) => {
+            Value::Array(parts)
+                if kind == "custom_tool_call_output" && script && parts.first().is_some_and(is_script_header) =>
+            {
+                let outer = script_status(&parts[0]);
+                let texts: Vec<usize> = (1..parts.len())
+                    .filter(|i| parts[*i].get("type").and_then(Value::as_str) == Some("input_text"))
+                    .collect();
+                // Several commands: part k is the k-th text() call's, when the
+                // counts agree; otherwise none can be told apart.
+                let owner: Vec<usize> = match prints {
+                    Some(p) if p.len() == texts.len() => p.clone(),
+                    Some(_) => return None,
+                    None => vec![0; texts.len()],
+                };
                 let mut replaced = 0;
-                for (i, part) in parts.iter_mut().enumerate().skip(1) {
-                    if part.get("type").and_then(Value::as_str) != Some("input_text") {
+                for (k, i) in texts.into_iter().enumerate() {
+                    let Some(Value::String(raw)) = parts[i].get_mut("text") else {
                         continue;
-                    }
-                    let Some(Value::String(raw)) = part.get_mut("text") else {
-                        continue;
-                    };
-                    let framed = unframe(raw);
-                    let text = match &framed {
-                        Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
                     };
                     let id = if call_id.is_empty() {
-                        lge_core::content_hash(text.as_bytes())
+                        lge_core::content_hash(raw.as_bytes())
                     } else {
                         format!("{call_id}#{i}")
                     };
-                    if let Some(new) = self.text(call, &id, &text) {
-                        *raw = reframe(framed, new);
-                        replaced += 1;
-                    }
+                    let j = owner[k];
+                    let Some(ran) = commands.get(j) else { continue };
+                    replaced += self.part(raw, at, j, ran, &id, prints.is_none(), commands.len() == 1, outer);
                 }
                 Some(replaced)
             }
@@ -284,23 +1093,95 @@ impl Known<'_, '_> {
     }
 }
 
+/// The path, numbered flag and first line of a read.
+fn read_of(p: &Purpose) -> Option<(String, bool, usize)> {
+    match p {
+        Purpose::ReadWhole { path, numbered } => Some((path.clone(), *numbered, 1)),
+        Purpose::ReadRange {
+            path, start, numbered, ..
+        } => Some((path.clone(), *numbered, *start)),
+        _ => None,
+    }
+}
+
+/// The text that replaces an output identical to an earlier one. It names the
+/// run it repeats and quotes its first line, so the model can tell which of
+/// several runs of a command it is.
+fn pointer_text(first: &Whole, text: &str) -> String {
+    let cmd: String = first.command.chars().take(120).collect();
+    let line: String = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim_end()
+        .chars()
+        .take(80)
+        .collect();
+    format!(
+        "lge: identical to the output of run {} of `{cmd}` earlier in this conversation ({} lines, first line: \"{line}\"); it is not repeated here.\n",
+        first.run,
+        text.lines().count()
+    )
+}
+
 /// Shorten the texts of an output whose command is not known, each judged by
 /// its content. Returns how many were replaced. The JSON type of `output` and
-/// the number of its parts never change.
-fn rewrite_by_content(item: &mut Value, session: &mut Session, opts: &Options) -> usize {
-    let mut replaced = 0;
-    match item.get_mut("output") {
-        Some(Value::String(raw)) => {
-            let framed = unframe(raw);
-            let text = match &framed {
-                Framed::Plain { text, .. } | Framed::Json { text, .. } => text.clone(),
-            };
-            if let Some(shorter) = session.rewrite_text(&text, opts) {
-                *raw = reframe(framed, shorter);
-                replaced += 1;
+/// the number of its parts never change. `code_mode`: a script's result, whose
+/// parts may hold exec results as JSON lines. `minify`: JSON may be minified
+/// (a tool that is neither a shell nor a file reader).
+fn rewrite_by_content(
+    item: &mut Value,
+    session: &mut Session,
+    opts: &Options,
+    call: &str,
+    code_mode: bool,
+    minify: bool,
+) -> usize {
+    let mut one = |raw: &mut String, outer: RunStatus| -> usize {
+        match unframe(raw, code_mode) {
+            Framed::JsonLines { head, lines } => {
+                let new: Vec<Option<String>> = lines
+                    .iter()
+                    .map(|(_, exec)| {
+                        exec.as_ref()
+                            .and_then(|e| session.decide_content(call, &e.output, e.status, false, opts))
+                    })
+                    .collect();
+                let replaced = new.iter().filter(|n| n.is_some()).count();
+                if replaced > 0 {
+                    *raw = rejoin(&head, &lines, &new);
+                }
+                replaced
+            }
+            framed => {
+                let (text, status) = match &framed {
+                    Framed::Plain { text, status, .. } | Framed::Json { text, status, .. } => (text.clone(), *status),
+                    Framed::JsonLines { .. } => unreachable!("handled above"),
+                };
+                let status = RunStatus {
+                    exit: status.exit.or(outer.exit),
+                    running: status.running || outer.running,
+                    masked: false,
+                };
+                match session.decide_content(call, &text, status, minify, opts) {
+                    Some(new) => {
+                        *raw = reframe(framed, new);
+                        1
+                    }
+                    None => 0,
+                }
             }
         }
+    };
+    match item.get_mut("output") {
+        Some(Value::String(raw)) => one(raw, RunStatus::default()),
         Some(Value::Array(parts)) => {
+            let outer = parts
+                .first()
+                .filter(|p| is_script_header(p))
+                .map(script_status)
+                .unwrap_or_default();
+            let mut replaced = 0;
             for part in parts.iter_mut() {
                 if part.get("type").and_then(Value::as_str) != Some("input_text") {
                     continue;
@@ -308,15 +1189,12 @@ fn rewrite_by_content(item: &mut Value, session: &mut Session, opts: &Options) -
                 let Some(Value::String(text)) = part.get_mut("text") else {
                     continue;
                 };
-                if let Some(shorter) = session.rewrite_text(text, opts) {
-                    *text = shorter;
-                    replaced += 1;
-                }
+                replaced += one(text, outer);
             }
+            replaced
         }
-        _ => {}
+        _ => 0,
     }
-    replaced
 }
 
 /// Read what the request says about itself, without changing it.
@@ -343,85 +1221,142 @@ pub fn inspect(body: &Value) -> Seen {
     seen
 }
 
-/// Rewrite `body` in place. Only `input` is touched, and in it only shell
+/// Rewrite `body` in place. Only `input` is touched, and in it only tool
 /// outputs (replaced) and typed user messages (a context item is added after).
-/// A body that is not a Responses request is left alone.
+/// A body that is not a Responses request is left alone. Starts a request in
+/// the session ([`Session::begin_request`]); afterwards the session has judged
+/// the follow-ups of earlier items and compared the prefix with the previous
+/// request's.
 pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>, opts: &Options) -> Seen {
     let mut seen = inspect(body);
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return seen;
     };
-    // Which command produced which output.
-    let mut ran: HashMap<String, Ran> = HashMap::new();
-    for item in items.iter() {
-        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let found = match kind {
-            "function_call" => item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                .and_then(|a| command_of(&a)),
-            "local_shell_call" => item.get("action").and_then(command_of),
-            // Code mode: a script that runs one shell command. The script is
-            // read, never changed.
-            "custom_tool_call" if item.get("name").and_then(Value::as_str) == Some("exec") => item
-                .get("input")
-                .and_then(Value::as_str)
-                .and_then(script_command)
-                .map(|c| Ran {
-                    command: c.cmd,
-                    workdir: c.workdir,
-                }),
-            _ => None,
-        };
-        if let Some(r) = found {
-            ran.insert(call_id.to_string(), r);
+    session.begin_request();
+    let calls = history(items);
+    let index: HashMap<&str, usize> = calls.iter().enumerate().map(|(i, c)| (c.call_id.as_str(), i)).collect();
+    for call in &calls {
+        if !seen.called_tools.contains(&call.name) {
+            seen.called_tools.push(call.name.clone());
         }
     }
+    // Calls of the provider's own tools carry no call id: named by their tool type.
+    for item in items.iter() {
+        let hosted = match item.get("type").and_then(Value::as_str) {
+            Some("web_search_call") => "web_search",
+            Some("image_generation_call") => "image_generation",
+            Some("tool_search_call") => "tool_search",
+            _ => continue,
+        };
+        if !seen.called_tools.iter().any(|t| t == hosted) {
+            seen.called_tools.push(hosted.to_string());
+        }
+    }
+    let client: Vec<u64> = items.iter().map(|item| hash_of(&[item])).collect();
+    let previous = session.previous_client_hashes();
+    let mut new_outputs: Vec<OutputFact> = Vec::new();
 
-    let mut known = Known {
-        session,
-        graph,
-        opts,
-        default_dir: seen.cwd.clone(),
-        sent_in_full: HashMap::new(),
-    };
+    let mut known = Known::new(session, graph, opts, seen.cwd.clone(), &calls);
     let mut out: Vec<Value> = Vec::with_capacity(items.len() + 2);
+    let mut forwarded: Vec<u64> = Vec::with_capacity(items.len());
     for mut item in std::mem::take(items) {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         match kind.as_str() {
             "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
-                let call = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| ran.get(id))
-                    .cloned();
-                let replaced = call.and_then(|call| known.output(&mut item, &kind, &call));
+                let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string();
+                let at = index.get(call_id.as_str()).copied();
+                // A new item's size, read before it is rewritten.
+                let fresh = !previous.contains(&client[forwarded.len()]);
+                let tokens = if fresh { output_tokens(&item) } else { 0 };
+                let replaced = at.and_then(|at| known.output(&mut item, &kind, at));
                 // No command to go by (another tool, a script this cannot read), or an
                 // output of another shape: each text is judged by its content alone.
-                seen.outputs_replaced += replaced.unwrap_or_else(|| rewrite_by_content(&mut item, known.session, opts));
+                let replaced = replaced.unwrap_or_else(|| {
+                    let call = at.map(|at| &calls[at]);
+                    let code_mode = matches!(
+                        call.map(|c| &c.kind),
+                        Some(CallKind::Script {
+                            plan: None | Some(ScriptPlan { prints: None, .. }),
+                            ..
+                        })
+                    );
+                    let minify = matches!(call.map(|c| &c.kind), Some(CallKind::Tool(name)) if name != "write_stdin" && !file_tool(name));
+                    rewrite_by_content(&mut item, known.session, opts, &call_id, code_mode, minify)
+                });
+                seen.outputs_replaced += replaced;
+                if fresh {
+                    new_outputs.push(OutputFact {
+                        command: at.map(|at| calls[at].label()).unwrap_or_default(),
+                        tokens,
+                        shortened: replaced > 0,
+                    });
+                }
+                // An item left as it was has the client's hash.
+                forwarded.push(if replaced > 0 {
+                    hash_of(&[&item])
+                } else {
+                    client[forwarded.len()]
+                });
                 out.push(item);
             }
             "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
                 let text = message_text(&item);
                 let typed = text.as_deref().is_some_and(|t| !is_injected(&item, t));
-                out.push(item);
-                let (Some(text), Some(graph), true) = (text, graph, typed) else {
-                    continue;
+                // Looked up with or without a graph: a message decided once
+                // keeps its pack, or its lack of one, on every later turn.
+                let context = match (text, typed) {
+                    (Some(text), true) => known.session.context_after(graph, &text, opts),
+                    _ => None,
                 };
-                if let Some(context) = known.session.context_for(graph, &text, opts) {
-                    out.push(context_item(&context));
-                    seen.contexts_present += 1;
+                match context {
+                    Some(context) => {
+                        let added = context_item(&context);
+                        forwarded.push(hash_of(&[&item, &added]));
+                        out.push(item);
+                        out.push(added);
+                        seen.contexts_present += 1;
+                    }
+                    None => {
+                        forwarded.push(client[forwarded.len()]);
+                        out.push(item);
+                    }
                 }
             }
-            _ => out.push(item),
+            _ => {
+                forwarded.push(client[forwarded.len()]);
+                out.push(item);
+            }
         }
     }
     *items = out;
+
+    let views: Vec<CallView> = calls.iter().map(Call::view).collect();
+    session.judge(&views);
+    let pairs: Vec<(u64, u64)> = client.iter().copied().zip(forwarded.iter().copied()).collect();
+    (seen.lge_break_item, seen.client_break_item) = session.compare_prefix(pairs);
+    (seen.removed_present, seen.added_present) = session.present_tokens();
+    seen.new_decisions = session.new_this_request().len();
+    seen.client_hashes = client;
+    seen.forwarded_hashes = forwarded;
+    // Largest first; among equals, the earlier item first.
+    new_outputs.sort_by_key(|o| std::cmp::Reverse(o.tokens));
+    new_outputs.truncate(LARGEST_NEW_OUTPUTS);
+    seen.largest_new_outputs = new_outputs;
     seen
+}
+
+/// Tokens of a tool output item's text: the string, or its text parts.
+fn output_tokens(item: &Value) -> usize {
+    match item.get("output") {
+        Some(Value::String(s)) => lge_retrieve::budget::count(s),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .map(lge_retrieve::budget::count)
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Token usage reported at the end of a streamed response.
@@ -490,6 +1425,7 @@ impl UsageScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::Mode;
 
     fn user(text: &str) -> Value {
         json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] })
@@ -503,6 +1439,14 @@ mod tests {
         json!({ "type": "function_call_output", "call_id": id, "output": text })
     }
 
+    fn patch(id: &str, path: &str) -> Value {
+        json!({ "type": "custom_tool_call", "call_id": id, "name": "apply_patch", "input": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch\n") })
+    }
+
+    fn patched(id: &str) -> Value {
+        json!({ "type": "custom_tool_call_output", "call_id": id, "output": "Success. Updated the following files:\nM src/a.rs\n" })
+    }
+
     fn passing_run() -> String {
         let mut run = String::from(
             "============================= test session starts ==============================\ncollected 300 items\n\n",
@@ -514,6 +1458,41 @@ mod tests {
             ));
         }
         run + "\n============================= 300 passed in 9.87s ==============================\n"
+    }
+
+    /// `cargo clippy` with `n` warnings, as Codex frames it.
+    fn clippy(n: usize) -> String {
+        let mut out = String::from("    Checking shop v0.1.0 (/repo)\n");
+        let lints = [
+            ("needless_return", "unneeded `return` statement"),
+            ("redundant_clone", "redundant clone"),
+        ];
+        for i in 0..n {
+            let (lint, message) = lints[i % 2];
+            out.push_str(&format!(
+                "warning: {message}\n  --> src/m{i}.rs:{l}:5\n   |\n{l} |     return value_{i}.clone();\n   |     ^^^^^^^^^^^^^^^^^^^^^^^^\n   |\n   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#{lint}\n   = note: `#[warn(clippy::{lint})]` on by default\nhelp: remove this\n   |\n{l} -     return value_{i}.clone();\n{l} +     value_{i}\n   |\n\n",
+                l = i + 10
+            ));
+        }
+        out.push_str(&format!(
+            "warning: `shop` (lib) generated {n} warnings (run `cargo clippy --fix --lib -p shop` to apply {n} suggestions)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s\n"
+        ));
+        format!("Chunk ID: 1a2b\nWall time: 1.2000 seconds\nProcess exited with code 0\nOutput:\n{out}")
+    }
+
+    fn file_text() -> String {
+        (0..120)
+            .map(|i| format!("line {i}: some source text that is long enough to matter\n"))
+            .collect()
+    }
+
+    fn texts(body: &Value) -> Vec<String> {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["output"].as_str().map(str::to_string).unwrap_or_default())
+            .collect()
     }
 
     #[test]
@@ -568,6 +1547,9 @@ mod tests {
         assert_eq!(seen.model.as_deref(), Some("gpt-test"));
         assert_eq!(seen.first_user_message, "run the tests please");
         assert_eq!(seen.outputs_replaced, 1);
+        assert_eq!(seen.called_tools, ["exec_command", "update_plan"]);
+        assert_eq!(seen.client_hashes.len(), 9);
+        assert_eq!(seen.forwarded_hashes.len(), 9);
 
         let items = body["input"].as_array().unwrap();
         assert_eq!(items.len(), 9, "no item is added without a graph");
@@ -580,7 +1562,9 @@ mod tests {
         // Every other item, and every other field, is byte-identical.
         for i in [0, 1, 2, 3, 5, 6, 7, 8] {
             assert_eq!(items[i], before["input"][i], "item {i}");
+            assert_eq!(seen.client_hashes[i], seen.forwarded_hashes[i], "item {i}");
         }
+        assert_ne!(seen.client_hashes[4], seen.forwarded_hashes[4]);
         for field in ["model", "prompt_cache_key", "instructions", "tools", "stream"] {
             assert_eq!(body[field], before[field], "{field}");
         }
@@ -588,16 +1572,18 @@ mod tests {
         // The next turn resends the conversation: the same item gets the same bytes.
         let mut again = before.clone();
         again["input"].as_array_mut().unwrap().push(user("thanks"));
-        transform(&mut again, &mut session, None, &Options::default());
+        let next = transform(&mut again, &mut session, None, &Options::default());
         assert_eq!(again["input"][4], body["input"][4]);
         assert_eq!(session.saved.outputs_shortened, 1, "decided once");
+        // Only the new message is decided (no pack: there is no graph).
+        assert_eq!(next.new_decisions, 1);
+        assert_eq!(next.contexts_present, 0);
+        assert_eq!((next.lge_break_item, next.client_break_item), (None, None));
     }
 
     #[test]
     fn a_repeated_output_points_to_its_first_copy_while_that_copy_is_there() {
-        let file: String = (0..120)
-            .map(|i| format!("line {i}: some source text that is long enough to matter\n"))
-            .collect();
+        let file = file_text();
         let mut body = json!({ "input": [
             call("c1", "cat src/app.py"), output("c1", &file),
             call("c2", "sed -n '1,200p' src/app.py"), output("c2", &file),
@@ -610,7 +1596,7 @@ mod tests {
         assert_eq!(body["input"][1]["output"], file, "the first copy stays whole");
         assert_eq!(
             body["input"][3]["output"],
-            "lge: identical to the output of `cat src/app.py` earlier in this conversation (120 lines, unchanged); it is not repeated here.\n"
+            "lge: identical to the output of run 1 of `cat src/app.py` earlier in this conversation (120 lines, first line: \"line 0: some source text that is long enough to matter\"); it is not repeated here.\n"
         );
         assert_eq!(
             body["input"][7]["output"], "short",
@@ -622,6 +1608,7 @@ mod tests {
         transform(&mut again, &mut session, None, &Options::default());
         assert_eq!(again["input"][3], first["input"][3]);
         assert_eq!(session.saved.outputs_shortened, 1);
+        assert_eq!(session.saved.by_rule["repeat_pointer"].items, 1);
         // The agent compacted its history and the first copy is gone: the content is sent again.
         let mut compacted = json!({ "input": [call("c2", "sed -n '1,200p' src/app.py"), output("c2", &file)] });
         transform(&mut compacted, &mut session, None, &Options::default());
@@ -642,34 +1629,354 @@ mod tests {
     }
 
     #[test]
-    fn a_json_framed_output_keeps_its_frame() {
-        let run = passing_run();
-        let framed = json!({ "output": run, "metadata": { "exit_code": 0, "duration_seconds": 9.9 } }).to_string();
-        let mut body = json!({ "input": [call("c1", "pytest -v"), output("c1", &framed)] });
-        transform(&mut body, &mut Session::default(), None, &Options::default());
-        let new: Value = serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
-        assert!(new["output"].as_str().unwrap().starts_with("ok"), "{new}");
-        assert_eq!(new["metadata"]["exit_code"], 0);
+    fn a_pointer_names_the_run_it_repeats() {
+        // Run A fails, run B passes, run A' fails exactly as A did.
+        let a: String = (0..80)
+            .map(|i| format!("step {i}: building the order fixtures for the failing case\n"))
+            .collect();
+        let a = format!("worker 7 did not start, retrying\n{a}");
+        let b: String = (0..80)
+            .map(|i| format!("step {i}: building the order fixtures for the passing case\n"))
+            .collect();
+        let items = vec![
+            call("c1", "make check"),
+            output("c1", &a),
+            call("c2", "make check"),
+            output("c2", &b),
+            call("c3", "make check"),
+            output("c3", &a),
+        ];
+        let mut body = json!({ "input": items.clone() });
+        let mut session = Session::default();
+        transform(&mut body, &mut session, None, &Options::default());
+        let pointer = "lge: identical to the output of run 1 of `make check` earlier in this conversation (81 lines, first line: \"worker 7 did not start, retrying\"); it is not repeated here.\n";
+        assert_eq!(body["input"][5]["output"], pointer);
+        assert_eq!(body["input"][3]["output"], b.as_str());
+        let mut next = json!({ "input": items });
+        next["input"].as_array_mut().unwrap().push(user("and now?"));
+        transform(&mut next, &mut session, None, &Options::default());
+        assert_eq!(next["input"][5]["output"], pointer, "the same bytes next turn");
     }
 
     #[test]
-    fn bodies_of_another_shape_pass_through() {
-        for mut body in [
-            json!({}),
-            json!({ "input": "a plain string" }),
-            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
-            json!([1, 2, 3]),
+    fn a_rerun_with_nothing_changed_between_is_sent_whole() {
+        let run = clippy(30);
+        let items = vec![
+            call("c1", "cargo clippy --all-targets"),
+            output("c1", &run),
+            call("c2", "cargo clippy --all-targets"),
+            output("c2", &run),
+            call("c3", "cargo clippy --all-targets"),
+            output("c3", &run),
+        ];
+        let mut body = json!({ "input": items.clone() });
+        let mut session = Session::default();
+        transform(&mut body, &mut session, None, &Options::default());
+        let out = texts(&body);
+        assert!(
+            out[1].contains("Output:\nok: 30 warnings\n"),
+            "the first run is shortened: {}",
+            out[1]
+        );
+        assert!(
+            out[1].contains("lge: output of `cargo` reduced to its result and its 30 warnings"),
+            "{}",
+            out[1]
+        );
+        assert_eq!(out[3], run, "the re-run with nothing changed is sent whole");
+        assert!(
+            out[5].contains("lge: identical to the output of run 2 of `cargo clippy --all-targets`"),
+            "a third identical run points at the second, never at the shortened first: {}",
+            out[5]
+        );
+        let key = output_key(
+            "c2",
+            "cargo clippy --all-targets",
+            run.split("Output:\n").nth(1).unwrap(),
+        );
+        assert!(session.is_raw_call(&key));
+        // Stable on the next turn, and after a settings change.
+        let mut next = json!({ "input": items.clone() });
+        transform(&mut next, &mut session, None, &Options::default());
+        assert_eq!(texts(&next), out);
+        let mut off = json!({ "input": items });
+        transform(
+            &mut off,
+            &mut session,
+            None,
+            &Options {
+                shorten_outputs: false,
+                ..Options::default()
+            },
+        );
+        assert_eq!(texts(&off), out);
+    }
+
+    #[test]
+    fn a_rerun_after_apply_patch_is_shortened_again() {
+        let run = clippy(30);
+        let mut body = json!({ "input": [
+            call("c1", "cargo clippy --all-targets"), output("c1", &run),
+            patch("p1", "src/a.rs"), patched("p1"),
+            call("c2", "cargo clippy --all-targets"), output("c2", &run),
+        ] });
+        transform(&mut body, &mut Session::default(), None, &Options::default());
+        let out = texts(&body);
+        assert!(out[1].contains("lge: output of `cargo` reduced"), "{}", out[1]);
+        assert!(out[5].contains("lge: output of `cargo` reduced"), "{}", out[5]);
+        // A command that may write files counts as an edit too; a read does not.
+        let mut write = json!({ "input": [
+            call("c1", "cargo clippy --all-targets"), output("c1", &run),
+            call("c2", "cargo fmt"), output("c2", ""),
+            call("c3", "cargo clippy --all-targets"), output("c3", &run),
+        ] });
+        transform(&mut write, &mut Session::default(), None, &Options::default());
+        assert!(texts(&write)[5].contains("lge: output of `cargo` reduced"));
+        let mut read = json!({ "input": [
+            call("c1", "cargo clippy --all-targets"), output("c1", &run),
+            call("c2", "cat src/a.rs"), output("c2", "fn main() {}\n"),
+            call("c3", "cargo clippy --all-targets"), output("c3", &run),
+        ] });
+        transform(&mut read, &mut Session::default(), None, &Options::default());
+        assert_eq!(texts(&read)[5], run);
+    }
+
+    #[test]
+    fn an_lge_raw_prefix_is_never_shortened() {
+        let run = clippy(30);
+        let file = file_text();
+        let mut body = json!({ "input": [
+            call("c1", "LGE_RAW=1 cargo clippy --all-targets"), output("c1", &run),
+            call("c2", "cat src/app.py"), output("c2", &file),
+            call("c3", "LGE_RAW=1 cat src/app.py"), output("c3", &file),
+        ] });
+        let before = body.clone();
+        let seen = transform(&mut body, &mut Session::default(), None, &Options::default());
+        assert_eq!(seen.outputs_replaced, 0);
+        assert_eq!(body, before, "not reduced and not pointed at");
+    }
+
+    #[test]
+    fn turning_shortening_off_mid_conversation_keeps_past_items() {
+        let run = clippy(30);
+        let first = vec![call("c1", "cargo clippy --all-targets"), output("c1", &run)];
+        let mut session = Session::default();
+        let mut body = json!({ "input": first.clone() });
+        transform(&mut body, &mut session, None, &Options::default());
+        let shortened = body["input"][1].clone();
+        assert_ne!(shortened, first[1]);
+        let off = Options {
+            shorten_outputs: false,
+            ..Options::default()
+        };
+        let mut items = first.clone();
+        items.extend([call("c2", "pytest -v"), output("c2", &passing_run())]);
+        let mut next = json!({ "input": items.clone() });
+        let seen = transform(&mut next, &mut session, None, &off);
+        assert_eq!(next["input"][1], shortened, "the old item keeps its bytes");
+        assert_eq!(next["input"][3], items[3], "a new item is untouched");
+        assert_eq!(seen.lge_break_item, None);
+        // Switched on again: the item decided while it was off stays as it was.
+        let mut again = json!({ "input": items.clone() });
+        transform(&mut again, &mut session, None, &Options::default());
+        assert_eq!(again["input"][3], items[3]);
+    }
+
+    #[test]
+    fn a_pointer_survives_a_settings_change() {
+        let file = file_text();
+        let items = vec![
+            call("c1", "cat src/app.py"),
+            output("c1", &file),
+            call("c2", "cat src/app.py"),
+            output("c2", &file),
+        ];
+        let mut session = Session::default();
+        let mut body = json!({ "input": items.clone() });
+        transform(&mut body, &mut session, None, &Options::default());
+        let pointer = body["input"][3].clone();
+        assert_ne!(pointer, items[3]);
+        for opts in [
+            Options {
+                shorten_outputs: false,
+                ..Options::default()
+            },
+            Options {
+                rules: crate::rules::RuleModes::all(Mode::Off),
+                ..Options::default()
+            },
+            Options {
+                holdout: true,
+                ..Options::default()
+            },
         ] {
-            let before = body.clone();
-            transform(&mut body, &mut Session::default(), None, &Options::default());
-            assert_eq!(body, before);
+            let mut again = json!({ "input": items.clone() });
+            transform(&mut again, &mut session, None, &opts);
+            assert_eq!(again["input"][3], pointer, "{opts:?}");
         }
     }
 
     #[test]
+    fn promotion_from_shadow_to_on_applies_to_new_items_only() {
+        let lock: String = {
+            let mut text = String::from("# This file is automatically @generated by Cargo.\nversion = 4\n\n");
+            for i in 0..80 {
+                text.push_str(&format!(
+                    "[[package]]\nname = \"crate-number-{i}\"\nversion = \"1.{i}.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{:064x}\"\n\n",
+                    i * 7919
+                ));
+            }
+            text
+        };
+        let mut session = Session::default();
+        let first = vec![call("c1", "cat Cargo.lock"), output("c1", &lock)];
+        let mut body = json!({ "input": first.clone() });
+        transform(&mut body, &mut session, None, &Options::default());
+        assert_eq!(body["input"][1], first[1], "lockfile is in shadow by default");
+        assert_eq!(session.saved.by_rule["lockfile"].shadow_items, 1);
+        let mut on = Options::default();
+        on.rules.lockfile = Mode::On;
+        let mut items = first.clone();
+        items.extend([call("c2", "cat Cargo.lock"), output("c2", &lock)]);
+        let mut next = json!({ "input": items });
+        transform(&mut next, &mut session, None, &on);
+        assert_eq!(next["input"][1], first[1], "decided in shadow: stays as it was");
+        let new = next["input"][3]["output"].as_str().unwrap();
+        assert!(
+            new.starts_with("lge: Cargo.lock shown as its package list (80 packages"),
+            "{new}"
+        );
+        assert_eq!(session.saved.by_rule["lockfile"].items, 1);
+    }
+
+    #[test]
+    fn holdout_forwards_bodies_byte_identical_and_counts_what_would_be_saved() {
+        let run = clippy(30);
+        let file = file_text();
+        let mut body = json!({ "input": [
+            call("c1", "cargo clippy --all-targets"), output("c1", &run),
+            call("c2", "cat src/app.py"), output("c2", &file),
+            call("c3", "cat src/app.py"), output("c3", &file),
+        ] });
+        let before = body.clone();
+        let mut session = Session::default();
+        let opts = Options {
+            holdout: true,
+            ..Options::default()
+        };
+        let seen = transform(&mut body, &mut session, None, &opts);
+        assert_eq!(body, before);
+        assert_eq!(seen.outputs_replaced, 0);
+        assert_eq!(seen.removed_present, 0);
+        let check = session.saved.by_rule["check"];
+        assert_eq!((check.items, check.shadow_items), (0, 1));
+        assert!(check.shadow_tokens_after < check.shadow_tokens_before);
+        assert_eq!(session.saved.by_rule["repeat_pointer"].shadow_items, 1);
+        assert_eq!(session.saved.outputs_shortened, 0);
+    }
+
+    #[test]
+    fn exit_codes_and_running_states_are_read_from_every_frame() {
+        let status = |raw: &str, lines: bool| match unframe(raw, lines) {
+            Framed::Plain { status, .. } | Framed::Json { status, .. } => status,
+            Framed::JsonLines { lines, .. } => lines.iter().find_map(|(_, e)| e.as_ref()).unwrap().status,
+        };
+        let done = |code| RunStatus {
+            exit: Some(code),
+            running: false,
+            masked: false,
+        };
+        let running = RunStatus {
+            exit: None,
+            running: true,
+            masked: false,
+        };
+        assert_eq!(
+            status("Exit code: 2\nWall time: 1.0 seconds\nOutput:\nx", false),
+            done(2)
+        );
+        assert_eq!(
+            status(
+                "Chunk ID: ab\nWall time: 1.0 seconds\nProcess exited with code -1\nOutput:\nx",
+                false
+            ),
+            done(-1)
+        );
+        assert_eq!(
+            status("Chunk ID: ab\nWall time: 10.0 seconds\nProcess running with session ID 4711\nOriginal token count: 9\nOutput:\nx", false),
+            running
+        );
+        assert_eq!(
+            status(
+                r#"{"output":"x","metadata":{"exit_code":1,"duration_seconds":0.5}}"#,
+                false
+            ),
+            done(1)
+        );
+        assert_eq!(
+            status(
+                r#"{"chunk_id":"ab","wall_time_seconds":0.5,"exit_code":3,"output":"x"}"#,
+                true
+            ),
+            done(3)
+        );
+        assert_eq!(
+            status(
+                r#"{"chunk_id":"ab","wall_time_seconds":10.0,"session_id":17,"output":"x"}"#,
+                true
+            ),
+            running
+        );
+        assert_eq!(status("no frame at all", false), RunStatus::default());
+        // JSON lines are read only from what a script printed.
+        assert!(matches!(
+            unframe(
+                r#"{"chunk_id":"ab","wall_time_seconds":0.5,"exit_code":3,"output":"x"}"#,
+                false
+            ),
+            Framed::Json { .. }
+        ));
+        // A key the exec result does not have: not an exec result.
+        assert!(!matches!(
+            unframe(r#"{"chunk_id":"ab","exit_code":3,"output":"x","path":"a"}"#, true),
+            Framed::JsonLines { .. }
+        ));
+    }
+
+    #[test]
+    fn json_lines_splice_keeps_every_byte_outside_the_output() {
+        let line = r#"{"chunk_id":"ab","wall_time_seconds":3.458e-6,"exit_code":0,"original_token_count":12,"output":"a\u001b[1m\"b\"\n"}"#;
+        let raw = format!("Warning: truncated output (original token count: 9)\nTotal output lines: 3\n\n{line}\nnot json\n{{\"chunk_id\":\"cut");
+        let Framed::JsonLines { head, lines } = unframe(&raw, true) else {
+            panic!("not read as JSON lines");
+        };
+        assert_eq!(
+            head,
+            "Warning: truncated output (original token count: 9)\nTotal output lines: 3\n\n"
+        );
+        assert_eq!(lines.len(), 3);
+        let exec = lines[0].1.as_ref().unwrap();
+        assert_eq!(exec.output, "a\u{1b}[1m\"b\"\n");
+        assert!(lines[1].1.is_none() && lines[2].1.is_none());
+        assert_eq!(rejoin(&head, &lines, &[None, None, None]), raw);
+        let spliced = rejoin(&head, &lines, &[Some("ok".to_string()), None, None]);
+        assert_eq!(
+            spliced,
+            raw.replace(r#""a\u001b[1m\"b\"\n""#, r#""ok""#),
+            "only the output token changes"
+        );
+        // An escape serde_json would write differently: the line is left alone.
+        let other = r#"{"chunk_id":"ab","exit_code":0,"output":"a\/b"}"#;
+        let Framed::JsonLines { lines, .. } = unframe(other, true) else {
+            panic!()
+        };
+        assert!(lines[0].1.is_none());
+    }
+
+    #[test]
     fn an_output_without_a_known_command_is_judged_by_its_content() {
-        // A script run (code mode) with two commands: the output is a list of
-        // parts, and no single command produced them.
+        // A script run (code mode) with two commands, each printed by its own
+        // text() call: each part is matched to its command.
         let listing: String = (0..200)
             .map(|i| {
                 format!(
@@ -695,19 +2002,18 @@ mod tests {
         let mut session = Session::default();
         let seen = transform(&mut body, &mut session, None, &Options::default());
         let parts = body["input"][1]["output"].as_array().unwrap();
-        assert_eq!(
-            seen.outputs_replaced,
-            3,
-            "{}",
-            serde_json::to_string(&json!([parts[1], parts[3], body["input"][2]]))
-                .unwrap()
-                .chars()
-                .take(900)
-                .collect::<String>()
-        );
+        assert_eq!(seen.outputs_replaced, 3);
         assert_eq!(parts.len(), 4, "the number of parts never changes");
         assert_eq!(parts[0], before["input"][1]["output"][0]);
         assert!(parts[1]["text"].as_str().unwrap().starts_with("ok"), "{}", parts[1]);
+        assert!(
+            parts[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("lge: output of `pytest` reduced"),
+            "matched to its command: {}",
+            parts[1]
+        );
         assert_eq!(parts[2], before["input"][1]["output"][2]);
         assert!(
             parts[3]["text"]
@@ -731,10 +2037,231 @@ mod tests {
         let mut again = before.clone();
         transform(&mut again, &mut session, None, &Options::default());
         assert_eq!(again, body);
-        assert_eq!(
-            session.saved.outputs_shortened, 2,
-            "the same text twice is decided and counted once"
+        assert_eq!(session.saved.outputs_shortened, 3, "each item counted once");
+    }
+
+    #[test]
+    fn json_from_a_tool_that_is_not_a_file_reader_is_minified() {
+        let rows: Vec<Value> = (0..200)
+            .map(|i| json!({ "id": i, "name": format!("order {i}"), "status": "open" }))
+            .collect();
+        let pretty = serde_json::to_string_pretty(&json!({ "rows": rows })).unwrap();
+        let framed = format!("Wall time: 0.1000 seconds\nOutput:\n{pretty}");
+        let mut body = json!({ "input": [
+            { "type": "function_call", "name": "query", "namespace": "mcp__db__", "call_id": "m1", "arguments": "{}" },
+            output("m1", &framed),
+            { "type": "function_call", "name": "read_file", "namespace": "mcp__fs__", "call_id": "m2", "arguments": "{}" },
+            output("m2", &framed),
+        ] });
+        let seen = transform(&mut body, &mut Session::default(), None, &Options::default());
+        assert_eq!(seen.outputs_replaced, 1);
+        assert_eq!(seen.called_tools, ["mcp__db__query", "mcp__fs__read_file"]);
+        let small = body["input"][1]["output"].as_str().unwrap();
+        assert!(
+            small.starts_with("Wall time: 0.1000 seconds\nOutput:\n{\"rows\":[{\"id\":0,"),
+            "{small}"
         );
+        assert_eq!(
+            body["input"][3]["output"],
+            framed.as_str(),
+            "a file tool's output stays"
+        );
+    }
+
+    #[test]
+    fn paths_are_folded_and_progress_noise_is_measured_in_shadow() {
+        let paths: String = (0..120)
+            .map(|i| format!("crates/lge-proxy/src/module_number_{}/file_{i}.rs\n", i / 30))
+            .collect();
+        let mut install: String = (0..150)
+            .map(|i| format!("Collecting package-number-{i}==1.{i}.0\n  Downloading package_number_{i}-1.{i}.0-py3-none-any.whl (12 kB)\n"))
+            .collect();
+        install.push_str("Installing collected packages: many\nSuccessfully installed 150 packages\n");
+        let framed = format!("Chunk ID: 9f\nWall time: 3.1000 seconds\nProcess exited with code 0\nOutput:\n{install}");
+        let mut body = json!({ "input": [
+            call("c1", "git ls-files"), output("c1", &paths),
+            call("c2", "pip install -r requirements.txt"), output("c2", &framed),
+        ] });
+        let mut session = Session::default();
+        let seen = transform(&mut body, &mut session, None, &Options::default());
+        let folded = body["input"][1]["output"].as_str().unwrap();
+        assert!(folded.starts_with(crate::fold::HEADER), "{folded}");
+        assert_eq!(crate::fold::unfold_paths(folded), paths, "lossless");
+        assert_eq!(session.saved.by_rule["path_fold"].items, 1);
+        let noise = session.saved.by_rule.get("noise").copied().unwrap_or_default();
+        assert_eq!(noise.items, 0, "noise is in shadow by default");
+        assert_eq!(noise.shadow_items, 1, "{:?}", session.saved.by_rule);
+        let mut on = Options::default();
+        on.rules.noise = Mode::On;
+        let mut again = json!({ "input": [call("c9", "pip install -r requirements.txt"), output("c9", &framed)] });
+        transform(&mut again, &mut Session::default(), None, &on);
+        let short = again["input"][1]["output"].as_str().unwrap();
+        assert!(
+            short.ends_with("lge: 301 progress lines of `pip install` left out (exit code 0).\n"),
+            "{short}"
+        );
+        // Without a known exit code 0, progress lines stay.
+        let unknown = json!({ "input": [call("c8", "pip install -r requirements.txt"), output("c8", &install)] });
+        let mut unknown_body = unknown.clone();
+        transform(&mut unknown_body, &mut Session::default(), None, &on);
+        assert_eq!(unknown_body, unknown);
+        assert!(seen.outputs_replaced >= 1);
+    }
+
+    #[test]
+    fn reruns_and_rereads_are_measured_as_deltas_in_shadow() {
+        let log = |changed: &str| -> String {
+            (0..150)
+                .map(|i| {
+                    if i == 75 {
+                        format!("{changed}\n")
+                    } else {
+                        format!("job {i}: compiled the module for the order service in release mode\n")
+                    }
+                })
+                .collect()
+        };
+        let file = file_text();
+        let middle: String = file.lines().skip(9).take(51).map(|l| format!("{l}\n")).collect();
+        let mut body = json!({ "input": [
+            call("c1", "make all"), output("c1", &log("job 75: failed")),
+            call("c2", "make all"), output("c2", &log("job 75: done")),
+            call("c3", "cat src/app.py"), output("c3", &file),
+            call("c4", "sed -n '10,60p' src/app.py"), output("c4", &middle),
+        ] });
+        let before = body.clone();
+        let mut session = Session::default();
+        transform(&mut body, &mut session, None, &Options::default());
+        assert_eq!(body, before, "measured only");
+        assert_eq!(session.saved.by_rule["rerun_delta"].shadow_items, 1);
+        assert_eq!(session.saved.by_rule["read_delta"].shadow_items, 1);
+        let r = session.saved.by_rule["read_delta"];
+        assert!(r.shadow_tokens_after * 5 < r.shadow_tokens_before, "{r:?}");
+        // Switched off, nothing is measured.
+        let mut off = Options::default();
+        off.rules.rerun_delta = Mode::Off;
+        off.rules.read_delta = Mode::Off;
+        let mut quiet = Session::default();
+        transform(&mut before.clone(), &mut quiet, None, &off);
+        assert!(!quiet.saved.by_rule.contains_key("rerun_delta") && !quiet.saved.by_rule.contains_key("read_delta"));
+    }
+
+    #[test]
+    fn removed_tokens_are_summed_over_the_items_present() {
+        let run = clippy(30);
+        let mut session = Session::default();
+        let opts = Options::default();
+        let one = vec![call("c1", "cargo clippy --all-targets"), output("c1", &run)];
+        let mut body = json!({ "input": one.clone() });
+        let first = transform(&mut body, &mut session, None, &opts);
+        assert!(first.removed_present > 1000, "{}", first.removed_present);
+        let mut two = one.clone();
+        two.extend([call("c2", "pytest -v"), output("c2", &passing_run())]);
+        let mut body = json!({ "input": two.clone() });
+        let second = transform(&mut body, &mut session, None, &opts);
+        assert!(second.removed_present > first.removed_present);
+        let mut body = json!({ "input": two });
+        let third = transform(&mut body, &mut session, None, &opts);
+        assert_eq!(
+            third.removed_present, second.removed_present,
+            "replayed items count every time"
+        );
+        // After a compaction the items are gone, and so is what they removed.
+        let mut body = json!({ "input": [user("summary of the work so far")] });
+        let after = transform(&mut body, &mut session, None, &opts);
+        assert_eq!(after.removed_present, 0);
+        assert_eq!(after.client_break_item, Some(0));
+    }
+
+    #[test]
+    fn the_prefix_monitor_tells_lge_breaks_from_client_breaks() {
+        let run = clippy(30);
+        let items = vec![
+            user("fix the warnings"),
+            call("c1", "cargo clippy --all-targets"),
+            output("c1", &run),
+        ];
+        let mut session = Session::default();
+        for _ in 0..2 {
+            let mut body = json!({ "input": items.clone() });
+            let seen = transform(&mut body, &mut session, None, &Options::default());
+            assert_eq!((seen.lge_break_item, seen.client_break_item), (None, None));
+        }
+        assert_eq!(session.prefix, crate::session::PrefixStats::default());
+        // A forced re-decision: the item gets other bytes while the client's are the same.
+        session.forget_outputs();
+        let mut off = Options::default();
+        off.rules.check = Mode::Off;
+        let mut body = json!({ "input": items.clone() });
+        let seen = transform(&mut body, &mut session, None, &off);
+        assert_eq!(seen.lge_break_item, Some(2));
+        assert_eq!(session.prefix.lge_breaks, 1);
+        assert_eq!(session.prefix.first_lge_break_item, Some(2));
+        assert_eq!(session.prefix.client_breaks, 0);
+        // A compaction replaces the items: a client break, not an lge one.
+        let mut body = json!({ "input": [user("compacted summary"), call("c9", "ls"), output("c9", "a\nb\n")] });
+        let seen = transform(&mut body, &mut session, None, &Options::default());
+        assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(0)));
+        assert_eq!((session.prefix.lge_breaks, session.prefix.client_breaks), (1, 1));
+    }
+
+    #[test]
+    fn a_retry_makes_only_this_requests_new_decisions_raw() {
+        let run = clippy(30);
+        let mut session = Session::default();
+        let opts = Options::default();
+        let one = vec![call("c1", "cargo clippy --all-targets"), output("c1", &run)];
+        let mut body = json!({ "input": one.clone() });
+        transform(&mut body, &mut session, None, &opts);
+        let old = body["input"][1].clone();
+        let saved = session.saved.clone();
+        let prefix = session.prefix.clone();
+
+        let mut two = one.clone();
+        two.extend([call("c2", "pytest -v"), output("c2", &passing_run())]);
+        let mut body = json!({ "input": two.clone() });
+        let seen = transform(&mut body, &mut session, None, &opts);
+        assert_eq!(seen.new_decisions, 1);
+        assert_ne!(body["input"][3], two[3]);
+        session.revert_new();
+        assert_eq!(session.saved, saved, "the counters go back");
+        let mut retry = json!({ "input": two.clone() });
+        let seen = transform(&mut retry, &mut session, None, &opts);
+        assert_eq!(seen.new_decisions, 0);
+        assert_eq!(retry["input"][1], old, "an old decision replays");
+        assert_eq!(retry["input"][3], two[3], "the new one is sent as it is");
+        assert_eq!(session.saved, saved);
+        assert_eq!(session.prefix, prefix, "a retry is not a cache break");
+    }
+
+    #[test]
+    fn bodies_of_another_shape_pass_through() {
+        for mut body in [
+            json!({}),
+            json!({ "input": "a plain string" }),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+            json!([1, 2, 3]),
+        ] {
+            let before = body.clone();
+            transform(&mut body, &mut Session::default(), None, &Options::default());
+            assert_eq!(body, before);
+        }
+    }
+
+    #[test]
+    fn a_json_framed_output_keeps_its_frame() {
+        let run = passing_run();
+        let framed = json!({ "output": run, "metadata": { "exit_code": 0, "duration_seconds": 9.9 } }).to_string();
+        let mut body = json!({ "input": [call("c1", "pytest -v"), output("c1", &framed)] });
+        transform(&mut body, &mut Session::default(), None, &Options::default());
+        let new: Value = serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
+        assert!(new["output"].as_str().unwrap().starts_with("ok"), "{new}");
+        assert_eq!(new["metadata"]["exit_code"], 0);
+        // A non-zero exit with a passing tally is not called a pass.
+        let failed = json!({ "output": run, "metadata": { "exit_code": 1, "duration_seconds": 9.9 } }).to_string();
+        let mut body = json!({ "input": [call("c1", "pytest -v"), output("c1", &failed)] });
+        transform(&mut body, &mut Session::default(), None, &Options::default());
+        assert_eq!(body["input"][1]["output"], failed.as_str());
     }
 
     #[test]
@@ -791,5 +2318,56 @@ mod tests {
         let mut none = UsageScanner::default();
         none.feed(b"data: [DONE]\n\n");
         assert_eq!(none.usage, None);
+    }
+
+    #[test]
+    fn the_largest_new_outputs_and_the_tools_called_are_reported() {
+        let mut body = json!({
+            "prompt_cache_key": "conv-n",
+            "input": [
+                user("run the tests"),
+                call("c1", "pytest -v"),
+                output("c1", &passing_run()),
+                call("c2", "ls"),
+                output("c2", "a.py\nb.py\n"),
+                { "type": "function_call", "name": "shell", "namespace": "functions", "call_id": "c3", "arguments": json!({ "command": ["bash", "-lc", "cat a.py"] }).to_string() },
+                output("c3", "print('a')\n"),
+                { "type": "local_shell_call", "call_id": "c4", "status": "completed", "action": { "type": "exec", "command": ["bash", "-lc", "pwd"] } },
+                output("c4", "/repo\n"),
+                { "type": "web_search_call", "id": "ws_1", "status": "completed" },
+            ],
+        });
+        let mut session = Session::default();
+        let seen = transform(&mut body.clone(), &mut session, None, &Options::default());
+        assert_eq!(
+            seen.called_tools,
+            ["exec_command", "shell", "local_shell", "web_search"]
+        );
+        let largest: Vec<(&str, bool)> = seen
+            .largest_new_outputs
+            .iter()
+            .map(|o| (o.command.as_str(), o.shortened))
+            .collect();
+        assert_eq!(largest.len(), LARGEST_NEW_OUTPUTS);
+        assert_eq!(largest[0], ("pytest -v", true));
+        assert!(seen.largest_new_outputs[0].tokens > seen.largest_new_outputs[1].tokens);
+        // Codex's default namespace is no namespace: the call is a shell call.
+        assert!(largest.iter().any(|(c, _)| *c == "cat a.py"), "{largest:?}");
+
+        // Next turn: only the items added since count as new.
+        body["input"].as_array_mut().unwrap().push(call("c5", "git status"));
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(output("c5", "nothing to commit\n"));
+        let seen = transform(&mut body, &mut session, None, &Options::default());
+        assert_eq!(seen.largest_new_outputs.len(), 1);
+        assert_eq!(
+            (
+                seen.largest_new_outputs[0].command.as_str(),
+                seen.largest_new_outputs[0].shortened
+            ),
+            ("git status", false)
+        );
     }
 }

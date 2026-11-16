@@ -1,0 +1,2 @@
+vetme/v.go:6:22: fmt.Sprintf format %d has arg "three" of wrong type string
+vetme/v.go:10:14: fmt.Printf format %s reads arg #1, but call has 0 args

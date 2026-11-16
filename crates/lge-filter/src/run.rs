@@ -73,6 +73,7 @@ pub(crate) fn run_with(spec: &CheckSpec, base: &Path, max_output: usize) -> Resu
     let opts = FilterOptions {
         passed: Some(passed),
         max_bytes: MAX_FILTERED_BYTES.saturating_sub(notice.len()),
+        keep_warnings: false,
     };
     // Lossy on purpose: a stray byte in a log must not cost the whole report.
     let raw = String::from_utf8_lossy(&captured.bytes);

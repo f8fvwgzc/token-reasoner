@@ -26,6 +26,7 @@ lge-mcp = { path = "../lge-mcp" }
 lge-memory = { path = "../lge-memory" }
 lge-usage = { path = "../lge-usage" }
 lge-router = { path = "../lge-router" }
+regex = "1.13.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -1,0 +1,5 @@
+[ERROR] COMPILATION ERROR : 
+[ERROR] /home/dev/shop/src/main/java/com/example/App.java:[7,20] Symbol nicht gefunden
+  Symbol: Variable c
+  Ort: Klasse com.example.App
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile) on project shop: Kompilierungsfehler

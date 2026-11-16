@@ -1,0 +1,12 @@
+cc -Wall -Werror=implicit-function-declaration -c -o src/main.o src/main.c
+src/main.c: In function 'main':
+src/main.c:7:20: error: 'totl' undeclared (first use in this function); did you mean 'total'?
+    7 |     printf("%d\n", totl);
+      |                    ^~~~
+      |                    total
+src/main.c:7:20: note: each undeclared identifier is reported only once for each function it appears in
+src/main.c:8:5: error: implicit declaration of function 'report' [-Werror=implicit-function-declaration]
+    8 |     report(total);
+      |     ^~~~~~
+cc1: some warnings being treated as errors
+make: *** [<builtin>: src/main.o] Error 1

@@ -1,0 +1,22 @@
+Collecting requests==2.31.0
+  Downloading requests-2.31.0-py3-none-any.whl.metadata (4.6 kB)
+Collecting charset-normalizer<4,>=2 (from requests==2.31.0)
+  Downloading charset_normalizer-3.5.2-cp39-cp39-macosx_10_9_universal2.whl.metadata (46 kB)
+Collecting idna<4,>=2.5 (from requests==2.31.0)
+  Downloading idna-3.20-py3-none-any.whl.metadata (7.2 kB)
+Collecting urllib3<3,>=1.21.1 (from requests==2.31.0)
+  Downloading urllib3-2.6.3-py3-none-any.whl.metadata (6.9 kB)
+Collecting certifi>=2017.4.17 (from requests==2.31.0)
+  Downloading certifi-2026.10.23-py3-none-any.whl.metadata (2.5 kB)
+Downloading requests-2.31.0-py3-none-any.whl (62 kB)
+Downloading certifi-2026.10.23-py3-none-any.whl (135 kB)
+Downloading charset_normalizer-3.5.2-cp39-cp39-macosx_10_9_universal2.whl (374 kB)
+Downloading idna-3.20-py3-none-any.whl (69 kB)
+Downloading urllib3-2.6.3-py3-none-any.whl (131 kB)
+Installing collected packages: urllib3, idna, charset-normalizer, certifi, requests
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+botocore 1.31.1 requires urllib3<1.27,>=1.25.4, but you have urllib3 2.6.3 which is incompatible.
+Successfully installed certifi-2026.10.23 charset-normalizer-3.5.2 idna-3.20 requests-2.31.0 urllib3-2.6.3
+
+[notice] A new release of pip is available: 24.3.1 -> 26.0.1
+[notice] To update, run: /Library/Developer/CommandLineTools/usr/bin/python3 -m pip install --upgrade pip

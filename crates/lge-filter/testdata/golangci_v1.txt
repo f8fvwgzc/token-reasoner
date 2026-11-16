@@ -1,0 +1,12 @@
+cart/cart.go:12:12: Error return value of `f.Close` is not checked (errcheck)
+	defer f.Close()
+	          ^
+cart/cart.go:20:2: ineffectual assignment to total (ineffassign)
+	total := 0.0
+	^
+pricing/pricing.go:5:6: func `round` is unused (unused)
+func round(x float64) float64 {
+     ^
+go.mod:3:1: replacement are not allowed: example.com/lib (gomoddirectives)
+replace example.com/lib => ../lib
+^

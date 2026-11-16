@@ -12,6 +12,9 @@ use lge_store::{GraphStore, Store};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod discover;
+mod init;
+
 #[derive(Parser)]
 #[command(
     name = "lge",
@@ -172,6 +175,17 @@ enum Cmd {
         /// Register the MCP server by running `codex mcp add`.
         #[arg(long)]
         register: bool,
+        /// Add the batch line to the rule: related read-only commands in one exec script.
+        /// Not measured yet: compare with `lge ab --variant batch`.
+        #[arg(long)]
+        batch: bool,
+        /// The terse-replies Codex skill: `on` writes it, `always` also puts a short section in
+        /// AGENTS.md (with --write), `off` removes both where lge wrote them. Never on by default.
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "on")]
+        terse: Option<init::TerseMode>,
+        /// With --terse: the skill in your own skills folder (~/.agents/skills) for every repository.
+        #[arg(long, requires = "terse")]
+        global: bool,
     },
     /// Measure packs and routing against a file of tasks with known files.
     Bench {
@@ -220,6 +234,28 @@ struct AbArgs {
     /// Codex model for both arms. Default: `[session] model` in lge.toml, else Codex's own default.
     #[arg(long)]
     model: Option<String>,
+    /// What the arms differ in: `features` (lge's features off against on), `terse` (AGENTS.md
+    /// without against with the terse-replies section) or `batch` (the lge block without against
+    /// with the batch line). For terse and batch both arms use the daemon's settings as you set them.
+    #[arg(long, default_value = "features", value_parser = ["features", "terse", "batch"])]
+    variant: String,
+    /// Skip the preflight: by default each task's setup and check run on a fresh copy of the base
+    /// commit before any session, and the run stops when a check passes there or cannot run.
+    #[arg(long)]
+    no_preflight: bool,
+    /// Run only the preflight and print its table: no daemon, no session, no token spent.
+    #[arg(long, conflicts_with = "no_preflight")]
+    preflight_only: bool,
+    /// Resume a stopped run: the work dir it printed. Sessions in its results.jsonl that finished
+    /// are not run again; the report covers them all.
+    #[arg(long, value_name = "WORK_DIR", conflicts_with = "work_dir")]
+    resume: Option<PathBuf>,
+    /// With --resume: accept earlier results of another base commit, task file, model or variant.
+    #[arg(long, requires = "resume")]
+    force: bool,
+    /// Weights of billed-equivalent tokens in the report: uncached input, cached input, output.
+    #[arg(long, value_name = "IN,CACHED,OUT", default_value = "1,0.1,8")]
+    weights: String,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -234,6 +270,18 @@ enum UsageCmd {
         days: Option<i64>,
         #[arg(long)]
         json: bool,
+    },
+    /// Replay past Codex sessions (~/.codex, or CODEX_HOME) through lge's rules: what each rule
+    /// would remove, what no rule recognises, and commands that had to be corrected. Reads only.
+    Discover {
+        /// Sessions of the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+        #[arg(long)]
+        json: bool,
+        /// Store each correction seen at least twice as a convention fact in this repository's graph.
+        #[arg(long)]
+        retain: bool,
     },
 }
 
@@ -262,21 +310,6 @@ enum MemoryCmd {
     /// Print one page.
     Page { slug: String },
 }
-
-/// The rule Codex follows in this repository. Kept short: it is read in every session.
-const AGENTS_BLOCK: &str = "<!-- lge:start -->
-## Code graph (lge)
-
-This repository is indexed by a local code graph, served by the `local_graph` MCP tools.
-
-- Before the first grep, directory listing or file read for a code question, call `search_code_context` with the task or question. Put this rule in every sub-agent prompt that explores code.
-- Before editing a symbol or file, call `analyze_change_impact`: it lists the affected code and the tests to run.
-- Use `trace_execution_flow`, `find_dependencies` and `get_architecture_context` for how code connects, and `get_relevant_source` for exact lines.
-- Read raw files only for line ranges these tools located.
-- Edges marked inferred or unresolved are not verified: check them in the source.
-- `recall_memory` returns decisions and conventions from earlier sessions. At the end of a task, store one with `retain_memory`.
-<!-- lge:end -->
-";
 
 /// The git repository that holds `start`, else `start` itself.
 fn discover_repo(start: &Path) -> PathBuf {
@@ -383,8 +416,36 @@ fn main() -> Result<()> {
 
     // `init` only prints or edits text files: it must work while the MCP
     // server holds the database.
-    if let Cmd::Init { write, register } = &cli.cmd {
-        return init(&repo, *write, *register);
+    if let Cmd::Init {
+        write,
+        register,
+        batch,
+        terse,
+        global,
+    } = &cli.cmd
+    {
+        let exe = std::env::current_exe().context("cannot find the lge binary")?;
+        let exe = exe.canonicalize().unwrap_or(exe);
+        let places = init::Places {
+            repo: repo.clone(),
+            home: std::env::home_dir(),
+            exe: exe.to_string_lossy().to_string(),
+        };
+        let opts = init::InitOptions {
+            write: *write,
+            register: *register,
+            batch: *batch,
+            terse: *terse,
+            global: *global,
+        };
+        return init::run(&places, &opts, &mut std::io::stdout().lock());
+    }
+    // Discover reads Codex's session files; only --retain opens the graph.
+    if let Cmd::Usage {
+        cmd: UsageCmd::Discover { days, json, retain },
+    } = &cli.cmd
+    {
+        return usage_discover(&repo, &db, *days, *json, *retain);
     }
     // The A/B runner works in copies through the daemon; it never opens the repository's graph.
     if let Cmd::Ab(args) = &cli.cmd {
@@ -686,6 +747,9 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Usage {
+            cmd: UsageCmd::Discover { .. },
+        } => unreachable!("handled above"),
+        Cmd::Usage {
             cmd: UsageCmd::Report { days, json },
         } => {
             let since = days.map(|d| unix_now() - d * 86_400).unwrap_or(0);
@@ -786,9 +850,42 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
     }
     let file = ab::load_task_file(&args.tasks)?;
     let tasks = file.tasks;
+    let weights = ab::Weights::parse(&args.weights)?;
+    let variant: ab::Variant = args.variant.parse()?;
     let session = lge_session::load_config(repo)?;
     // Before the daemon is asked anything: a wrong revision is a typo.
     let base = ab::resolve_commit(repo, &args.base)?;
+    let work_dir = args
+        .resume
+        .clone()
+        .or_else(|| args.work_dir.clone())
+        .unwrap_or_else(ab::default_work_dir);
+    let mut opts = ab::AbOptions::new(work_dir.clone());
+    opts.runs = args.runs;
+    opts.base = base.clone();
+    opts.model = args
+        .model
+        .clone()
+        .or_else(|| (!session.model.is_empty()).then(|| session.model.clone()));
+    opts.sandbox = (!args.sandbox.is_empty()).then(|| args.sandbox.clone());
+    opts.approve_for_me = !args.no_approve_for_me;
+    opts.note = ab::resolve_note(file.note.as_deref(), args.no_note);
+    opts.variant = variant;
+    opts.weights = weights;
+    opts.preflight = !args.no_preflight;
+    opts.resume = args.resume.is_some();
+    opts.force = args.force;
+    opts.tasks_hash = file.hash.clone();
+    let log = |m: &str| eprintln!("lge ab: {m}");
+    if args.preflight_only {
+        ab::interrupt::install();
+        let checked = ab::run_preflight(repo, &tasks, &opts, &ab::interrupt::requested, &log)?;
+        print!("{}", checked.render());
+        if !checked.ok() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let daemon = ab::HttpDaemon::new(&args.daemon)?;
     daemon.status()?;
     if !args.no_codex_check {
@@ -805,24 +902,25 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
         }
     }
     let runner = CodexRunner::new(session.codex_bin.clone());
-    let mut opts = ab::AbOptions::new(args.work_dir.clone().unwrap_or_else(ab::default_work_dir));
-    opts.runs = args.runs;
-    opts.base = base.clone();
-    opts.model = args
-        .model
-        .clone()
-        .or_else(|| (!session.model.is_empty()).then(|| session.model.clone()));
-    opts.sandbox = (!args.sandbox.is_empty()).then(|| args.sandbox.clone());
-    opts.approve_for_me = !args.no_approve_for_me;
-    opts.note = ab::resolve_note(file.note.as_deref(), args.no_note);
     eprintln!(
-        "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions, one after another, each in its own \
+        "lge ab: {} task(s) x {} run(s) x 2 arms = {} Codex sessions{}, one after another, each in its own \
          git worktree of commit {base} of {} under {}",
         tasks.len(),
         opts.runs,
         tasks.len() * opts.runs * 2,
+        if opts.resume {
+            " at most (finished ones are not run again)"
+        } else {
+            ""
+        },
         repo.display(),
         opts.work_dir.display()
+    );
+    eprintln!("lge ab: variant {variant}");
+    eprintln!(
+        "lge ab: results go to {}; to resume after a stop: {}",
+        work_dir.join(ab::RESULTS_FILE).display(),
+        resume_command(repo, args, &base, &work_dir)
     );
     match &opts.note {
         Some(note) => eprintln!("lge ab: note appended to every prompt: {note}"),
@@ -830,7 +928,6 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
     }
     eprintln!("lge ab: the daemon's settings are switched during the run and restored at the end (Ctrl-C too)");
     ab::interrupt::install();
-    let log = |m: &str| eprintln!("lge ab: {m}");
     let env = ab::AbEnv {
         daemon: &daemon,
         runner: &runner,
@@ -844,6 +941,10 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
         print!("{}", ab::render(&report));
     }
     if report.interrupted {
+        eprintln!(
+            "lge ab: stopped; to run what is missing: {}",
+            resume_command(repo, args, &base, &work_dir)
+        );
         std::process::exit(130);
     }
     if !report.settings_restored {
@@ -852,55 +953,194 @@ fn ab(repo: &Path, args: &AbArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print, and on request apply, what connects this repository to Codex.
-fn init(repo: &Path, write: bool, register: bool) -> Result<()> {
-    let exe = std::env::current_exe().context("cannot find the lge binary")?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    println!("A. The proxy: every Codex session goes through lge, nothing else to remember.\n");
-    println!("   1. Start the daemon:  lge serve      (or, in Docker:  docker compose up -d)");
-    println!("   2. Add one line to ~/.codex/config.toml (the CLI and the desktop app read the same file;");
-    println!("      your ChatGPT or API-key login stays as it is):\n");
-    println!("        openai_base_url = \"http://127.0.0.1:8787/v1\"\n");
-    println!("   3. Open http://127.0.0.1:8787 to add folders and see tokens per session.");
-    println!("      Graph tools for the agent:  codex mcp add local_graph --url http://127.0.0.1:8787/mcp\n");
-
-    let command = ["mcp", "add", "local_graph", "--", &exe.to_string_lossy(), "mcp"].map(str::to_string);
-    println!("B. Without the daemon: the graph tools only, started by Codex in the repository it works in.\n");
-    println!("   lge index");
-    println!("   codex {}\n", command.join(" "));
-    if register {
-        let status = std::process::Command::new("codex")
-            .args(&command)
-            .status()
-            .context("cannot run `codex`; is the Codex CLI on PATH?")?;
-        if !status.success() {
-            bail!("`codex mcp add` failed");
-        }
-        println!("   registered.\n");
+/// A word as the shell reads it: quoted when it holds anything but plain characters.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=,@%+".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
+}
 
-    let agents = repo.join("AGENTS.md");
-    println!(
-        "C. The rule that makes the agent ask the graph first belongs in {}:\n",
-        agents.display()
-    );
-    println!("{AGENTS_BLOCK}");
-    if write {
-        let old = std::fs::read_to_string(&agents).unwrap_or_default();
-        let new = match (old.find("<!-- lge:start -->"), old.find("<!-- lge:end -->")) {
-            (Some(start), Some(end)) if end > start => {
-                let after = &old[end + "<!-- lge:end -->".len()..];
-                format!("{}{}{}", &old[..start], AGENTS_BLOCK.trim_end(), after)
-            }
-            _ if old.trim().is_empty() => AGENTS_BLOCK.to_string(),
-            _ => format!("{}\n\n{AGENTS_BLOCK}", old.trim_end()),
-        };
-        if new != old {
-            std::fs::write(&agents, new).with_context(|| format!("cannot write {}", agents.display()))?;
-            println!("   written to {}.", agents.display());
-        } else {
-            println!("   {} already has this block.", agents.display());
+/// The command that resumes this run: the same task file, repository, base
+/// commit and options, with `--resume <work dir>`.
+fn resume_command(repo: &Path, args: &AbArgs, base: &str, work_dir: &Path) -> String {
+    let tasks = args.tasks.canonicalize().unwrap_or_else(|_| args.tasks.clone());
+    let mut words: Vec<String> = vec![
+        "lge".into(),
+        "ab".into(),
+        shell_word(&tasks.to_string_lossy()),
+        "--repo".into(),
+        shell_word(&repo.to_string_lossy()),
+        "--base".into(),
+        base.to_string(),
+        "--runs".into(),
+        args.runs.to_string(),
+    ];
+    let mut option = |name: &str, value: &str| {
+        words.push(name.to_string());
+        words.push(shell_word(value));
+    };
+    if let Some(model) = &args.model {
+        option("--model", model);
+    }
+    if args.variant != "features" {
+        option("--variant", &args.variant);
+    }
+    if args.sandbox != "workspace-write" {
+        option("--sandbox", &args.sandbox);
+    }
+    if args.daemon != "http://127.0.0.1:8787" {
+        option("--daemon", &args.daemon);
+    }
+    if args.weights != "1,0.1,8" {
+        option("--weights", &args.weights);
+    }
+    for (set, flag) in [
+        (args.no_approve_for_me, "--no-approve-for-me"),
+        (args.no_note, "--no-note"),
+        (args.no_codex_check, "--no-codex-check"),
+        (args.no_preflight, "--no-preflight"),
+        (args.json, "--json"),
+    ] {
+        if set {
+            words.push(flag.to_string());
         }
+    }
+    words.push("--resume".into());
+    words.push(shell_word(&work_dir.to_string_lossy()));
+    words.join(" ")
+}
+
+/// `lge usage discover`: the replay of past Codex sessions, and with
+/// `--retain` the corrected commands seen at least twice in sessions that
+/// worked inside `repo`, as facts in its graph.
+fn usage_discover(repo: &Path, db: &Path, days: i64, json: bool, retain: bool) -> Result<()> {
+    if days <= 0 {
+        bail!("--days must be at least 1");
+    }
+    let home = lge_usage::codex_home();
+    // Facts go into this repository's graph: only its own sessions' corrections.
+    let report = lge_proxy::discover::replay_for(&home, days, retain.then_some(repo))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", discover::render(&report));
+    }
+    if report.files == 0 {
+        eprintln!(
+            "no Codex session files of the last {days} day(s) under {}",
+            home.display()
+        );
+    }
+    if retain {
+        let store = open(db)?;
+        let stored = discover::retain_corrections(&store, &report, unix_now())?;
+        if stored.is_empty() {
+            eprintln!(
+                "nothing retained: no correction was seen {} times or more",
+                discover::MIN_SEEN
+            );
+        }
+        for (key, outcome) in stored {
+            eprintln!("retained {key}: {outcome:?}");
+        }
+    } else if !discover::corrections(&report).is_empty() {
+        eprintln!("--retain stores the corrections seen at least twice as convention facts in this repository's graph");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    fn ab_args(args: &[&str]) -> AbArgs {
+        let mut all = vec!["lge", "ab"];
+        all.extend_from_slice(args);
+        match Cli::try_parse_from(all).unwrap().cmd {
+            Cmd::Ab(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn the_resume_command_repeats_the_options_that_matter() {
+        let args = ab_args(&[
+            "tasks.toml",
+            "--runs",
+            "3",
+            "--model",
+            "gpt-x",
+            "--variant",
+            "terse",
+            "--no-note",
+            "--weights",
+            "1,0.2,6",
+            "--work-dir",
+            "/tmp/old",
+        ]);
+        let cmd = resume_command(
+            Path::new("/work/my repo"),
+            &args,
+            "4f9c2a1e",
+            Path::new("/tmp/lge-ab-1"),
+        );
+        assert_eq!(
+            cmd,
+            "lge ab tasks.toml --repo '/work/my repo' --base 4f9c2a1e --runs 3 --model gpt-x --variant terse \
+             --weights 1,0.2,6 --no-note --resume /tmp/lge-ab-1"
+        );
+        let plain = ab_args(&["t.toml"]);
+        assert_eq!(
+            resume_command(Path::new("/r"), &plain, "abc", Path::new("/w")),
+            "lge ab t.toml --repo /r --base abc --runs 1 --resume /w"
+        );
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ab_flags_parse_and_conflict_where_they_should() {
+        let a = ab_args(&["t.toml", "--resume", "/w", "--force", "--no-preflight"]);
+        assert_eq!(a.resume.as_deref(), Some(Path::new("/w")));
+        assert!(a.force && a.no_preflight && !a.preflight_only);
+        assert_eq!((a.variant.as_str(), a.weights.as_str()), ("features", "1,0.1,8"));
+        for bad in [
+            vec!["lge", "ab", "t.toml", "--force"],
+            vec!["lge", "ab", "t.toml", "--resume", "/w", "--work-dir", "/x"],
+            vec!["lge", "ab", "t.toml", "--preflight-only", "--no-preflight"],
+            vec!["lge", "ab", "t.toml", "--variant", "other"],
+            vec!["lge", "init", "--global"],
+        ] {
+            assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+        for (args, terse) in [
+            (vec!["lge", "init", "--terse"], Some(init::TerseMode::On)),
+            (vec!["lge", "init", "--terse", "--write"], Some(init::TerseMode::On)),
+            (vec!["lge", "init", "--terse=always"], Some(init::TerseMode::Always)),
+            (vec!["lge", "init", "--terse", "off"], Some(init::TerseMode::Off)),
+            (vec!["lge", "init"], None),
+        ] {
+            match Cli::try_parse_from(&args).unwrap().cmd {
+                Cmd::Init { terse: t, .. } => assert_eq!(t, terse, "{args:?}"),
+                _ => unreachable!(),
+            }
+        }
+        match Cli::try_parse_from(["lge", "usage", "discover"]).unwrap().cmd {
+            Cmd::Usage {
+                cmd: UsageCmd::Discover { days, json, retain },
+            } => assert_eq!((days, json, retain), (30, false, false)),
+            _ => unreachable!(),
+        }
+    }
 }

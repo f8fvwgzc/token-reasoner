@@ -399,6 +399,227 @@ fn money(amount: Option<f64>) -> String {
     amount.map_or_else(|| "-".to_string(), |amount| format!("{amount:.4}"))
 }
 
+// ---------------------------------------------------------------------------
+// Holdout arms
+// ---------------------------------------------------------------------------
+
+/// `mode` of a conversation that went through the proxy with its rules.
+pub const PROXY_ARM: &str = "proxy";
+/// `mode` of a conversation in the holdout arm: every rule in shadow, the
+/// client's bytes forwarded.
+pub const HOLDOUT_ARM: &str = "proxy-holdout";
+/// Below this many sessions in either arm, no difference is reported.
+pub const MIN_ARM_SESSIONS: usize = 30;
+/// Resamples of the bootstrap interval.
+const BOOTSTRAP_RESAMPLES: usize = 2000;
+/// A fixed seed: the same records always give the same interval.
+const BOOTSTRAP_SEED: u64 = 0x6c67_655f_6172_6d73;
+
+/// The per-session measures compared between the arms, in this order.
+pub const ARM_METRICS: [&str; 7] = [
+    "input_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "requests",
+    "removed_tokens_sent",
+];
+
+/// One arm: its sessions and the median of each measure in [`ARM_METRICS`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ArmStats {
+    pub arm: String,
+    pub sessions: usize,
+    pub medians: BTreeMap<String, f64>,
+}
+
+/// The difference of the medians of one measure, proxy arm less holdout arm,
+/// with its 95% bootstrap interval.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricDiff {
+    pub metric: String,
+    pub difference: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+/// The proxy arm against the holdout arm.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ArmComparison {
+    pub proxy: ArmStats,
+    pub holdout: ArmStats,
+    /// One per measure; empty while either arm has fewer than
+    /// [`MIN_ARM_SESSIONS`] sessions.
+    pub differences: Vec<MetricDiff>,
+    /// `not enough sessions` while either arm is below the minimum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The value of one measure for one session. `requests` is read from the
+/// monitor JSON the proxy writes; a record without it counts 0.
+fn metric(rec: &UsageRecord, name: &str) -> f64 {
+    let u = TokenUsage::of(rec);
+    match name {
+        "input_tokens" => u.input_tokens as f64,
+        "cached_input_tokens" => u.cached_input_tokens as f64,
+        "uncached_input_tokens" => u.uncached_input_tokens() as f64,
+        "output_tokens" => u.output_tokens as f64,
+        "reasoning_tokens" => u.reasoning_tokens as f64,
+        "requests" => serde_json::from_str::<serde_json::Value>(&rec.monitor)
+            .ok()
+            .and_then(|m| m.get("requests").and_then(serde_json::Value::as_f64))
+            .unwrap_or(0.0),
+        "removed_tokens_sent" => rec.removed_tokens_sent.max(0) as f64,
+        _ => 0.0,
+    }
+}
+
+/// Compare the sessions of the two proxy arms, told apart by `mode`
+/// ([`PROXY_ARM`], [`HOLDOUT_ARM`]); other records are ignored. Differences
+/// are proxy less holdout, so a negative input difference is a saving.
+pub fn compare_arms(records: &[UsageRecord]) -> ArmComparison {
+    let arm = |mode: &str| -> Vec<&UsageRecord> { records.iter().filter(|r| r.mode == mode).collect() };
+    let (proxy, holdout) = (arm(PROXY_ARM), arm(HOLDOUT_ARM));
+    let stats = |name: &str, recs: &[&UsageRecord]| ArmStats {
+        arm: name.to_string(),
+        sessions: recs.len(),
+        medians: ARM_METRICS
+            .iter()
+            .map(|m| {
+                let values: Vec<f64> = recs.iter().map(|r| metric(r, m)).collect();
+                (m.to_string(), median(&values))
+            })
+            .collect(),
+    };
+    let mut out = ArmComparison {
+        proxy: stats(PROXY_ARM, &proxy),
+        holdout: stats(HOLDOUT_ARM, &holdout),
+        differences: Vec::new(),
+        note: None,
+    };
+    if proxy.len() < MIN_ARM_SESSIONS || holdout.len() < MIN_ARM_SESSIONS {
+        out.note = Some("not enough sessions".to_string());
+        return out;
+    }
+    for (k, m) in ARM_METRICS.iter().enumerate() {
+        let a: Vec<f64> = proxy.iter().map(|r| metric(r, m)).collect();
+        let b: Vec<f64> = holdout.iter().map(|r| metric(r, m)).collect();
+        let (difference, low, high) = bootstrap_median_diff(&a, &b, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED + k as u64);
+        out.differences.push(MetricDiff {
+            metric: m.to_string(),
+            difference,
+            low,
+            high,
+        });
+    }
+    out
+}
+
+/// The median; 0 for no values. An even count gives the mean of the middle two.
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    }
+}
+
+/// The `p`-th percentile (0 to 100) of sorted values, interpolated linearly.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = p / 100.0 * (sorted.len() - 1) as f64;
+    let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+    sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
+}
+
+/// xorshift64*: small, fast and the same on every platform.
+struct XorShift(u64);
+
+impl XorShift {
+    fn new(seed: u64) -> XorShift {
+        XorShift(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// An index below `n` (`n > 0`).
+    fn below(&mut self, n: usize) -> usize {
+        ((self.next() >> 11) as f64 / (1u64 << 53) as f64 * n as f64) as usize % n
+    }
+}
+
+/// The difference of medians `median(a) - median(b)` and its 95% bootstrap
+/// interval: each of `resamples` rounds draws both samples again with
+/// replacement, and the interval is the 2.5th and 97.5th percentiles of the
+/// differences. Deterministic for a seed (xorshift64*). `(0, 0, 0)` when
+/// either sample is empty.
+pub fn bootstrap_median_diff(a: &[f64], b: &[f64], resamples: usize, seed: u64) -> (f64, f64, f64) {
+    if a.is_empty() || b.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let diff = median(a) - median(b);
+    if resamples == 0 {
+        return (diff, diff, diff);
+    }
+    let mut rng = XorShift::new(seed);
+    let mut draws = Vec::with_capacity(resamples);
+    let (mut ra, mut rb) = (vec![0.0; a.len()], vec![0.0; b.len()]);
+    for _ in 0..resamples {
+        for x in ra.iter_mut() {
+            *x = a[rng.below(a.len())];
+        }
+        for x in rb.iter_mut() {
+            *x = b[rng.below(b.len())];
+        }
+        draws.push(median(&ra) - median(&rb));
+    }
+    draws.sort_by(f64::total_cmp);
+    (diff, percentile(&draws, 2.5), percentile(&draws, 97.5))
+}
+
+/// A 95% bootstrap interval for any statistic: `statistic` is called
+/// `resamples` times with a sampler that returns an index below its argument
+/// (drawn with replacement, xorshift64* seeded with `seed`, so the result is
+/// the same for the same seed), and the interval is the 2.5th and 97.5th
+/// percentiles of the values it returns. A round that returns `None` (no
+/// value for that resample) is left out. `None` when no round gave a value.
+pub fn bootstrap_interval(
+    resamples: usize,
+    seed: u64,
+    mut statistic: impl FnMut(&mut dyn FnMut(usize) -> usize) -> Option<f64>,
+) -> Option<(f64, f64)> {
+    let mut rng = XorShift::new(seed);
+    let mut draws = Vec::with_capacity(resamples);
+    for _ in 0..resamples {
+        let mut below = |n: usize| if n == 0 { 0 } else { rng.below(n) };
+        if let Some(v) = statistic(&mut below).filter(|v| v.is_finite()) {
+            draws.push(v);
+        }
+    }
+    if draws.is_empty() {
+        return None;
+    }
+    draws.sort_by(f64::total_cmp);
+    Some((percentile(&draws, 2.5), percentile(&draws, 97.5)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,5 +1343,94 @@ retry: tokens of attempts that were followed by an escalation
         assert_eq!(percent(0.4923), "49.2%");
         assert_eq!(money(Some(1.0)), "1.0000");
         assert_eq!(money(None), "-");
+    }
+
+    fn arm_record(i: usize, mode: &str, input: i64, requests: u64) -> UsageRecord {
+        UsageRecord {
+            id: format!("{mode}-{i}"),
+            mode: mode.to_string(),
+            input_tokens: input,
+            cached_input_tokens: input / 2,
+            output_tokens: 1000,
+            reasoning_tokens: 400,
+            removed_tokens_sent: if mode == PROXY_ARM { 5000 } else { 0 },
+            monitor: format!("{{\"requests\":{requests},\"raw_retries\":0}}"),
+            ..UsageRecord::default()
+        }
+    }
+
+    #[test]
+    fn bootstrap_is_deterministic_and_brackets_the_difference() {
+        let a: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        let b: Vec<f64> = (0..40).map(|i| 150.0 + i as f64).collect();
+        let first = bootstrap_median_diff(&a, &b, 500, 7);
+        assert_eq!(first, bootstrap_median_diff(&a, &b, 500, 7), "same seed, same result");
+        let (mut s7, mut s8) = (XorShift::new(7), XorShift::new(8));
+        assert_ne!(
+            (s7.next(), s7.next()),
+            (s8.next(), s8.next()),
+            "another seed draws otherwise"
+        );
+        let (diff, low, high) = first;
+        assert_eq!(diff, -50.0);
+        assert!(low <= diff && diff <= high && low < high, "{first:?}");
+        assert!(low > -70.0 && high < -30.0, "{first:?}");
+        assert_eq!(bootstrap_median_diff(&[], &b, 10, 1), (0.0, 0.0, 0.0));
+        assert_eq!(bootstrap_median_diff(&[1.0], &[3.0], 0, 1), (-2.0, -2.0, -2.0));
+        assert_eq!(median(&[3.0, 1.0, 2.0, 10.0]), 2.5);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 50.0), 2.0);
+    }
+
+    #[test]
+    fn a_bootstrap_interval_of_any_statistic_is_deterministic() {
+        let values: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let mean_of_resample = |below: &mut dyn FnMut(usize) -> usize| {
+            let draw: Vec<f64> = (0..values.len()).map(|_| values[below(values.len())]).collect();
+            Some(draw.iter().sum::<f64>() / draw.len() as f64)
+        };
+        let first = bootstrap_interval(400, 3, mean_of_resample).unwrap();
+        assert_eq!(Some(first), bootstrap_interval(400, 3, mean_of_resample));
+        let (low, high) = first;
+        assert!(low < 24.5 && 24.5 < high && high - low < 20.0, "{first:?}");
+        // Rounds without a value are left out; none at all gives no interval.
+        assert_eq!(bootstrap_interval(10, 1, |_| None), None);
+        assert_eq!(bootstrap_interval(0, 1, |_| Some(1.0)), None);
+        assert_eq!(bootstrap_interval(5, 1, |_| Some(2.0)), Some((2.0, 2.0)));
+    }
+
+    #[test]
+    fn arms_are_compared_by_mode_with_medians_and_intervals() {
+        let mut records: Vec<UsageRecord> = (0..31)
+            .map(|i| arm_record(i, PROXY_ARM, 80_000 + 100 * i as i64, 20))
+            .chain((0..30).map(|i| arm_record(i, HOLDOUT_ARM, 100_000 + 100 * i as i64, 25)))
+            .collect();
+        records.push(UsageRecord {
+            mode: "history".to_string(),
+            input_tokens: 1,
+            ..UsageRecord::default()
+        });
+        let c = compare_arms(&records);
+        assert_eq!((c.proxy.sessions, c.holdout.sessions), (31, 30));
+        assert_eq!(c.note, None);
+        assert_eq!(c.proxy.medians["input_tokens"], 81_500.0);
+        assert_eq!(c.holdout.medians["input_tokens"], 101_450.0);
+        assert_eq!(c.proxy.medians["requests"], 20.0);
+        assert_eq!(c.holdout.medians["uncached_input_tokens"], 50_725.0);
+        assert_eq!(c.proxy.medians["removed_tokens_sent"], 5000.0);
+        let metrics: Vec<&str> = c.differences.iter().map(|d| d.metric.as_str()).collect();
+        assert_eq!(metrics, ARM_METRICS);
+        let input = &c.differences[0];
+        assert_eq!(input.difference, -19_950.0);
+        assert!(input.low <= input.difference && input.difference <= input.high);
+        assert_eq!(c.differences[5].difference, -5.0, "requests per session");
+        assert_eq!(compare_arms(&records), c, "deterministic");
+
+        // One arm short of the minimum: medians, no differences.
+        let few = compare_arms(&records[..40]);
+        assert_eq!((few.proxy.sessions, few.holdout.sessions), (31, 9));
+        assert_eq!(few.note.as_deref(), Some("not enough sessions"));
+        assert!(few.differences.is_empty());
+        let none = compare_arms(&[]);
+        assert_eq!(none.proxy.medians["input_tokens"], 0.0);
     }
 }

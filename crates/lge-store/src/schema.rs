@@ -70,7 +70,9 @@ const KEPT_TABLES: &[(&str, &str)] = &[
          model STRING, session_id STRING, started_at INT64, finished_at INT64, input_tokens INT64, \
          cached_input_tokens INT64, reasoning_tokens INT64, output_tokens INT64, pack_tokens INT64, \
          outcome STRING, escalated BOOLEAN, files STRING[], services STRING[], \
-         recommended_level STRING DEFAULT '', mode STRING DEFAULT '', PRIMARY KEY(id)",
+         recommended_level STRING DEFAULT '', mode STRING DEFAULT '', rule_stats STRING DEFAULT '', \
+         monitor STRING DEFAULT '', removed_tokens_sent INT64 DEFAULT 0, added_tokens_sent INT64 DEFAULT 0, \
+         PRIMARY KEY(id)",
     ),
     (
         "HandoffNote",
@@ -95,6 +97,10 @@ const KEPT_TABLES: &[(&str, &str)] = &[
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("UsageRecord", "recommended_level", "STRING DEFAULT ''"),
     ("UsageRecord", "mode", "STRING DEFAULT ''"),
+    ("UsageRecord", "rule_stats", "STRING DEFAULT ''"),
+    ("UsageRecord", "monitor", "STRING DEFAULT ''"),
+    ("UsageRecord", "removed_tokens_sent", "INT64 DEFAULT 0"),
+    ("UsageRecord", "added_tokens_sent", "INT64 DEFAULT 0"),
 ];
 
 /// Graph, index-run and staging tables: dropped by a migration and rebuilt by

@@ -1,0 +1,12 @@
+In file included from src/main.c:2:
+src/util.h:4:1: error: unknown type name 'unknown_t'
+    4 | unknown_t helper(void);
+      | ^
+src/main.c:7:20: error: use of undeclared identifier 'totl'; did you mean 'total'?
+    7 |     printf("%d\n", totl);
+      |                    ^~~~
+      |                    total
+src/main.c:6:9: note: 'total' declared here
+    6 |     int total = add(1, 2);
+      |         ^
+2 errors generated.

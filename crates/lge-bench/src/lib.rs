@@ -8,6 +8,7 @@
 //! usage log, not here.
 
 pub mod ab;
+pub mod agents;
 
 use anyhow::{Context, Result};
 use lge_core::Level;

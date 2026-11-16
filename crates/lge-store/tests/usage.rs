@@ -206,3 +206,25 @@ fn the_usage_log_is_independent_of_the_graph() {
     store.replace_edges(&resolved, COMMIT, NOW + 5).unwrap();
     assert_eq!(store.stats().unwrap(), stats);
 }
+
+#[test]
+fn a_usage_record_is_found_by_id() {
+    let (_dir, store) = open();
+    assert_eq!(store.get_usage("u1").unwrap(), None);
+    let mut rec = usage("u1", "t1", 1, 1000);
+    rec.mode = "proxy".to_string();
+    rec.rule_stats = r#"{"by_rule":{"check":{"items":3,"judged":2,"recovered":1}},"condensed_upstream":0}"#.to_string();
+    rec.monitor = r#"{"prefix":{"lge_breaks":0,"client_breaks":1},"raw_retries":0}"#.to_string();
+    rec.removed_tokens_sent = 98_765;
+    rec.added_tokens_sent = 4_321;
+    store.put_usage(&rec).unwrap();
+    store.put_usage(&usage("u2", "t2", 1, 1100)).unwrap();
+    assert_eq!(store.get_usage("u1").unwrap(), Some(rec.clone()));
+    // Written again with larger counts: the same record, replaced.
+    rec.input_tokens += 10;
+    rec.removed_tokens_sent += 1;
+    store.put_usage(&rec).unwrap();
+    assert_eq!(store.get_usage("u1").unwrap(), Some(rec));
+    assert_eq!(store.list_usage(0).unwrap().len(), 2);
+    assert_eq!(store.get_usage("u3").unwrap(), None);
+}

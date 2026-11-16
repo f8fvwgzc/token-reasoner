@@ -31,9 +31,9 @@ lge-retrieve  index pipeline, traversal, evidence packs      -> core, index, res
 lge-router    reasoning router v0 and v1                     -> core, store, retrieve
 lge-session   prompt builder and session runner              -> core, store, retrieve, router, usage, filter
 lge-mcp       rmcp stdio server, six tools, watcher          -> core, store, retrieve
-lge-bench     benchmark runner                               -> core, store, retrieve, router
+lge-bench     benchmark runner, lge ab, AGENTS.md texts       -> core, store, retrieve, router, session, usage
 lge-memory    long-term memory: retain, recall, pages          -> core, store, retrieve
-lge-proxy     daemon: proxy, usage page, MCP over HTTP         -> core, store, retrieve, filter, mcp, memory, usage, router
+lge-proxy     daemon: proxy, rules, usage page, MCP over HTTP  -> core, store, retrieve, index, filter, mcp, memory, usage, router
 lge-cli       the `lge` binary                               -> everything
 ```
 
@@ -181,7 +181,12 @@ tables `CallSite`, `ImportSite` and `FactSite` hold what the indexer extracted;
 Every relationship table except CONTAINS has the columns
 `confidence DOUBLE, method STRING, evidence_file STRING, start_line INT64, end_line INT64, commit STRING, created_at INT64`.
 An older schema version is migrated by dropping and recreating the graph tables (they
-are rebuilt by the next `lge index`); usage and handoff tables are kept.
+are rebuilt by the next `lge index`); usage and handoff tables are kept. A kept table
+that gained columns after its first release gets them added (`ADDED_COLUMNS`), and rows
+written before read the default: v0.0.2 added `UsageRecord.rule_stats` and `monitor`
+(JSON strings of counts, written by the proxy), `removed_tokens_sent` and
+`added_tokens_sent`. `GraphStore::get_usage(id)` reads one record, which the proxy uses to
+continue a conversation's counters after a restart.
 
 ## lge-usage
 
@@ -191,12 +196,41 @@ builds `UsageRecord`s, and aggregates them into a report: per level and overall,
 attempts, escalations, success rate, tokens by class, cached share of input, and cost
 from a configurable price table. No database access; callers persist through `GraphStore`.
 
+It also reads what replaying a session needs: `rollout_items` (tool calls and their
+outputs), `rollout_files` (the session files of the last days, archived ones included),
+`rollout_requests` and `rollout_cwd`. `compare_arms` compares the proxy's two arms
+(`proxy`, `proxy-holdout`) by per-session medians with `bootstrap_median_diff` (95%
+interval, 2,000 resamples, xorshift64* with a fixed seed), and only from 30 sessions per
+arm (`MIN_ARM_SESSIONS`); `bootstrap_interval` is the same resampling for any statistic,
+which `lge ab` uses for its interval clustered by task.
+
 ## lge-filter
 
 Runs the configured or auto-detected lint, type and test commands for a repository and
 reduces their output to failures: file, line, rule or test name, message, and a short
 excerpt. Adds the `git diff` hunks of the files named in failures. Reports raw and
 filtered sizes so the saving can be measured. Never drops a failing test.
+
+- Parsers, one per tool (`parse/`): pytest, cargo (rustc, clippy, libtest and nextest,
+  suites counted), jest, vitest, tsc, eslint, pyright, mypy, ruff and flake8, and since
+  v0.0.2 go (`go.rs`: go test text and `-json`, go build, go vet, panics), golangci-lint
+  (`golangci.rs`), Maven (`maven.rs`), Gradle (`gradle.rs`, Kotlin diagnostics included)
+  and gcc/clang (`cc.rs`, linker errors included; last when the tool is not known,
+  because its diagnostic line is the most generic). When the tool is not known, every
+  parser runs and their failures are merged; a parser that owns a file type (C sources,
+  JVM sources) drops the generic readers' duplicates of its lines.
+- `filter_for_proxy(tool, text, opts) -> ProxyFiltered`: the proxy's entry. Beside the
+  failures and the text it says whether a parser recognised the output, whether the
+  tool's own closing line is in it (`closed`), whether anything but the tool's epilogue
+  follows that line (`trailing`), and how many failures the tool counted or a line said it
+  had that no parser read (`unparsed`). With `keep_warnings`, warnings are kept, grouped by
+  rule with every location (`format::group_by_rule`), and never capped. `lge check`
+  (`filter_output`, `filter_with`) is unchanged by these: its output stays byte-identical.
+- `normalize_terminal` (escape codes removed, carriage-return redraws applied, trailing
+  blanks trimmed), `strip_ansi`, and `collapse_repeats` (`repeat.rs`: a run of 3 or more
+  identical lines of 8 or more characters becomes the line and
+  `lge: the line above repeats N more times`). Each is idempotent and returns the input
+  itself when nothing changes.
 
 ## lge-retrieve
 
@@ -236,6 +270,71 @@ rmcp stdio server exposing `search_code_context`, `trace_execution_flow`,
 `get_architecture_context`. Every result carries the indexed commit. Before answering,
 files that changed since they were indexed are re-indexed. The server process owns all
 writes, including the file watcher.
+
+## lge-proxy
+
+The daemon (`server.rs`) and the decisions it makes on each Responses request.
+
+| Module | Role |
+|---|---|
+| `server.rs` | HTTP: the proxy, the page and its API, MCP over HTTP. Settings and `daemon.json`, conversations and their usage records (restored after a restart), the holdout bucket, the retry after a refused request, cold restarts, the periodic recovery check and demotion, the fixed-prefix tool registry, request traces in memory |
+| `responses.rs` | One request body: the history of tool calls (shell, code-mode script, patch, other tool; whether each may change files), the frames around an output (`Exit code:`, `Wall time ... Output:`, a JSON object, exec results as JSON lines), and `transform`, which rewrites tool outputs and adds packs in conversation order |
+| `session.rs` | What one conversation remembers: each item's decision, replayed first; the rule chain for a new item; follow-up judging (`judge`); the cache-break comparison (`compare_prefix`); the ledger of hash prefixes and rule ids kept with the record; `begin_request` and `revert_new` for the retry; `shadow_decide` for replays |
+| `rules.rs` | The twelve rule ids, their kinds (lossy, lossless, measure-only), modes and defaults, per-rule and per-cohort counters, and the fixed thresholds (`FOLLOW_UP_CALLS` 3, `SKELETON_FOLLOW_UP_CALLS` 5, `MIN_JUDGED` 200, `DEMOTE_ABOVE` 0.15, `HEALTHY_BELOW` 0.05) |
+| `command.rs` | What a shell command was for (`purpose`): normalisation (leading statements that print nothing, wrappers, `LGE_RAW=1`, `rtk`), whether it is one producer and whether its exit status is masked, subcommand allowlists, read forms, read-only commands, patch paths; `script_plan` for code-mode scripts with one or several commands |
+| `shorten.rs` | The pure shorteners: skeleton, search cap, `check_run` (the pass rules), long-line clip, `inert`, `terminal_only`, `minify_json`, RTK marker detection, `worth_it` (at least 400 tokens, at most 70% after) |
+| `fold.rs` | Path lists folded by folder and unfolded again; a fold is sent only when unfolding gives back the input |
+| `noise.rs` | The table of progress lines per command, with the lines that are always kept |
+| `lockfile.rs` | Package lists of Cargo, npm, pnpm and yarn lock files |
+| `delta.rs` | lge's own Myers line diff; `rerun_delta` and `read_delta`, measured only |
+| `discover.rs` | Replays past Codex sessions through `shadow_decide`, in memory: totals per rule and command family, code-mode scripts, requests per session, commands corrected after a usage error |
+
+### How one tool output is decided
+
+For each tool output of a request, in conversation order:
+
+1. **Replay.** An item decided before in this conversation gets the same bytes again,
+   whatever the settings say now (a pointer only while its target is still in the
+   request; otherwise it is decided again). This happens before any setting is read.
+2. **Ledger.** After a daemon restart, an item the stored ledger names is decided again
+   with exactly the rules it got then, and is not counted, watched or reverted again.
+3. **Master switch and raw.** With "Apply the rules" off, or for `LGE_RAW=1`, the item is
+   sent as it is.
+4. **Re-run recovery.** When an earlier call in the request ran the same normalised
+   command, its output was shortened by a lossy rule, and no call that may change files
+   lies between them, the item is sent whole.
+5. **The rule chain for its purpose** (see `docs/PROXY.md`): the `inert` pre-pass for
+   everything but reads, diffs and JSON, then `check`, or `line_clip` and `search_cap`, or
+   `path_fold`, `json_minify`, `lockfile`, `skeleton`, or for any other command `check` by
+   content and `noise` after an exit code of 0. Each `on` rule's result is the next one's
+   input; a `shadow` rule is counted and changes nothing. The final text is sent only when
+   it is worth it, else `inert` alone when that is worth it, else the original. An output
+   with no known command goes through the content-only chain instead (escape codes,
+   `check` by content, numbered `search_cap`, `json_minify` for tools that are not shells
+   or file readers).
+6. **Repeat pointer.** An output still sent whole (a re-run recovery too), of 2,000 bytes
+   or more, identical to a copy sent whole earlier in the request, becomes a pointer to
+   that copy.
+7. **Measured deltas.** For an output still sent whole, what `rerun_delta` or
+   `read_delta` would save is counted.
+8. **Commit.** The decision is cached for the conversation, recorded in the ledger,
+   counted once per rule, and a lossy or measure-only rule's item is watched for its
+   follow-up calls.
+
+Typed messages are handled in the same pass, in conversation order: each gets its pack or
+none, decided once (also when no graph is ready) and replayed after. After the pass,
+`judge` looks at the pending items whose window of later calls is complete, and
+`compare_prefix` compares the request's item hashes with the previous request's.
+
+## lge-bench
+
+The benchmark runner, and `lge ab` (`ab.rs`, `ab/`): arms and variants (`arm_settings`,
+`variant_agents`), the preflight (`ab/preflight.rs`), `results.jsonl` and resume
+(`ab/results.rs`), the daemon's traces (`ab/trace.rs`), and the report with its verdict,
+billed-equivalent tokens, clustered bootstrap interval, geometric mean and noise
+(`ab/report.rs`). `agents.rs` holds the AGENTS.md block, the batch line, the
+terse-replies section and skill, and the editors that put them between lge's markers;
+`lge init` and the A/B variants write the same bytes from it.
 
 ## Fixtures
 

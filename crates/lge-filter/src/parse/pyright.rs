@@ -2,7 +2,7 @@
 //! indented continuation lines, and a closing `N errors, M warnings, K informations`.
 //! pyright prints absolute paths; the runner makes them relative.
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -81,6 +81,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
         }
     }
     parsed.recognised |= !parsed.failures.is_empty() || !parsed.warnings.is_empty();
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&TOTALS], &[]);
     parsed
 }
 

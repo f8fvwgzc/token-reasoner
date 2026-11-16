@@ -2,14 +2,20 @@
 
 `lge ab` measures what the proxy saves on your own tasks. Every task runs as one Codex
 session with lge's features off and one with them on, each in a fresh copy of the
-repository, and the task's own check says whether the work was done right.
+repository, and the task's own check says whether the work was done right. With
+`--variant` it compares two versions of the text lge puts in `AGENTS.md` instead.
 
 ```
 lge ab tasks.toml [--repo DIR] [--base REV] [--runs N] [--model M] [--daemon http://127.0.0.1:8787]
                   [--sandbox MODE] [--no-approve-for-me] [--no-note] [--work-dir DIR] [--json]
+                  [--variant features|terse|batch] [--no-preflight | --preflight-only]
+                  [--resume WORK_DIR [--force]] [--weights IN,CACHED,OUT]
 ```
 
 How the sessions run:
+
+- **A preflight first**: each task's setup and check run on a fresh copy of the base
+  commit before any session (see "Preflight").
 
 - **Each session in its own temporary git worktree** of the base commit (`git worktree add
   --detach`), made for that session and removed after its check. The base is `HEAD`
@@ -26,7 +32,8 @@ How the sessions run:
 The target it reports against: **at least 25% lower median total tokens with no drop in
 success**.
 
-This spends real tokens: `tasks x runs x 2` Codex sessions.
+This spends real tokens: `tasks x runs x 2` Codex sessions. A stopped run can be resumed
+without spending its finished sessions again (see "Results, resume and traces").
 
 ## Before you start
 
@@ -92,14 +99,19 @@ nothing whatever the file says. The report says which note was used.
 
    | Setting | lge off | lge on |
    |---|---|---|
-   | Add graph context | off | on |
-   | Shorten outputs | off | on |
-   | Skeletons for whole-file reads | off | as you set it on the page |
-   | Index on first use | off | off |
+   | Add graph context (`inject_context`) | off | on |
+   | Apply the rules to tool output (`shorten_outputs`) | off: no rule runs, not even in shadow | on |
+   | Rule modes (`rules`, the skeleton's included) | as you set them, but switched off by the line above | as you set them on the page |
+   | Holdout share (`holdout_share`) | 0 | 0 |
+   | Index on first use (`auto_index`) | off | off |
 
-   Every other setting stays as it is. For the arm with lge on, the copy is added to the
-   daemon and indexed before the session starts, so the first message already gets its
-   context; it is removed from the daemon afterwards.
+   That is the default variant, `features`. For `--variant terse` and `--variant batch`
+   both arms keep your settings as they are, except holdout 0 and indexing on first use
+   off; what differs is `AGENTS.md` (see "Variants"). Every other setting stays as it is.
+   For an arm whose settings use the graph (graph context or the rules on), the copy is
+   added to the daemon and indexed before the session starts, so the first message already
+   gets its context; it is removed from the daemon afterwards. The holdout is 0 in both
+   arms because a held-out conversation would run every rule in shadow.
 3. `setup` runs, then one session: `codex exec --json` in the copy, with the prompt (and
    the note) on stdin and the sandbox `workspace-write` (`--sandbox` changes it; `codex
    exec` alone is read-only). When `codex exec --help` lists `--approve-for-me`, asked once
@@ -112,8 +124,11 @@ nothing whatever the file says. The report says which note was used.
 4. The token usage is read from the session's event stream: input (of which cached),
    output (of which reasoning), and turns. The daemon's status gives the number of model
    requests, and shows whether the session went through it at all.
-5. `check` runs in the copy. Exit 0 is a success.
-6. The copy is removed (`git worktree remove --force`).
+5. The daemon's trace of the session's requests is fetched and saved (see "Results,
+   resume and traces").
+6. `check` runs in the copy. Exit 0 is a success.
+7. One line for the session is appended to `results.jsonl` in the work dir, and the copy
+   is removed (`git worktree remove --force`).
 
 The sessions run one after another, each in its own copy.
 
@@ -130,25 +145,109 @@ failed because of it is listed as interrupted, never as a result. A second Ctrl-
 `SIGTERM` and `SIGHUP` stop the run the same way, but they reach only `lge ab`: a
 session already running is not stopped and ends first.
 
+## Variants
+
+`--variant` says what the two arms differ in:
+
+| Variant | lge off arm | lge on arm |
+|---|---|---|
+| `features` (default) | graph context and the rules off | graph context and the rules on |
+| `terse` | `AGENTS.md` with the lge block and without the terse-replies section | the same with the terse-replies section (`lge init --terse=always`) |
+| `batch` | the lge block without the batch line | the lge block with the batch line (`lge init --batch`) |
+
+For `terse` and `batch` the runner writes `AGENTS.md` in the folder the session starts in
+(the copy's root, or the `--repo` subfolder), before setup, with the same bytes
+`lge init` writes; everything outside lge's markers stays as the commit has it. A check
+that needs a clean `git status` sees that file as changed, in both arms alike. The
+variant is printed at the start and in the report (`variant` in `--json`). These texts are
+unmeasured until such a run measures them.
+
+## Preflight
+
+Before any session, and before the daemon's settings are touched, each task gets a fresh
+copy of the base commit in which its setup and then its check run, through the same shell
+as after a session. The run stops, naming each bad task and why, when:
+
+- the setup fails;
+- the check passes on the base commit: the task is already done there, or the check does
+  not test it;
+- the check cannot run: exit 126 or 127, or the shell reports a syntax error, an
+  unexpected end of file, an unterminated quoted string, a bad substitution or a command
+  not found (only lines the shell itself starts, and only with exit 2, 126 or 127).
+
+A check that fails because a script the task must create is not there yet
+(`./scripts/check.sh: not found`, or a name ending in `.sh`, `.py`, ...) fails as
+expected. The preflight's copies are removed. `--preflight-only` runs only the preflight
+and prints its table (task, setup, check, finding): no daemon, no session, no token
+spent, and exit code 1 when a task has a problem. `--no-preflight` skips it. On a resume
+the preflight runs only for the tasks that still have sessions to run.
+
+## Results, resume and traces
+
+The work dir (`--work-dir`, else a new `lge-ab-<pid>` folder in the system's temporary
+folder) holds the copies while they exist, and two things that stay:
+
+- **`results.jsonl`**: one JSON line per session, appended and synced to the disk as soon
+  as the session ended: the task name, run, arm, tokens (input, cached, output,
+  reasoning), turns, requests, success, error text, the end of the check's output when it
+  failed, the agent's thread id, a summary of the trace, start and end times, and what the
+  run used (base commit, a hash of the task file, note, model, sandbox, variant). A
+  session that was interrupted or ended in an error before its check is written too, and
+  run again on a resume.
+- **`traces/<NN>-<task>-<run>-<arm>.json`**: the daemon's trace of the session
+  (`GET /lge/api/sessions/<thread-id>/requests`, see `docs/PROXY.md`): per request its
+  status, input, cached, output and reasoning tokens, the tokens lge added and removed,
+  and its three largest new tool outputs, named by their command cut to 120 characters,
+  with their tokens and whether lge shortened them. No output text. The thread id comes
+  from the agent's event stream; one with characters outside letters, digits and
+  `-_.:` is not asked for.
+
+At the start, and again after an interruption, `lge ab` prints the work dir and the
+command that resumes the run. `--resume <work-dir>` reads `results.jsonl` back, skips the
+sessions that finished, runs the rest, and reports on all of them (`resumed` counts the
+sessions read back). It refuses earlier results of another base commit, task file,
+model, variant, prompt note or sandbox, unless `--force` is given. A line cut short
+(`lge ab` killed while writing) is skipped. A run that is not a resume refuses a work dir
+that already holds `results.jsonl`. To add runs to a finished result, resume it with a
+higher `--runs`.
+
 ## The report
 
+The layout, with illustrative numbers (not a measurement):
+
 ```
+variant: features: lge's graph context and output shortening off against on
 base commit: 4f9c2a1e0b7d4c3a9e8f1b2c3d4e5f60718293a4
 note appended to every prompt: Do not install, download or sync dependencies and do not run long test suites: the task's check runs after you finish.
 sessions ran with --approve-for-me (workspace-write sandbox, approvals reviewed automatically)
+results and traces: /tmp/lge-ab-4242
 
 task                    run  arm        input       cached     output  reasoning        total  turns   reqs  result
 validate-order-payload    1  off      182,410      120,064      6,120      3,904      188,530      9     14  pass
 validate-order-payload    1  on       121,377       90,112      4,870      2,950      126,247      6      9  pass
 ...
 
-task                       off median      on median    change  off ok   on ok
-validate-order-payload        188,530        126,247    -33.0%     1/1     1/1
+task                       off median      on median    change  off ok   on ok   billed chg  noise
+validate-order-payload        188,530        126,247    -33.0%     1/1     1/1       -35.7%
+...
+
+per arm, medians over the successful runs of the compared tasks (output includes reasoning):
+arm  sessions  requests     output  reasoning        total       billed
+off         2        14      6,120      3,904      188,530      123,312
+on          2         9      4,870      2,950      126,247       79,236
+
+context per request, from the daemon's traces (input tokens of each request, cached included):
+task                    run  arm   reqs         mean          max
+validate-order-payload    1  off     14       13,029       21,870
+    largest outputs: 6,204 tokens `python -m pytest -q orders_api/tests`; ...
 ...
 
 compared over 2 of 2 task(s) where both arms succeeded
 total tokens with lge against without: median -29.4%, mean -29.4%
+geometric mean of the tasks' on/off ratios: 0.705 (-29.5%)
+billed-equivalent tokens (uncached input x1, cached input x0.1, output x8): median -30.0%, mean -30.0%
 success: without lge 2/2 (100%), with lge 2/2 (100%)
+second reading, on billed-equivalent tokens (not the verdict): target met (...)
 verdict: target met (at least 25% lower median total tokens with no drop in success): ...
 ```
 
@@ -173,11 +272,44 @@ verdict: target met (at least 25% lower median total tokens with no drop in succ
   present; a number that does not exist (no comparison) is `null`.
 - A session whose requests never reached the daemon is flagged: the arm's settings did
   not apply to it.
-- The first lines name the base commit (full id), the note appended to the prompts (or
-  `none`), and whether the sessions ran with `--approve-for-me`; `--json` has them as
-  `base`, `note` (`null` for none) and `approve_for_me`.
+- The first lines name the variant, the base commit (full id), the note appended to the
+  prompts (or `none`), whether the sessions ran with `--approve-for-me`, and the work dir;
+  `--json` has them as `variant`, `base`, `note` (`null` for none), `approve_for_me` and
+  `work_dir`.
 
-## Enterprise machines
+### Beside the verdict
+
+These help read a result; none of them changes the `verdict:` line.
+
+- **Per arm**: the medians of requests, output, reasoning, total and billed-equivalent
+  tokens over the successful runs of the compared tasks. Output already includes
+  reasoning; it is never added twice.
+- **Billed-equivalent tokens**: uncached input x `IN` + cached input x `CACHED` + output
+  x `OUT`, with `--weights IN,CACHED,OUT` (default `1,0.1,8`). The default weights are the
+  ratios of the list prices of current OpenAI models: a cached input token costs a tenth
+  of an uncached one, an output token eight times as much. Total tokens count a cached
+  token like any other, so a change that only moves tokens into or out of the cache, or
+  trades input for output, reads differently here. Each task gets a `billed chg` column,
+  and a second reading against the same -25% target and success rule is printed before
+  the verdict, labelled as not the verdict. Pass other weights for other prices.
+- **Bootstrap interval**: a 95% interval of the median change in total tokens, clustered
+  by task: each of 2,000 resamples (fixed seed, so the same results give the same
+  interval) draws the compared tasks with replacement, then, within each drawn task, each
+  arm's runs with replacement, and takes the median over tasks of
+  `(median on - median off) / median off`. Shown only when 2 or more tasks were compared
+  and tasks ran 2 or more times: with one run per task there is nothing to resample within
+  a task.
+- **Geometric mean** of the per-task on/off ratios of median total tokens: unlike the
+  median it uses every task, and a task that halves counts as much as one that doubles.
+- **Noise**: an arm of a task is marked noisy when the total tokens of its passing runs
+  differ by more than 1.5 times (largest over smallest). Its median is then a weak
+  estimate; the report says so and suggests more runs (`--resume` with a higher `--runs`
+  adds them).
+- **Context per request**: from each session's trace, its requests, the mean and largest
+  input per request (cached included), and the three largest tool outputs with a flag
+  when lge shortened them.
+
+## Managed machines
 
 What a run on a managed Mac needed, so yours does not:
 
@@ -212,7 +344,10 @@ What a run on a managed Mac needed, so yours does not:
 
 ## Leftovers
 
-The copies and their folder are removed. A copy that cannot be removed (the session or
+The copies are removed. The work dir stays, with `results.jsonl` and `traces/`; it is
+removed only when this run created it and it is still empty (a run stopped before any
+session, such as after a failed preflight). Delete it when you no longer need to resume
+the run. A copy that cannot be removed (the session or
 the check left a folder without write permission) is named at the end of the run, with
 the `git worktree prune` to run after deleting it. The graph the daemon built for each copy stays
 in its data folder, named after the copy: `~/.lge/graphs/lge-ab-*`. Delete those folders

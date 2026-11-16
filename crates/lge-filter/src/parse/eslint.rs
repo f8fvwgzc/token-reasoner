@@ -2,13 +2,15 @@
 //! `line:col  severity  message  rule` rows) and `unix`
 //! (`path:line:col: message [Error/rule]`).
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, number, pattern, Parsed};
 use crate::format::failure;
 
 pattern!(ROW, r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.+?)(?:\s{2,}(\S+))?\s*$");
 pattern!(TOTAL, r"^✖ (\d+ problems? \((\d+) errors?, (\d+) warnings?\))$");
 pattern!(UNIX, r"^(.+?):(\d+):(\d+): (.*) \[(Error|Warning)(?:/([^\]]+))?\]$");
 pattern!(UNIX_TOTAL, r"^(\d+) problems?$");
+pattern!(CLOSING, r"^\s*(?:✖ )?\d+ problems?\b");
+pattern!(FIXABLE, r"^\s+\d+ errors? and \d+ warnings? potentially fixable");
 
 pub(crate) fn parse(text: &str) -> Parsed {
     let mut parsed = Parsed::default();
@@ -48,6 +50,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
         parsed.reported = Some(total.saturating_sub(parsed.warnings.len()));
     }
     parsed.recognised = !parsed.failures.is_empty() || !parsed.warnings.is_empty() || parsed.summary.is_some();
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&CLOSING], &[&FIXABLE]);
     parsed
 }
 

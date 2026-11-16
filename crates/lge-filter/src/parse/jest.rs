@@ -1,7 +1,7 @@
 //! Jest: a `FAIL <file>` line per failing suite, then one `● suite › test` block per
 //! failing test with the assertion, a code frame and the stack.
 
-use super::{count_of, number, pattern, squeeze, Parsed};
+use super::{closing_state, count_of, number, pattern, squeeze, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -11,6 +11,11 @@ pattern!(BULLET, r"^\s*● (.+)$");
 pattern!(FRAME, r"^\s*at (?:.*? \()?(.+?):(\d+):(\d+)\)?$");
 pattern!(TESTS, r"^Tests:\s+(.*)$");
 pattern!(SUITES, r"^Test Suites:\s+(.*)$");
+// What jest prints after its `Tests:` line.
+pattern!(
+    EPILOGUE,
+    r"^(?:(?:Snapshots|Time|Test Suites):|Ran all test suites|Watch Usage)"
+);
 
 /// Blocks that use the bullet but are not failures.
 const NOT_FAILURES: &[&str] = &["Console", "Deprecation Warning", "Validation Warning"];
@@ -123,6 +128,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
     parsed.summary = tests
         .map(|t| format!("Tests: {}", squeeze(&t)))
         .or(suites.map(|s| format!("Test Suites: {}", squeeze(&s))));
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&TESTS], &[&EPILOGUE]);
     parsed
 }
 

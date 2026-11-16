@@ -1,9 +1,12 @@
-# Prior art: what lge takes from four open-source projects
+# Prior art: what lge takes from eight open-source projects
 
-Studied on 2026-11-15 from shallow clones kept outside this repository
-(`../references/`). No code was copied; the mechanisms below are reimplemented in
-Rust on LadybugDB. None of the four can be used as a dependency: they need a Python
-runtime, PostgreSQL or another storage engine, which the project rules exclude.
+Studied from shallow clones kept outside this repository (`../references/`): the four
+context and memory projects below on 2026-11-15, Headroom and RTK for the proxy, and
+Caveman and Token Optimizer (with RTK again) for v0.0.2 on 2026-11-16. No code was
+copied from any of them; the mechanisms below are reimplemented in Rust, in lge's own
+code and words, on LadybugDB. None of the first four can be used as a dependency: they
+need a Python runtime, PostgreSQL or another storage engine, which the project rules
+exclude.
 
 | Project | Licence | What it is | Fit for lge |
 |---|---|---|---|
@@ -77,7 +80,7 @@ are BUSL-1.1, so only ideas were taken). The request format was checked against 
 | Decide each rewrite once and replay the same bytes on later turns, so the provider's prefix cache keeps hitting | headroom | `lge-proxy::session` |
 | Forward a body that was not changed as the exact bytes that came; relay the response stream as bytes and parse it only for usage | headroom | `lge-proxy::server` |
 | Point a repeated output to its first copy | headroom | `lge-proxy::responses` |
-| Leave file reads alone by default; outlining a read is opt-in | headroom, rtk | `shorten_reads` setting, off |
+| Leave file reads alone by default; outlining a read is opt-in | headroom, rtk | the `skeleton` rule: off in v0.0.1, measured in `shadow` (never sent) from v0.0.2 until you switch it on |
 | Test, lint and type-check runs reduced to failures and summary | rtk, headroom | `lge-filter` through the proxy |
 | Never send a result that is not smaller; never summarise an unknown format | rtk (`never_worse`), headroom | `lge-proxy::shorten` |
 | No truncation notice without a way back: each marker names the exact command that returns what was left out | rtk | skeleton and search markers |
@@ -88,6 +91,110 @@ Both projects report that the saving on whole requests is far below the saving o
 compressed parts (rtk: "a 90% cut in command output is not a 90% cut in cost";
 headroom: 0% on plain source files, and a net loss when small results are compressed).
 lge's page therefore shows provider-reported tokens per session next to what was removed.
+
+## v0.0.2: three token-cutting tools
+
+Studied on 2026-11-16 for v0.0.2: what each tool cuts, how it measures, and which of
+its ideas fit lge's rules (never change the model, the reasoning level, the system prompt,
+tool definitions, tool calls or patches; decide each item once; fail open; never
+summarise a format lge does not recognise).
+
+| Project | Licence | What lge takes |
+|---|---|---|
+| [RTK](https://github.com/rtk-ai/rtk) (rtk-ai/rtk v0.49.0) | Apache-2.0 at the root (the CLI in `src/`, `text/`); its `engine/` and `proxy/` directories are BUSL-1.1 | Ideas only, reimplemented in lge's own code: per-command output parsers, line filters and command recognition from the Apache-2.0 part; normalisation, shadow rules, lock-file lists, JSON minifying and the proxy's markers from the BUSL part, as ideas only. No code, regex list or filter table was copied |
+| [Caveman](https://github.com/JuliusBrussee/caveman) (Julius Brussee) | Apache-2.0 | Ideas only: terse replies, frozen decisions, a prefix tripwire, resending a refused request, code-mode result unwrapping. "Caveman" is a trademark, so lge's skill is called terse-replies and no lge feature or file uses the name |
+| [Token Optimizer](https://github.com/alexgreensh/token-optimizer) (Alex Greenshpun) | PolyForm Noncommercial 1.0.0 | Ideas only: recovery rates with thresholds fixed in advance, a holdout arm, skeleton cohorts, fixed-prefix and cache-break attribution, deltas for re-runs. No code, regex lists, tables, prompts or wording |
+
+| Mechanism | From | In lge |
+|---|---|---|
+| A pass is stated only when the tool's own closing line ends the output and one producer printed it; a failure is never hidden | RTK (never hide a failure, bypass), Token Optimizer (one producer must remain), Caveman (fail closed) | `lge-filter::filter_for_proxy` (closed, trailing, unparsed), `lge-proxy::shorten::check_run` |
+| Warnings grouped by rule with every location | RTK (clippy grouped by rule) | `lge-filter::format::group_by_rule` |
+| Failure parsers for go test, go build, go vet, golangci-lint, Maven, Gradle, gcc and clang; cargo suites and nextest | RTK's per-command filters, rebuilt as parsers that never drop a failure | `lge-filter::parse::{go, golangci, maven, gradle, cc, rust}` |
+| Lossless clean-up: escape codes, carriage-return redraws, trailing blanks, runs of identical lines | RTK (its proxy's default normalisation), Caveman (terminal and repetition clean-up) | `lge-filter::{normalize_terminal, collapse_repeats}`, rule `inert` |
+| Path lists written with each folder once, sent only when unfolding gives the input back | RTK (folding by folder), Token Optimizer (recount against the input) | `lge-proxy::fold`, rule `path_fold` |
+| JSON without whitespace outside strings, byte-exact otherwise | RTK (JSON minifying) | `shorten::minify_json`, rule `json_minify` |
+| Long search lines clipped around the match, with the exact command for the whole line | RTK (match window in its search filter) | `shorten::clip_match_lines`, rule `line_clip` |
+| A capped search names every file it left out | Token Optimizer (every name kept after a cap), RTK (count of files left out) | `shorten::cap_search` |
+| A repeat pointer names the run it repeats and quotes its first line | RTK (its proxy's marker names a block by its first lines) | `responses::pointer_text` |
+| Progress lines of installs, transfers and builds dropped by a table, with lines that mention errors always kept and no line cap | RTK (declarative line filters, install and build filters), Token Optimizer (build-output collapse that keeps error lines) | `lge-proxy::noise`, rule `noise` |
+| A lock file shown as its package list | RTK (lock-file method) | `lge-proxy::lockfile`, rule `lockfile` |
+| Deltas for a re-run and a re-read, measured only | Token Optimizer (cross-turn deltas) | `lge-proxy::delta`, rules `rerun_delta`, `read_delta` |
+| Skeleton reads counted by language and size band | Token Optimizer (first-read cohorts) | `rules::cohort_key`, the page's cohort table |
+| RTK's output recognised and never shortened twice; `rtk proxy` read as the command | RTK (its proxy skips blocks it stamped; its bypass) | `command::normalise`, `shorten::condensed_upstream` |
+| Harmless leading statements dropped before a command is classified | Token Optimizer (post-run command classifier), RTK (its interop and bypass rules) | `command::normalise` |
+| A re-run with nothing changed in between returns the output whole | Token Optimizer (a repeat with no edit between is deliberate), RTK (no cut without a way back) | `responses::Known::recovery` |
+| A mode per rule: off, shadow, on | RTK (shadow rules), Caveman (record mode), Token Optimizer (opportunity tier) | `lge-proxy::rules`, `session::Chain` |
+| Recovery within the next calls, thresholds fixed before any data, automatic demotion | Token Optimizer | `session::judge`, `server::check_rules` |
+| A holdout arm compared with a bootstrap interval | Token Optimizer | `server::in_holdout`, `lge_usage::compare_arms` |
+| Cache breaks caused by the proxy told apart from the client's | Caveman (prefix tripwire), Token Optimizer (cache-break attribution) | `session::compare_prefix` |
+| The fixed prefix per request and the tools never called; cold restarts | Token Optimizer (fixed-overhead audit, unused servers, cache drops) | `server::tool_defs`, `server::Conv::observe_response` |
+| Earlier items keep their bytes whatever the settings say now | Caveman (frozen substitutions) | `session::Session::replay`, looked up first |
+| A refused request sent once more without the new rewrites | Caveman (resends the original); lge reverts only the request's new decisions | `server::Daemon::proxy`, `session::Session::revert_new` |
+| Code-mode results: several commands, exec results printed as JSON | Caveman (code-mode result unwrapping), checked against Codex's source | `command::script_plan`, `responses::unframe` |
+| Past sessions replayed through the rules; commands corrected after a usage error | RTK (`discover`, and `learn` with a window of 3 calls), Token Optimizer (reads Codex rollouts) | `lge-proxy::discover`, `lge usage discover` |
+| A terse-replies skill and AGENTS.md section | Caveman (terse reply rules), RTK (terse directive); written in lge's own words | `lge_bench::agents`, `lge init --terse` |
+| AGENTS.md lines on condensed output and on batching read-only commands | RTK (awareness note), Caveman (tool-run rule) | `lge_bench::agents`, `lge init`, `lge init --batch` |
+
+### Deliberately not adopted from these three
+
+- Rewriting commands through a Codex hook: it breaks Codex's saved approvals and runs
+  commands again, and the proxy already sees every output.
+- A retrieve tool answered inside the proxy: it changes tool definitions and calls, and
+  would make the proxy edit the response stream.
+- Pointers for written file bodies, truncated tool-call arguments: lge never touches tool
+  calls or patches.
+- Model routing, cheaper models for reads, effort hints, output caps: each changes the
+  model or the reasoning, or cuts answers.
+- Setting `model_verbosity` or prompt-cache retention in flight: body fields outside lge's
+  forward-as-is contract; `lge init` only mentions `model_verbosity` as your choice.
+- Compacting `git diff` and `git show`: the model writes patches from diffs.
+- Head and tail caps on unknown output, log-template merging, folding library stack
+  frames: they summarise formats lge does not recognise.
+- An in-memory store of originals with a recall tool: needed only for caps lge does not
+  adopt, and it would add a tool to the cached tool list.
+- Diffs or structure maps in place of a re-read: the model re-reads after a patch to get
+  the exact text; v0.0.2 only measures `read_delta`.
+- Cohorts that switch skeletons on by themselves: promoting a lossy rule automatically is
+  not safe; you switch it on.
+- Re-encoding JSON arrays as tables, truncating cells: changes what the model reads, or
+  loses values.
+- Top-N lint lists, head-biased line caps, first-N stack frames, tree depth cuts, row caps
+  on listings, shortened paths: each can drop a finding or make a path unopenable.
+- Eliding base64, slimming HTML and Markdown bodies, compacting `env`, `psql`, `git log`
+  and branch lists: rare in coding sessions, or lossy without a way back.
+- Parsers for JUnit XML or JSON test reports: agents write them to files; JSON printed to
+  stdout still gets `json_minify`.
+- Attributing `write_stdin` polls to their command: a poll is a fragment of the run.
+- A re-orientation item after a compaction: it repeats Codex's own summary.
+- Re-deciding old items once the cache is cold: a wrong guess bills the whole prefix
+  uncached.
+- A terse or scope sentence added every turn, nudges based on context fill: they change
+  behaviour every turn and add input; only the opt-in skill ships, measured with
+  `lge ab --variant terse`.
+- Quiet-flag advice and "no commentary" in the default AGENTS.md block: unmeasured, and
+  every line costs prefix tokens; the commentary rule is in the opt-in skill.
+- Thrash notes, quality warnings, a quality score: they write into outputs the model
+  trusts; the page shows raw signals instead.
+- Shrinking lge's own packs as the context fills, rewording lge's own short texts: too
+  small a gain.
+- Keep-warm pings, cache warming, injecting `prompt_cache_key`: spend tokens on a guess,
+  or Codex sends its own key.
+- Shrinking other servers' tool schemas: tool definitions start the cached prefix; lge
+  only reports their cost.
+- Rewriting AGENTS.md or memory files with a model: spends tokens and sends files to a
+  provider.
+- Replies in classical Chinese: the tokeniser erases the saving.
+- Invariant markers and rarity guards for lossy collapses: they only serve collapses lge
+  does not adopt.
+- Writing rewrite decisions to disk with their content: against lge's storage rule; the
+  ledger keeps only hash prefixes and rule ids.
+- Pinning a block after repeated retrieves: re-rendering a past item breaks the cache.
+- Refusing identical repeated MCP calls: a proxy cannot refuse a tool call; identical
+  outputs already become pointers.
+- Image downscaling, text rendered as images, secret redaction: lge never changes
+  non-text parts, and redaction is a privacy matter, not a token one.
+- Waste coaches, fleet audits, compaction advice, a second memory store: they count
+  savings with fixed guesses, or duplicate `lge-memory`.
 
 ## Deliberately not adopted
 

@@ -415,6 +415,10 @@ impl GraphStore for LadybugStore {
         usage::list_usage(&self.conn()?, since)
     }
 
+    fn get_usage(&self, id: &str) -> Result<Option<UsageRecord>> {
+        usage::get_usage(&self.conn()?, id)
+    }
+
     fn put_handoff(&self, note: &HandoffNote) -> Result<()> {
         self.write(|conn| usage::put_handoff(conn, note))
     }

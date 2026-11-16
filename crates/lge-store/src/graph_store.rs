@@ -118,6 +118,9 @@ pub trait GraphStore: Send + Sync {
     /// Usage records with `started_at >= since`, oldest first.
     fn list_usage(&self, since: i64) -> Result<Vec<UsageRecord>>;
 
+    /// The usage record with this id, if there is one.
+    fn get_usage(&self, id: &str) -> Result<Option<UsageRecord>>;
+
     fn put_handoff(&self, note: &HandoffNote) -> Result<()>;
 
     /// Most recent handoff notes, newest first.

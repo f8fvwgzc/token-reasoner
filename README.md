@@ -17,8 +17,30 @@ Codex (desktop app or CLI)  ──►  lge on 127.0.0.1:8787  ──►  OpenAI
 - If anything goes wrong inside lge, the original request is sent unchanged.
 - Everything runs on your machine. One Rust binary, one embedded database.
 
-No saving is claimed here: the page shows the real token counts of your own sessions, so
-you can see what lge does for you.
+No saving is claimed here: the page shows the real token counts of your own sessions,
+and two ways of measuring a difference are built in: `lge ab` runs your own tasks with lge
+off and on, and a holdout share of conversations runs with every rule measured but not
+applied.
+
+What v0.0.2 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+
+- **Certain verdicts.** A test, lint or build run is called passed only when its own
+  closing line ends the output, its exit code (when known) is 0 and nothing says it
+  failed; warnings are listed with every location.
+- **Twelve rules, each with a switch** (`off`, `shadow`, `on`): check results, search
+  caps, repeat pointers, lossless clean-up, path folding and JSON minifying are on;
+  skeletons, long-line clipping, progress noise and lock files are measured in shadow;
+  re-run and re-read deltas are measured only. Running a command again with nothing
+  changed in between returns its output whole.
+- **Measurement.** A recovery rate per rule (a rule whose cuts are fetched back too often
+  moves to shadow by itself), a holdout arm, a prompt-cache monitor, the fixed prefix of
+  every request and the tools never called, and `lge usage discover` to replay your past
+  Codex sessions through every rule.
+- **Codex.** Code-mode scripts with several commands, exec results printed as JSON, RTK's
+  output recognised, and one retry without the new rewrites when the provider refuses a
+  request.
+- **Tools.** `lge init --terse` (an opt-in terse-replies skill), `lge init --batch`, and
+  `lge ab --variant`, `--resume`, a preflight, traces and bootstrap intervals.
 
 ---
 
@@ -160,6 +182,27 @@ key keep working. Remove the line to stop. Optional, the graph tools for the age
 codex mcp add local_graph --url http://127.0.0.1:8787/mcp
 ```
 
+### The AGENTS.md rule and the terse-replies skill (`lge init`)
+
+`lge init` prints what connects a repository to Codex; with `--write` it puts the lge block
+into the repository's `AGENTS.md` (replacing an earlier lge block, keeping everything
+outside lge's markers byte for byte). The block tells the agent to ask the graph first,
+and that a line starting with `lge:` says what was left out and how to get it back.
+
+```bash
+lge init --write                 # the lge block in AGENTS.md
+lge init --write --batch         # with one more line: batch related read-only commands into one exec script
+lge init --terse                 # the terse-replies skill in .agents/skills/terse-replies/SKILL.md
+lge init --terse --global        # the same skill in ~/.agents/skills, for every repository
+lge init --terse=always --write  # the skill, and a short section in AGENTS.md so every reply is short
+lge init --terse=off             # removes the skill and the section, where lge wrote them
+```
+
+The batch line and the terse-replies skill are opt-in and unmeasured: compare with
+`lge ab --variant batch` and `--variant terse` before keeping them. A skill file lge did not
+write is never overwritten or removed. Codex's own `model_verbosity` setting also changes
+how long its replies are; lge never sets it.
+
 ### Other agents (Qwen Code, Claude Code, Cursor, ...)
 
 The proxy understands the OpenAI Responses API, which is what Codex speaks. Agents that
@@ -194,9 +237,22 @@ Tools the agent gets over MCP:
 3. Use Codex as usual.
 
 The page shows, per session: input tokens, the share that was cached, output and
-reasoning tokens, what lge removed from tool output, and what graph context it added.
-"Import past Codex sessions" reads the token counts of your earlier sessions from
-`~/.codex` (no conversation text) so you have a before and after.
+reasoning tokens, what lge removed from tool output, what graph context it added, and the
+tokens not sent over every request net of lge's own packs. Below that:
+
+- **Rules**: each rule's switch (off, shadow, on), what it changed or would have changed,
+  its recovery rate and whether it is healthy or was demoted (with a Re-enable button),
+  and the skeleton counts by language and file size;
+- **Holdout**: the share of new conversations held out, and the comparison of the two arms;
+- **Prompt cache**: cache breaks caused by lge (a bug), breaks caused by Codex changing its
+  own history, and cold restarts after an idle gap;
+- **Fixed prefix**: what Codex sends at the start of every request, by tool group, and the
+  tools never called, with the `[mcp_servers.<name>]` entry that defines them (report
+  only);
+- **Past sessions replayed**: every rule run over your Codex sessions of the last 30 days,
+  in memory;
+- **Before and after**: "Import past Codex sessions" reads the token counts of your earlier
+  sessions from `~/.codex` (no conversation text).
 
 Under each folder the page also warns about folders that searches would wade through:
 build output, dependencies, logs or archives that `.gitignore` does not exclude (such as
@@ -221,8 +277,10 @@ lge arch                        # services, endpoints, queues, tables
 lge memory retain "Tokens expire after 15 minutes" --kind decision --key auth.token-expiry
 lge memory recall "token expiry"
 lge usage report                # tokens per task
+lge usage discover              # past Codex sessions through every rule (reads only)
 lge check                       # lint, types, tests: failures only
 lge ab tasks.toml               # A/B: each task with lge off and on (spends tokens)
+lge init --write                # the AGENTS.md rule; --terse, --batch: see section 4
 ```
 
 `lge --help` lists everything.
@@ -241,6 +299,25 @@ that off). On a managed machine: build against OpenSSL 3, not 4
 (`export OPENSSL_DIR="$(brew --prefix openssl@3)"`), quote paths with spaces inside
 `check` commands, and keep checks fast and offline. The task file and the details are in
 [docs/AB.md](docs/AB.md).
+
+What else `lge ab` does:
+
+- **Preflight**, on by default: before any session, each task's setup and check run on a
+  fresh copy of the base commit, and the run stops when a check already passes there or
+  the shell cannot run it. `--preflight-only` runs only this (no daemon, no session, no
+  token); `--no-preflight` skips it.
+- **Results and resume**: one line per session goes to `results.jsonl` in the work dir as
+  soon as its check ran; `--resume <work-dir>` runs only the sessions that did not finish
+  (it refuses earlier results of another base commit, task file, model, variant, prompt
+  note or sandbox unless `--force` is given).
+- **Traces**: the daemon's record of each session's requests is saved under `traces/`, and
+  the report shows the context per request and the largest tool outputs.
+- **Variants**: `--variant features` (default: lge's features off against on),
+  `--variant terse` (AGENTS.md without against with the terse-replies section) and
+  `--variant batch` (the lge block without against with the batch line).
+- **Readings beside the verdict**: billed-equivalent tokens (`--weights IN,CACHED,OUT`,
+  default `1,0.1,8`), a bootstrap interval of the median change clustered by task, the
+  geometric mean of the per-task ratios, and tasks whose runs varied too much.
 
 ---
 
@@ -274,10 +351,11 @@ test output. Each of these turns is sent again on every later turn of the conver
 ### Codex code mode
 
 Current Codex models run their commands inside a small JavaScript script
-(`tools.exec_command({cmd: "rg -n ..."})`). lge reads the command out of such a script when
-there is exactly one, and shortens its output as it would a plain command; the script
-itself is never changed. Anything it cannot read with certainty is judged by its content
-or left alone.
+(`tools.exec_command({cmd: "rg -n ..."})`). lge reads the commands out of such a script and
+shortens each printed output as it would a plain command's: one command, or several when
+each is awaited once at the top level and printed once with its own `text()` call, and
+exec results the script prints as JSON lines. The script itself is never changed. Anything
+it cannot read with certainty is judged by its content or left alone.
 
 ### Why reasoning tokens drop too
 
@@ -300,21 +378,56 @@ to your sessions from before lge, so you can see it on your own work.
 
 lge reads the request Codex sends, changes only what it understands, and forwards it:
 
-| In the conversation | What lge sends instead | When |
+| In the conversation | What lge sends instead | Rule, default |
 |---|---|---|
-| Output of a test, lint or type-check run | The failures, or one line when it passed | Only for formats it recognises (pytest, jest, vitest, cargo, tsc, eslint, ruff, mypy, pyright, ...) |
-| A search with 60 or more matching lines that make up at least half of the output | The matches capped (6 per file, about 60 in all), the files the task is about first, every other line kept in place, and a line saying what was left out | `rg`, `grep`, `git grep`, also inside Codex's code-mode scripts |
-| The same large output a second time | One line pointing to the first copy | While the first copy is still in the request |
-| A message you typed about the code | Your message, followed by the graph's context for it (600 tokens for a one-file question, up to 1,500 when the change spans files) | When it names a symbol or clearly matches one |
+| Output of a test, lint, type-check or build run | Every failure and every warning with its locations, or one line when it certainly passed | `check`, on. Formats it recognises: pytest, jest, vitest, cargo (and nextest), tsc, eslint, ruff, flake8, mypy, pyright, go, golangci-lint, Maven, Gradle, gcc, clang |
+| A search with 60 or more matching lines that make up at least half of the output | The matches capped (6 per file, 60 in all), the files the task is about first, every other line kept in place, and a line naming every file left out | `search_cap`, on. `rg`, `grep`, `git grep`, `ag`, also inside Codex's code-mode scripts |
+| The same large output a second time | One line naming the earlier run it repeats | `repeat_pointer`, on. While the first copy is still in the request |
+| Escape codes, progress redraws, runs of identical lines | The text as a terminal shows it, each run once with its count | `inert`, on |
+| A long list of paths | Each folder written once (`dir/ a b c`); unfolding gives back every byte | `path_fold`, on |
+| JSON output | The same JSON without whitespace between its tokens | `json_minify`, on |
+| A read of a whole file in the graph | Functions the task is not about keep their signature, with the `sed -n` that reads the rest | `skeleton`, measured in shadow |
+| Search matches of hundreds of characters (minified code) | 300 characters around the match, with the `sed -n` for the whole line | `line_clip`, measured in shadow |
+| Progress lines of installs, downloads and builds that exited 0 | The rest of the output, with lines about errors and warnings always kept | `noise`, measured in shadow |
+| A lock file read whole | Its package list | `lockfile`, measured in shadow |
+| A message you typed about the code | Your message, followed by the graph's context for it (600 tokens for a one-file question, up to 1,500 when the change spans files) | "Add graph context", on. When it names a symbol or clearly matches one |
 | Anything else | Exactly the same bytes | Always |
 
-Never touched: the system prompt, tool definitions, reasoning, tool calls, patches, and any
-output lge cannot classify with certainty.
+Never touched: the system prompt, tool definitions, reasoning, tool calls, patches, diffs,
+and any output lge cannot classify with certainty. Every `lge:` line says what was left out
+and how to get it back, and running the same command again with nothing changed in between
+returns the output whole (so does `LGE_RAW=1 <command>`).
+
+**Modes and measurement.** In `shadow` a rule runs and its would-be saving is counted, but
+the output is sent as it is; switch a rule to `on` on the page once its counts look right.
+For every item a lossy rule shortens, lge watches the next 3 tool calls (5 for a skeleton)
+for a recovery: a re-run, a read of a range a marker named, a search of a file a note
+listed. A rule in `on` recovered more than 15% of the time over at least 200 items moves to
+shadow for new items by itself. With a holdout share above 0, that share of new
+conversations runs every rule in shadow, and the page compares the two arms.
 
 **Prompt caching.** The agent resends the whole conversation every turn, and the provider
 charges much less for the unchanged start of it. lge decides how to rewrite each item
-once, then sends the same bytes for it on every later turn, so the cached start stays
-cached. A request in which nothing changed is forwarded byte for byte.
+once, then sends the same bytes for it on every later turn, whatever the settings say by
+then, so the cached start stays cached; the page's cache monitor checks this on every
+request. A request in which nothing changed is forwarded byte for byte. If the provider
+refuses a rewritten request (400, 413 or 422), lge sends it once more without the rewrites
+first made in that request.
+
+### Privacy: what is written to disk
+
+lge runs on your machine; the daemon forwards requests only to the provider your agent
+already uses. Per conversation it stores token counts, the model name, the first message
+you typed cut to 200 characters, the router's recommendation, counts per rule and of the
+cache monitor, two token totals, and a ledger of decisions made of hash prefixes and rule
+ids (no content). Settings go to `daemon.json`, and `serve.log` gets one line per model request
+without any content. Request traces, the replay of past sessions and the fixed-prefix
+report stay in memory. Credentials pass through and are never stored or logged.
+`lge usage discover` stores nothing unless you add `--retain`, which keeps corrected
+commands as facts in the repository's graph. `lge ab` writes `results.jsonl` (token
+counts, success, the end of a failing check's output) and `traces/` (token counts per
+request, commands cut to 120 characters, no output text) in its work dir. The full list is
+in `docs/PROXY.md`, "What is stored".
 
 ### The code graph
 
@@ -381,8 +494,9 @@ recent history along without `git log`. No model is called to store or recall me
 
 graphify (a code graph for coding agents), hindsight (agent memory), graphiti (facts that
 change over time), omnigraph (a typed graph database in Rust), Headroom (a
-context-optimizing proxy) and RTK (command-output filtering). No code was copied; what was
-taken from each, and what was left out on purpose, is in `docs/PRIOR_ART.md`.
+context-optimizing proxy), RTK (command-output filtering), Caveman (terse replies) and
+Token Optimizer (measuring what a cut costs). No code was copied; what was taken from
+each, and what was left out on purpose, is in `docs/PRIOR_ART.md`.
 
 ---
 
@@ -400,14 +514,22 @@ taken from each, and what was left out on purpose, is in `docs/PRIOR_ART.md`.
 | `--upstream-api` | `LGE_UPSTREAM_API` | `https://api.openai.com/v1` | Where API-key requests go |
 | `--upstream-chatgpt` | `LGE_UPSTREAM_CHATGPT` | `https://chatgpt.com/backend-api/codex` | Where ChatGPT-login requests go |
 
-### Settings on the page
+### Settings on the page (`daemon.json`)
 
-| Setting | Default | Meaning |
-|---|---|---|
-| Add graph context | on | The evidence pack after a typed message about the code |
-| Shorten outputs | on | Check results, search caps, pointers for repeated output |
-| Skeletons for whole-file reads | off | Experimental: functions the task does not need keep only their signature |
-| Index on first use | on | A git repository is indexed the first time Codex works in it |
+| Setting | Key | Default | Meaning |
+|---|---|---|---|
+| Add graph context | `inject_context` | on | The evidence pack after a typed message about the code |
+| Apply the rules to tool output | `shorten_outputs` | on | The master switch of every rule below; off, new outputs get no rule, not even in shadow |
+| Rules | `rules` | `check`, `search_cap`, `repeat_pointer`, `inert`, `path_fold`, `json_minify` on; `skeleton`, `line_clip`, `noise`, `lockfile` shadow; `rerun_delta`, `read_delta` measured only | The mode of each rule: off, shadow or on |
+| Holdout | `holdout_share` | 0 | The share of new conversations (0 to 1) that run every rule in shadow, for comparison |
+| Index on first use | `auto_index` | on | A git repository is indexed the first time Codex works in it |
+| - | `context_budget` | 1,500 | Tokens of one pack (at most 600 for a question about one file) |
+
+A change applies to outputs seen from then on; outputs already sent keep their bytes.
+`shorten_reads` from v0.0.1 still loads (true means `skeleton` on, false means shadow).
+Demotions (`demoted`, `rule_since`) are written by the daemon and lifted with Re-enable.
+An unreadable `daemon.json` is copied to `daemon.json.unreadable` and the defaults are
+used, with a warning on the page, until settings are saved from the page.
 
 ### Per repository (`lge.toml`, optional)
 
@@ -467,7 +589,10 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 - **Proxy:** only the OpenAI Responses API is rewritten (Codex). Other APIs pass through
   unchanged.
 - **Savings are not measured yet.** The page shows real counts per session; judge from
-  your own numbers. Both Headroom and RTK report that shrinking tool output by 90% saves
+  your own numbers, or measure with `lge ab` and the holdout arm. The terse-replies skill
+  and the batch line are unmeasured until `lge ab --variant` measures them. The code-mode
+  layouts for several commands and JSON exec lines are built from Codex's source, not from
+  a real capture. Both Headroom and RTK report that shrinking tool output by 90% saves
   far less than 90% of the whole cost, because most of a request is the conversation
   itself.
 - **Edges marked inferred or unresolved are not verified.** lge says so in every answer.
@@ -490,11 +615,11 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 | lge-memory | Long-term memory: retain, recall, pages |
 | lge-router | Reasoning-level recommendation from change impact (logged, not applied) |
 | lge-session | `lge run`: one Codex session per task from its evidence pack |
-| lge-filter | Lint, type and test output reduced to failures |
+| lge-filter | Lint, type, test and build output reduced to failures and warnings |
 | lge-usage | Codex token usage parsing and reports |
 | lge-mcp | MCP server |
-| lge-proxy | The daemon: proxy, page, folder API, MCP over HTTP |
-| lge-bench | Benchmark runner |
+| lge-proxy | The daemon: proxy, rules, page, folder API, MCP over HTTP, replay of past sessions |
+| lge-bench | Benchmark runner, `lge ab`, and the AGENTS.md texts `lge init` writes |
 | lge-cli | The `lge` binary |
 
 Development:

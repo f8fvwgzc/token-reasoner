@@ -158,6 +158,116 @@ pub(crate) fn format_failures(failures: &[Failure]) -> String {
     out
 }
 
+/// Longest message shown for a warning rule, in characters.
+const RULE_MESSAGE_CHARS: usize = 160;
+/// Longest message used as the rule of a warning that names none, in characters.
+const RULE_KEY_CHARS: usize = 80;
+/// Width the list of a rule's locations is wrapped at, in characters.
+const LOCATION_WIDTH: usize = 120;
+/// Excerpt lines that say how to fix or silence a warning.
+const HINTS: [&str; 5] = ["help:", "= help:", "note:", "= note:", "hint:"];
+const AT: &str = "  at ";
+/// Names parsers give a warning that names no rule: the severity (rustc after a
+/// lint's first occurrence, a C compiler without `-W` flag) or the tool (Kotlin,
+/// javac without a lint category). Not a rule: such warnings are grouped by message.
+const FALLBACK_RULES: [&str; 4] = ["warning", "error", "kotlin", "javac"];
+
+/// Warnings, one entry per rule with every location, most frequent rule first:
+///
+/// ```text
+/// warnings: 3 (2 rules)
+/// clippy::needless_return (2): unneeded `return` statement
+///   help: remove `return`
+///   at src/a.rs:2, src/b.rs:7
+/// unused_variables (1): unused variable: `x`
+///   at src/a.rs:14
+/// ```
+///
+/// The message and the hint are the first occurrence's (by file, then line); the other
+/// occurrences keep only their location, which is enough to find them. A warning
+/// without a rule (or named only by its severity or tool, see [`FALLBACK_RULES`]) is
+/// grouped by its message (cut to 80 characters), which is then not repeated after the
+/// count when it is whole.
+pub(crate) fn group_by_rule(warnings: &[Failure]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut rules: std::collections::BTreeMap<String, Vec<&Failure>> = std::collections::BTreeMap::new();
+    for w in warnings {
+        let key = if w.name.is_empty() || FALLBACK_RULES.contains(&w.name.as_str()) {
+            clip_chars(&w.message, RULE_KEY_CHARS)
+        } else {
+            w.name.clone()
+        };
+        rules.entry(key).or_default().push(w);
+    }
+    let mut rules: Vec<(String, Vec<&Failure>)> = rules.into_iter().collect();
+    for (_, list) in &mut rules {
+        list.sort_by(|a, b| location_order(a, b));
+    }
+    rules.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+    let mut out = format!("warnings: {} ({} rules)\n", warnings.len(), rules.len());
+    for (rule, list) in &rules {
+        let first = list[0];
+        out.push_str(&format!("{rule} ({})", list.len()));
+        // A rule made of the message says it already.
+        if !first.message.is_empty() && first.message != *rule {
+            out.push_str(": ");
+            out.push_str(&clip_chars(&first.message, RULE_MESSAGE_CHARS));
+        }
+        out.push('\n');
+        let hint = first
+            .excerpt
+            .lines()
+            .map(str::trim)
+            .find(|l| HINTS.iter().any(|h| l.starts_with(h)));
+        if let Some(hint) = hint {
+            out.push_str("  ");
+            out.push_str(hint);
+            out.push('\n');
+        }
+        push_locations(&mut out, list);
+    }
+    out
+}
+
+/// By file, then line; no file and no line last, as in [`format_failures`].
+fn location_order(a: &Failure, b: &Failure) -> Ordering {
+    (a.file.is_empty(), &a.file, a.line.is_none(), a.line).cmp(&(b.file.is_empty(), &b.file, b.line.is_none(), b.line))
+}
+
+/// `  at a.rs:1, b.rs:2`, wrapped at [`LOCATION_WIDTH`]; every line starts with `  at `.
+fn push_locations(out: &mut String, list: &[&Failure]) {
+    let mut line = String::from(AT);
+    let mut width = AT.len();
+    let mut empty = true;
+    for f in list {
+        let location = match (f.file.as_str(), f.line) {
+            ("", _) => NO_FILE.to_string(),
+            (file, Some(n)) => format!("{file}:{n}"),
+            (file, None) => file.to_string(),
+        };
+        let chars = location.chars().count();
+        if !empty && width + 2 + chars > LOCATION_WIDTH {
+            out.push_str(&line);
+            out.push('\n');
+            line = String::from(AT);
+            width = AT.len();
+            empty = true;
+        }
+        if !empty {
+            line.push_str(", ");
+            width += 2;
+        }
+        line.push_str(&location);
+        width += chars;
+        empty = false;
+    }
+    out.push_str(&line);
+    out.push('\n');
+}
+
 /// Shrinks `failures` until their text plus `extra` bytes fits in `max_bytes`:
 /// excerpts first, then messages. Names, files and lines are never touched, so the
 /// result can still be over the cap when the names alone do not fit.
@@ -377,6 +487,73 @@ mod tests {
         assert!(text.len() > 12_000);
         assert!(huge.iter().all(|x| x.excerpt.is_empty() && x.message.is_empty()));
         assert_eq!(text.lines().count(), 2_001);
+    }
+
+    #[test]
+    fn warnings_are_grouped_by_rule_with_every_location() {
+        let ws =
+            vec![
+            f("src/b.rs", Some(7), "clippy::needless_return", "unneeded `return` statement", ""),
+            f(
+                "src/a.rs",
+                Some(14),
+                "unused_variables",
+                "unused variable: `x`",
+                "14 |     let x = 1;\n   |         ^\nhelp: if this is intentional, prefix it with an underscore: `_x`",
+            ),
+            f(
+                "src/a.rs",
+                Some(2),
+                "clippy::needless_return",
+                "unneeded `return` statement",
+                "2 |     return 1;\n  = help: remove `return`",
+            ),
+            f("", None, "", "a warning without a rule or a file", ""),
+            f("src/c.rs", None, "zzz", "", ""),
+        ];
+        assert_eq!(
+            group_by_rule(&ws),
+            "warnings: 5 (4 rules)\n\
+             clippy::needless_return (2): unneeded `return` statement\n\
+             \x20 = help: remove `return`\n\
+             \x20 at src/a.rs:2, src/b.rs:7\n\
+             a warning without a rule or a file (1)\n\
+             \x20 at (no file)\n\
+             unused_variables (1): unused variable: `x`\n\
+             \x20 help: if this is intentional, prefix it with an underscore: `_x`\n\
+             \x20 at src/a.rs:14\n\
+             zzz (1)\n\
+             \x20 at src/c.rs\n"
+        );
+        assert_eq!(group_by_rule(&[]), "");
+    }
+
+    #[test]
+    fn grouped_locations_wrap_and_messages_are_clipped() {
+        let long = "m".repeat(200);
+        let ws: Vec<Failure> = (1..=40)
+            .map(|i| f(&format!("src/module_{i:02}.rs"), Some(i * 10), "dead_code", &long, ""))
+            .collect();
+        let text = group_by_rule(&ws);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "warnings: 40 (1 rules)");
+        assert_eq!(lines[1], format!("dead_code (40): {}...", "m".repeat(160)));
+        let at: Vec<&str> = lines[2..].to_vec();
+        assert!(at.len() > 1, "{text}");
+        for line in &at {
+            assert!(line.starts_with("  at ") && !line.ends_with(','), "{line}");
+            assert!(line.chars().count() <= LOCATION_WIDTH, "{line}");
+        }
+        for i in 1..=40 {
+            assert!(text.contains(&format!("src/module_{i:02}.rs:{}", i * 10)), "lost {i}");
+        }
+        // A rule key from the message is clipped, and rules with more warnings come first.
+        let mut ws = vec![f("a.c", Some(1), "", &"x".repeat(100), "")];
+        ws.push(f("a.c", Some(2), "w", "y", ""));
+        ws.push(f("a.c", Some(3), "w", "y", ""));
+        let text = group_by_rule(&ws);
+        assert!(text.starts_with("warnings: 3 (2 rules)\nw (2): y\n  at a.c:2, a.c:3\n"));
+        assert!(text.contains(&format!("\n{}... (1): {}", "x".repeat(80), "x".repeat(100))));
     }
 
     #[test]

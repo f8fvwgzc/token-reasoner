@@ -1,0 +1,11 @@
+{"Time":"2026-01-01T00:00:00Z","Action":"start","Package":"example.com/shop/util"}
+{"Time":"2026-01-01T00:00:00Z","Action":"start","Package":"example.com/shop/notests"}
+{"Time":"2026-01-01T00:00:00Z","Action":"output","Package":"example.com/shop/notests","Output":"?   \texample.com/shop/notests\t[no test files]\n"}
+{"Time":"2026-01-01T00:00:00Z","Action":"skip","Package":"example.com/shop/notests","Elapsed":0}
+{"Time":"2026-01-01T00:00:00Z","Action":"run","Package":"example.com/shop/util","Test":"TestAdd"}
+{"Time":"2026-01-01T00:00:00Z","Action":"output","Package":"example.com/shop/util","Test":"TestAdd","Output":"=== RUN   TestAdd\n","OutputType":"frame"}
+{"Time":"2026-01-01T00:00:00Z","Action":"output","Package":"example.com/shop/util","Test":"TestAdd","Output":"--- PASS: TestAdd (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-01-01T00:00:00Z","Action":"pass","Package":"example.com/shop/util","Test":"TestAdd","Elapsed":0}
+{"Time":"2026-01-01T00:00:00Z","Action":"output","Package":"example.com/shop/util","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-01-01T00:00:00Z","Action":"output","Package":"example.com/shop/util","Output":"ok  \texample.com/shop/util\t0.178s\n"}
+{"Time":"2026-01-01T00:00:00Z","Action":"pass","Package":"example.com/shop/util","Elapsed":0.179}

@@ -4,7 +4,7 @@
 //! followed by a source snippet) and the newer `full`, where the code comes first and
 //! the location follows on a ` --> path:line:col` line.
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 
 pattern!(
@@ -20,6 +20,9 @@ pattern!(SNIPPET, r"^\s*(?:\d+\s*)?\||^\s+= |^(?:help|info|note): |^\s*::: ");
 pattern!(FOUND, r"^Found (\d+) errors?(?: \((\d+) fixed, (\d+) remaining\))?\.$");
 // A snippet line with nothing but the gutter bar.
 pattern!(EMPTY_GUTTER, r"^\s*\|\s*$");
+pattern!(CLOSING, r"^(?:Found \d+ errors?\.?|All checks passed!)");
+// What ruff prints after its closing line. flake8 has no closing line at all.
+pattern!(EPILOGUE, r"^(?:\[\*\] \d+ fixable|No fixes available|\(\d+ hidden fix)");
 
 pub(crate) fn parse(text: &str) -> Parsed {
     let lines: Vec<&str> = text.lines().collect();
@@ -54,6 +57,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
         parsed.reported = reported;
     }
     parsed.recognised |= !parsed.failures.is_empty();
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&CLOSING], &[&EPILOGUE]);
     parsed
 }
 

@@ -1,19 +1,29 @@
 //! Making a bulky tool output small without losing what the task needs.
 //!
-//! Three shorteners, each pure and deterministic:
+//! The shorteners here, each pure and deterministic:
 //!
 //! * a file read becomes a skeleton: definitions the task is not about keep
 //!   their signature and lose their body, with a marker that says exactly how
 //!   to read the lines that were left out;
-//! * a search result is capped, with the files the task is about first;
-//! * a check run (tests, lint, types) is reduced to its failures.
+//! * a search result is capped, with the files the task is about first, and
+//!   its very long match lines can be clipped around the match;
+//! * a check run (tests, lint, types) is reduced to its result;
+//! * terminal noise and repeated lines are cleaned ([`inert`]), and JSON loses
+//!   the whitespace between its tokens ([`minify_json`]).
 //!
-//! A shortener returns `None` when it is not sure of the format or when the
-//! saving is too small to be worth a changed output.
+//! Path lists, lock files, progress noise and re-run deltas have their own
+//! modules: [`crate::fold`], [`crate::lockfile`], [`crate::noise`] and
+//! [`crate::delta`].
+//!
+//! A shortener returns `None` (or "as is") when it is not sure of the format
+//! or when the saving is too small to be worth a changed output.
 
+use crate::command::SearchArgs;
 use lge_core::{kind, NodeLabel, NodeRec};
 use lge_retrieve::budget::count;
+use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 
 /// An output smaller than this is never touched.
 pub const MIN_TOKENS: usize = 400;
@@ -21,7 +31,7 @@ pub const MIN_TOKENS: usize = 400;
 pub const MAX_RATIO: f64 = 0.7;
 
 /// True when `after` is enough smaller than `before` to be worth sending instead.
-fn worth_it(before: &str, after: &str) -> bool {
+pub(crate) fn worth_it(before: &str, after: &str) -> bool {
     let (b, a) = (count(before), count(after));
     b >= MIN_TOKENS && (a as f64) <= b as f64 * MAX_RATIO
 }
@@ -52,6 +62,18 @@ fn signature_end(lines: &[&str], start: usize, end: usize) -> usize {
     start
 }
 
+/// The number prefix of a line of `nl -ba` or `cat -n`: `<spaces><digits>\t`.
+/// The line number and the prefix's length in bytes.
+fn number_prefix(line: &str) -> Option<(usize, usize)> {
+    let spaces = line.len() - line.trim_start_matches(' ').len();
+    let digits = line[spaces..].bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || line.as_bytes().get(spaces + digits) != Some(&b'\t') {
+        return None;
+    }
+    let number = line[spaces..spaces + digits].parse().ok()?;
+    Some((number, spaces + digits + 1))
+}
+
 /// Shorten the text of a file read. `text` holds the file's lines from
 /// `first_line` (1-based) on; `symbols` are the file's symbols from the graph;
 /// `keep` says which symbols the task is about and must stay whole.
@@ -59,14 +81,36 @@ fn signature_end(lines: &[&str], start: usize, end: usize) -> usize {
 /// Functions and methods that are not kept and are long enough keep their
 /// signature (and the first docstring line); the body is replaced by one
 /// marker line that names the lines and the command that reads them.
+///
+/// With `numbered`, `text` is the output of `nl -ba` or `cat -n`: every line
+/// must start with its number and a tab, the numbers rising by one from
+/// `first_line`, or nothing is shortened. The prefixes are set aside to read
+/// the code; lines that are kept keep them, and markers name real line numbers.
 pub fn skeleton(
     path: &str,
     text: &str,
     first_line: usize,
     symbols: &[NodeRec],
     keep: &dyn Fn(&NodeRec) -> bool,
+    numbered: bool,
 ) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
+    // The code of each line, without its number prefix.
+    let mut code: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut prefix_len: Vec<usize> = Vec::with_capacity(lines.len());
+    for (k, line) in lines.iter().enumerate() {
+        let len = if numbered {
+            let (number, len) = number_prefix(line)?;
+            if number != first_line + k {
+                return None;
+            }
+            len
+        } else {
+            0
+        };
+        code.push(&line[len..]);
+        prefix_len.push(len);
+    }
     let last_line = first_line + lines.len().saturating_sub(1);
     let hash = comment_token(path);
     let mut candidates: Vec<&NodeRec> = symbols
@@ -88,9 +132,9 @@ pub fn skeleton(
             continue; // nested in a definition that was already handled
         }
         let (i0, i1) = (start - first_line, end - first_line);
-        let mut from = signature_end(&lines, i0, i1) + 1;
+        let mut from = signature_end(&code, i0, i1) + 1;
         // Keep the first line of a docstring: it says what the function is for.
-        if lines.get(from).is_some_and(|l| {
+        if code.get(from).is_some_and(|l| {
             l.trim_start().starts_with("\"\"\"")
                 || l.trim_start().starts_with("'''")
                 || l.trim_start().starts_with("/**")
@@ -99,7 +143,7 @@ pub fn skeleton(
         }
         // Keep a closing brace on its own line, so the structure still reads.
         let mut to = i1;
-        if lines
+        if code
             .get(to)
             .is_some_and(|l| matches!(l.trim(), "}" | "};" | "})" | "});"))
         {
@@ -109,10 +153,16 @@ pub fn skeleton(
             continue;
         }
         covered_to = end;
-        let indent: String = lines[from].chars().take_while(|c| c.is_whitespace()).collect();
+        let indent: String = code[from].chars().take_while(|c| c.is_whitespace()).collect();
+        // A marker of a numbered read lines up with the code: blank number, tab.
+        let pad = if numbered {
+            format!("{}\t", " ".repeat(prefix_len[from].saturating_sub(1)))
+        } else {
+            String::new()
+        };
         let (a, b) = (from + first_line, to + first_line);
         let marker = format!(
-            "{indent}{hash} lge: {} lines of {} `{}` left out; read them with: sed -n '{a},{b}p' {path}",
+            "{pad}{indent}{hash} lge: {} lines of {} `{}` left out; read them with: sed -n '{a},{b}p' {path}",
             b - a + 1,
             s.kind,
             s.name
@@ -150,18 +200,26 @@ pub fn skeleton(
 
 /// Lines kept from one search.
 const MAX_SEARCH_LINES: usize = 60;
+/// Tokens the list of files left out of a capped search may take.
+const NOT_SHOWN_BUDGET: usize = 1000;
 /// Lines kept per file.
 const MAX_PER_FILE: usize = 6;
 
 /// The file a `path:line:text` or `path:text` match line belongs to. With
-/// `numbered_only`, only a `path:line:text` line is a match.
+/// `numbered_only`, only a `path:line:text` line is a match. A path with a
+/// space is only taken from a numbered line of a known search (not with
+/// `numbered_only`): in other output, `Total lines: 12:` is not a path.
 fn match_path(line: &str, numbered_only: bool) -> Option<&str> {
     let (path, rest) = line.split_once(':')?;
-    if path.is_empty() || path.contains(' ') || path.len() > 300 || rest.is_empty() {
+    if path.trim().len() != path.len() || path.is_empty() || path.len() > 300 || rest.is_empty() {
+        return None;
+    }
+    let is_numbered = matches!(numbered(rest), Some((_, true)));
+    if path.contains(' ') && (numbered_only || !is_numbered) {
         return None;
     }
     // `app.name: x` (YAML), `tests/a.py::test_b PASSED`, `host.lan:8080 up`.
-    if numbered_only && !matches!(numbered(rest), Some((_, true))) {
+    if numbered_only && !is_numbered {
         return None;
     }
     // A path has a dot or a slash; `error: something` does not.
@@ -324,6 +382,40 @@ pub fn cap_numbered_search(text: &str, relevant: &dyn Fn(&str) -> bool) -> Optio
     cap(text, relevant, true)
 }
 
+/// The files a capped search left out, best first, each with its number of
+/// matching lines: `a.py (12), b.py (3)`. Every one is named while the list
+/// fits in [`NOT_SHOWN_BUDGET`] tokens; past that, how many more there are and
+/// how many lines they have.
+fn not_shown(skipped: &[usize], files: &[&str], matches: &[usize]) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut named = 0usize;
+    for f in skipped {
+        let entry = format!("{} ({})", files[*f], matches[*f]);
+        // +1 for the ", " that joins it.
+        let cost = count(&entry) + 1;
+        if used + cost > NOT_SHOWN_BUDGET {
+            break;
+        }
+        if named > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&entry);
+        used += cost;
+        named += 1;
+    }
+    let rest = &skipped[named..];
+    if !rest.is_empty() {
+        let lines: usize = rest.iter().map(|f| matches[*f]).sum();
+        out.push_str(&format!(
+            "{}{} more files ({lines} matching lines; rg -l with the same pattern lists them)",
+            if named > 0 { ", and " } else { "" },
+            rest.len()
+        ));
+    }
+    out
+}
+
 fn cap(text: &str, relevant: &dyn Fn(&str) -> bool, numbered_only: bool) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let (role, files) = roles(&lines, numbered_only);
@@ -458,20 +550,19 @@ fn cap(text: &str, relevant: &dyn Fn(&str) -> bool, numbered_only: bool) -> Opti
     }
 
     let files_shown = order.iter().filter(|f| take[**f] > 0).count();
-    let skipped: Vec<&str> = order.iter().filter(|f| take[**f] == 0).map(|f| files[*f]).collect();
+    let skipped: Vec<usize> = order.iter().copied().filter(|f| take[*f] == 0).collect();
     let mut closing = format!(
         "lge: {shown} of {total} matching lines shown, from {files_shown} of {} files.",
         order.len()
     );
     if !skipped.is_empty() {
-        let names: Vec<&str> = skipped.iter().take(8).copied().collect();
-        closing.push_str(&format!(
-            " Not shown: {}{}.",
-            names.join(", "),
-            if skipped.len() > names.len() { ", ..." } else { "" }
-        ));
+        closing.push_str(" Not shown: ");
+        closing.push_str(&not_shown(&skipped, &files, &matches));
+        closing.push('.');
     }
-    closing.push_str(" Narrow the pattern or search one file to see the rest.");
+    closing.push_str(
+        " Narrow the pattern or search one file to see the rest, or run the same search again before changing anything to see it whole.",
+    );
     out.push(closing);
     let out = out.join("\n") + "\n";
     worth_it(text, &out).then_some(out)
@@ -481,38 +572,292 @@ fn cap(text: &str, relevant: &dyn Fn(&str) -> bool, numbered_only: bool) -> Opti
 // Check runs
 // ---------------------------------------------------------------------------
 
-/// Reduce the output of a test, lint or type-check run to its failures, or to
-/// one line when it passed. `None` when the tool's output was not recognised:
-/// an unknown format is never summarised.
-pub fn failures_only(tool: &str, text: &str) -> Option<String> {
-    check_run(tool, text).flatten()
+/// What the agent's frame says about the process that printed an output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunStatus {
+    /// Its exit code, when it has exited and the code is known.
+    pub exit: Option<i32>,
+    /// It is still running: what was printed so far is not all of it.
+    pub running: bool,
+    /// The status the shell reported is not the run's verdict (a pipe without
+    /// `pipefail`, `|| true`, several statements joined by `;`): the output may
+    /// be a fragment or hold another program's failure, so the run is never
+    /// called passed.
+    pub masked: bool,
 }
 
-/// What [`failures_only`] decides, and whether the output was a check run at
-/// all: `None` when it was not recognised, `Some(None)` when it was but is
-/// sent as it is (the saving is too small, or it says nothing about a result).
+/// What [`check_run`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckDecision {
+    /// The output is not a test, lint, type-check or build run lge recognises.
+    NotACheck,
+    /// It is one, but it is sent as it is: something follows the tool's
+    /// result, a failure is not certain to be all there is, or the saving is
+    /// too small.
+    AsIs,
+    /// It is one, and this is its result, to send in its place.
+    Shorter(String),
+}
+
+/// Reduce the output of a test, lint, type-check or build run to its result:
+/// every failure, and every warning grouped by rule with all its locations;
+/// one line for a pass. `tool` picks the parser (`""` lets the output decide);
+/// `label` names the command in the marker (`tool` when empty, then "the
+/// command").
 ///
-/// A run is only called passed when the tool said so in its closing line (a
-/// tally such as `300 passed`, or cargo's `Finished`): an output cut before
-/// its end (a process still running, `| head`, a script that printed part of
-/// it) has no failure in it yet, and that is not a pass.
-pub fn check_run(tool: &str, text: &str) -> Option<Option<String>> {
-    let (failures, filtered) = lge_filter::filter_output(tool, text);
-    let passed = failures.is_empty() && filtered.trim_start().starts_with("ok");
-    if failures.is_empty() && !passed {
+/// A run is only called passed when the tool's own closing line is in the
+/// output and nothing but the tool's epilogue follows it, the process is not
+/// still running, its exit code, if known, is 0, the shell did not mask the
+/// status (a pipe without `pipefail`, `|| true`, statements joined by `;`),
+/// no line says the run failed (cargo's `error: 1 target failed:`, go's
+/// `FAIL`, `make: *** ... Error 1`, `BUILD FAILED`), and the tool did not
+/// count failures that no parser read. A non-zero exit with no
+/// failure parsed is sent as it is: lge does not know why it failed. Output
+/// that continues after the tool's result (`cargo run`, `pytest && script`)
+/// is always sent as it is.
+pub fn check_run(tool: &str, label: &str, text: &str, status: RunStatus) -> CheckDecision {
+    let opts = lge_filter::FilterOptions {
+        passed: None,
+        keep_warnings: true,
+        ..lge_filter::FilterOptions::default()
+    };
+    let filtered = lge_filter::filter_for_proxy(tool, text, &opts);
+    let failed = !filtered.failures.is_empty();
+    if !filtered.recognised && !failed {
+        return CheckDecision::NotACheck;
+    }
+    if filtered.trailing {
+        return CheckDecision::AsIs;
+    }
+    // A pass needs exit 0, or an unknown status that is not masked (a code-mode
+    // part prints a whole output without its status).
+    let exit_ok = match status.exit {
+        Some(code) => code == 0,
+        None => !status.masked,
+    };
+    // The tool counted failures no parser read, or a line says the run failed:
+    // not a pass lge can vouch for.
+    if !failed && (!exit_ok || status.masked || !filtered.closed || status.running || filtered.unparsed > 0) {
+        return CheckDecision::AsIs;
+    }
+    let label = match (label, tool) {
+        ("", "") => "the command".to_string(),
+        ("", tool) => format!("`{tool}`"),
+        (label, _) => format!("`{label}`"),
+    };
+    let warnings = match filtered.warnings {
+        0 => String::new(),
+        1 => " and its 1 warning (every location listed)".to_string(),
+        n => format!(" and its {n} warnings (every location listed)"),
+    };
+    let out = format!(
+        "{}\nlge: output of {label} reduced to its result{warnings}. Running the same command again before changing anything prints it whole.\n",
+        filtered.text.trim_end()
+    );
+    if worth_it(text, &out) {
+        CheckDecision::Shorter(out)
+    } else {
+        CheckDecision::AsIs
+    }
+}
+
+/// [`check_run`] for a finished run of `tool` whose exit code is not known:
+/// the shorter text, or `None`. Kept for tests.
+pub fn failures_only(tool: &str, text: &str) -> Option<String> {
+    match check_run(tool, tool, text, RunStatus::default()) {
+        CheckDecision::Shorter(out) => Some(out),
+        CheckDecision::NotACheck | CheckDecision::AsIs => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Long match lines
+// ---------------------------------------------------------------------------
+
+/// A match whose text is longer than this many characters is clipped.
+const CLIP_OVER: usize = 500;
+/// Characters kept of a clipped match.
+const CLIP_KEEP: usize = 300;
+/// Characters kept before the first match of the pattern.
+const CLIP_BEFORE: usize = 100;
+
+/// The search's pattern as a regular expression, when it compiles.
+fn search_regex(args: &SearchArgs) -> Option<Regex> {
+    let pattern = args.pattern.as_deref().filter(|p| !p.is_empty())?;
+    let mut source = if args.fixed {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    if args.word {
+        source = format!(r"\b(?:{source})\b");
+    }
+    let insensitive = args.ignore_case || (args.smart_case && !pattern.chars().any(char::is_uppercase));
+    RegexBuilder::new(&source)
+        .case_insensitive(insensitive)
+        .size_limit(1 << 20)
+        .build()
+        .ok()
+}
+
+/// A path as a shell word: single-quoted when it has a character outside
+/// `[A-Za-z0-9._/-]`.
+pub(crate) fn shell_word(path: &str) -> String {
+    if path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
+/// The clipped form of the match text `body` of line `number` of `path`, or
+/// `None` when it is short enough.
+fn clip_body(body: &str, re: Option<&Regex>, path: &str, number: usize) -> Option<String> {
+    let total = body.chars().count();
+    if total <= CLIP_OVER {
         return None;
     }
-    let finished = filtered.trim_start().starts_with("ok:")
-        || text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .is_some_and(|l| l.trim_start().starts_with("Finished "));
-    if passed && !finished {
-        return Some(None);
+    let first = re
+        .and_then(|re| re.find(body))
+        .map_or(0, |m| body[..m.start()].chars().count());
+    // A match near the end still gets a whole window.
+    let start = first.saturating_sub(CLIP_BEFORE).min(total - CLIP_KEEP);
+    let window: String = body.chars().skip(start).take(CLIP_KEEP).collect();
+    Some(format!(
+        "{}{window}...[lge: +{} chars; whole line: sed -n '{number}p' {}]",
+        if start > 0 { "..." } else { "" },
+        total - CLIP_KEEP,
+        shell_word(path)
+    ))
+}
+
+/// Clip the very long lines of a search result: a numbered match
+/// (`path:line:text`, or `line:text` under a heading path) whose text is over
+/// 500 characters keeps 300 characters from 100 before the pattern's first
+/// match (from the start when there is no pattern, it does not compile or it
+/// does not match), and says how many characters were left out and how to
+/// print the whole line. Unnumbered matches and context lines are never
+/// clipped. `None` when nothing was clipped; the caller decides whether the
+/// result is worth sending.
+pub fn clip_match_lines(text: &str, args: &SearchArgs) -> Option<String> {
+    let segments: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines: Vec<&str> = segments
+        .iter()
+        .map(|s| s.strip_suffix('\n').map_or(*s, |l| l.strip_suffix('\r').unwrap_or(l)))
+        .collect();
+    let (role, files) = roles(&lines, false);
+    let re = search_regex(args);
+    let mut out = String::with_capacity(text.len());
+    let mut clipped = false;
+    for (i, segment) in segments.iter().enumerate() {
+        let line = lines[i];
+        let (prefix_len, path) = match role[i] {
+            Role::Flat(f) => (files[f].len() + 1, files[f]),
+            Role::Line { file, matched: true } => (0, files[file]),
+            _ => (0, ""),
+        };
+        let rest = &line[prefix_len..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let numbered_match = !path.is_empty() && digits > 0 && rest.as_bytes().get(digits) == Some(&b':');
+        let short = numbered_match
+            .then(|| rest[..digits].parse::<usize>().ok())
+            .flatten()
+            .and_then(|number| clip_body(&rest[digits + 1..], re.as_ref(), path, number));
+        match short {
+            Some(body) => {
+                out.push_str(&line[..prefix_len + digits + 1]);
+                out.push_str(&body);
+                out.push_str(&segment[line.len()..]);
+                clipped = true;
+            }
+            None => out.push_str(segment),
+        }
     }
-    let out = format!("{}\nlge: output of `{tool}` reduced to its result; run the command again with a narrower target for the full log.\n", filtered.trim_end());
-    Some(worth_it(text, &out).then_some(out))
+    clipped.then_some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Lossless cleaning
+// ---------------------------------------------------------------------------
+
+/// The output as a terminal would show it ([`lge_filter::normalize_terminal`]:
+/// no escape codes, carriage returns applied, no trailing blanks), with runs
+/// of identical lines collapsed ([`lge_filter::collapse_repeats`]). `None`
+/// when that changes nothing.
+pub fn inert(text: &str) -> Option<String> {
+    let clean = lge_filter::normalize_terminal(text);
+    let collapsed = lge_filter::collapse_repeats(&clean);
+    (collapsed.as_ref() != text).then(|| collapsed.into_owned())
+}
+
+/// Only the terminal part of [`inert`]: escape codes removed and carriage
+/// returns applied. For output whose format is not known, where even trailing
+/// blanks and repeats are left as they are. `None` when the text has no ESC
+/// or carriage return, or when cleaning changes nothing.
+pub fn terminal_only(text: &str) -> Option<String> {
+    if !text.contains(['\u{1b}', '\r', '\u{9b}']) {
+        return None;
+    }
+    let clean = lge_filter::strip_ansi(text);
+    (clean != text).then_some(clean)
+}
+
+/// Largest JSON text [`minify_json`] reads.
+const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+/// One JSON value without the whitespace between its tokens. Nothing is
+/// re-encoded: numbers, escapes and key order stay byte for byte. The text
+/// must be one whole JSON object or array (a second value, as in NDJSON,
+/// refuses) of at most 8 MB, and the result must parse again and be worth
+/// sending.
+pub fn minify_json(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) || trimmed.len() > MAX_JSON_BYTES {
+        return None;
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(trimmed).ok()?;
+    let mut out: Vec<u8> = Vec::with_capacity(trimmed.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in trimmed.as_bytes() {
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => {}
+            b'"' => {
+                in_string = true;
+                out.push(b);
+            }
+            _ => out.push(b),
+        }
+    }
+    // Only ASCII bytes were removed, so the rest is still UTF-8.
+    let out = String::from_utf8(out).ok()?;
+    serde_json::from_str::<serde::de::IgnoredAny>(&out).ok()?;
+    worth_it(text, &out).then_some(out)
+}
+
+/// True when RTK has condensed the output already (its recall hints, its
+/// stamps, its notes about what it left out). Such output gets no lossy rule.
+pub fn condensed_upstream(text: &str) -> bool {
+    static MARKS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"rtk recall [0-9a-f]{6,}|\[rtk:|lines omitted by rtk|\[full output: |full output in recall file\]|\[full diff: rtk ",
+        )
+        .expect("the pattern is a valid regex")
+    });
+    MARKS.is_match(text)
 }
 
 #[cfg(test)]
@@ -555,7 +900,15 @@ mod tests {
     #[test]
     fn a_file_read_keeps_what_the_task_is_about_and_marks_the_rest() {
         let (text, symbols) = python_file();
-        let out = skeleton("svc/orders.py", &text, 1, &symbols, &|s| s.name == "cancel_order").unwrap();
+        let out = skeleton(
+            "svc/orders.py",
+            &text,
+            1,
+            &symbols,
+            &|s| s.name == "cancel_order",
+            false,
+        )
+        .unwrap();
         assert!(
             out.starts_with("# lge: shortened view of svc/orders.py (lines 1-120): 2 definition(s)"),
             "{out}"
@@ -587,20 +940,21 @@ mod tests {
     #[test]
     fn nothing_is_shortened_when_the_task_needs_it_all_or_the_file_is_small() {
         let (text, symbols) = python_file();
-        assert_eq!(skeleton("svc/orders.py", &text, 1, &symbols, &|_| true), None);
+        assert_eq!(skeleton("svc/orders.py", &text, 1, &symbols, &|_| true, false), None);
         assert_eq!(
             skeleton(
                 "svc/orders.py",
                 "def a():\n    return 1\n",
                 1,
                 &[sym("a", kind::FUNCTION, 1, 2)],
-                &|_| false
+                &|_| false,
+                false
             ),
             None
         );
         // A read that starts further down: symbols outside it are ignored.
         let tail: String = text.lines().skip(40).map(|l| format!("{l}\n")).collect();
-        let out = skeleton("svc/orders.py", &tail, 41, &symbols, &|_| false).unwrap();
+        let out = skeleton("svc/orders.py", &tail, 41, &symbols, &|_| false, false).unwrap();
         assert!(
             !out.contains("create_order") && out.contains("lines of function `refund_order` left out"),
             "{out}"
@@ -619,7 +973,7 @@ mod tests {
             sym("send", kind::METHOD, 2, 43),
             sym("inner", kind::FUNCTION, 10, 30),
         ];
-        let out = skeleton("src/mailer.ts", &text, 1, &symbols, &|_| false).unwrap();
+        let out = skeleton("src/mailer.ts", &text, 1, &symbols, &|_| false, false).unwrap();
         assert!(out.contains("  async send(to: string) {\n    // lge: 40 lines of method `send` left out; read them with: sed -n '3,42p' src/mailer.ts\n  }\n}\n"), "{out}");
         assert_eq!(
             out.matches("left out").count(),
@@ -649,9 +1003,9 @@ mod tests {
             out.contains("lge: 60 of 300 matching lines shown, from 10 of 30 files. Not shown: "),
             "{out}"
         );
-        assert!(out
-            .trim_end()
-            .ends_with("Narrow the pattern or search one file to see the rest."));
+        assert!(out.ends_with(
+            " Narrow the pattern or search one file to see the rest, or run the same search again before changing anything to see it whole.\n"
+        ));
         // Short results, and output that is not a list of matches, are left alone.
         assert_eq!(cap_search("a.py:1:x\nb.py:2:y\n", &|_| false), None);
         let prose: String = (0..200)
@@ -703,8 +1057,12 @@ mod tests {
             "every line stays in its place: {out}"
         );
         assert!(out.contains("src/module_25/handlers.py: (+4 more matching lines in this file)\n"));
+        let hidden: Vec<String> = [17, 18, 19, 2, 20, 21, 22, 23, 24, 26, 27, 28, 29, 3, 4, 5, 6, 7, 8, 9]
+            .iter()
+            .map(|f| format!("{} (10)", module(*f)))
+            .collect();
         assert!(
-            out.ends_with("lge: 60 of 300 matching lines shown, from 10 of 30 files. Not shown: src/module_17/handlers.py, src/module_18/handlers.py, src/module_19/handlers.py, src/module_2/handlers.py, src/module_20/handlers.py, src/module_21/handlers.py, src/module_22/handlers.py, src/module_23/handlers.py, .... Narrow the pattern or search one file to see the rest.\n"),
+            out.ends_with(&format!("lge: 60 of 300 matching lines shown, from 10 of 30 files. Not shown: {}. Narrow the pattern or search one file to see the rest, or run the same search again before changing anything to see it whole.\n", hidden.join(", "))),
             "{out}"
         );
         assert!(count(&out) * 10 <= count(&text) * 7);
@@ -879,8 +1237,12 @@ mod tests {
         for text in [&yaml, &listing, &hosts] {
             assert_eq!(cap_numbered_search(text, &|_| false), None, "{text}");
         }
-        // The same text from a known search command is a search: `rg` without `-n`.
-        assert!(cap_search(&yaml, &|_| false).is_some());
+        // From a known search command, `path:text` lines are matches: `rg` without `-n`.
+        let unnumbered: String = (0..30)
+            .flat_map(|f| (0..10).map(move |l| format!("{}:    result = create_order(payload, {l})\n", module(f))))
+            .collect();
+        assert!(cap_search(&unnumbered, &|_| false).is_some());
+        assert_eq!(cap_numbered_search(&unnumbered, &|_| false), None);
         // Numbered matches and the heading layout are still capped.
         let numbered: String = (0..30)
             .flat_map(|f| (0..10).map(move |l| flat(&module(f), l + 1)))
@@ -901,46 +1263,183 @@ mod tests {
         assert!(cap_numbered_search(&heading, &|_| false).is_some());
     }
 
-    #[test]
-    fn a_run_cut_before_its_result_is_not_called_passed() {
-        let mut partial = String::from(
+    fn pytest_lines(n: usize) -> String {
+        let mut run = String::from(
             "============================= test session starts ==============================\ncollected 300 items\n\n",
         );
-        for i in 0..200 {
-            partial.push_str(&format!(
+        for i in 0..n {
+            run.push_str(&format!(
                 "tests/test_orders.py::test_case_number_{i} PASSED                              [{:3}%]\n",
                 i / 3
             ));
         }
+        run
+    }
+
+    fn exited(code: i32) -> RunStatus {
+        RunStatus {
+            exit: Some(code),
+            running: false,
+            masked: false,
+        }
+    }
+
+    #[test]
+    fn a_run_cut_before_its_tally_is_not_called_passed() {
+        let mut partial = pytest_lines(200);
         // Still running, or cut by `| head`: no failure yet is not a pass.
-        assert_eq!(check_run("pytest", &partial), Some(None));
+        assert_eq!(
+            check_run("pytest", "pytest", &partial, RunStatus::default()),
+            CheckDecision::AsIs
+        );
         assert_eq!(failures_only("pytest", &partial), None);
         let mut build: String = (0..80)
             .map(|i| format!("   Compiling crate_number_{i} v0.{i}.0 (/repo/crates/crate_number_{i})\n"))
             .collect();
-        assert_eq!(check_run("cargo", &build), Some(None));
+        assert_eq!(check_run("cargo", "cargo", &build, exited(0)), CheckDecision::AsIs);
         // Finished: the build passed.
         build.push_str("    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.20s\n");
         let out = failures_only("cargo", &build).unwrap();
         assert!(out.starts_with("ok\n"), "{out}");
+        assert!(out.ends_with("lge: output of `cargo` reduced to its result. Running the same command again before changing anything prints it whole.\n"), "{out}");
         // A failure in a cut run is still reported.
         partial.push_str("tests/test_orders.py::test_case_number_200 FAILED                              [ 66%]\n");
         assert!(failures_only("pytest", &partial).is_some_and(|o| o.contains("test_case_number_200")));
         // Not a check run at all.
-        assert_eq!(check_run("", "just some words\n"), None);
+        assert_eq!(
+            check_run("", "", "just some words\n", RunStatus::default()),
+            CheckDecision::NotACheck
+        );
+    }
+
+    #[test]
+    fn a_running_process_is_never_called_passed() {
+        let mut run = pytest_lines(300);
+        run.push_str("\n============================= 300 passed in 9.87s ==============================\n");
+        let running = RunStatus {
+            exit: None,
+            running: true,
+            masked: false,
+        };
+        assert_eq!(check_run("pytest", "pytest", &run, running), CheckDecision::AsIs);
+        assert!(matches!(
+            check_run("pytest", "pytest", &run, RunStatus::default()),
+            CheckDecision::Shorter(_)
+        ));
+        assert!(matches!(
+            check_run("pytest", "pytest", &run, exited(0)),
+            CheckDecision::Shorter(_)
+        ));
+    }
+
+    #[test]
+    fn a_nonzero_exit_without_parsed_failures_is_as_is() {
+        let mut run = pytest_lines(300);
+        run.push_str("\n============================= 300 passed in 9.87s ==============================\n");
+        // The tally says passed, the exit code says otherwise: lge does not know why.
+        assert_eq!(check_run("pytest", "pytest", &run, exited(1)), CheckDecision::AsIs);
+        assert_eq!(check_run("pytest", "pytest", &run, exited(-9)), CheckDecision::AsIs);
+        // A tally that counts a failure no parser read is not a pass either.
+        let mut unread = pytest_lines(300);
+        unread.push_str("\n======================== 1 failed, 299 passed in 9.87s =========================\n");
+        assert_eq!(
+            check_run("pytest", "pytest", &unread, RunStatus::default()),
+            CheckDecision::AsIs
+        );
+        // With a failure parsed, a non-zero exit is the expected case.
+        let mut failed = pytest_lines(299);
+        failed.push_str("tests/test_orders.py::test_case_number_299 FAILED                              [ 99%]\n\n=================================== FAILURES ===================================\n__________________________ test_case_number_299 ___________________________\n\n    def test_case_number_299():\n>       assert total() == 3\nE       assert 2 == 3\n\ntests/test_orders.py:12: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_orders.py::test_case_number_299 - assert 2 == 3\n======================== 1 failed, 299 passed in 9.87s =========================\n");
+        match check_run("pytest", "pytest", &failed, exited(1)) {
+            CheckDecision::Shorter(out) => {
+                assert!(
+                    out.contains("test_case_number_299") && out.contains("tests/test_orders.py"),
+                    "{out}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn fixture(name: &str) -> String {
+        let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn cargo_run_with_a_warning_and_a_panic_is_sent_as_is() {
+        // A real capture: one build warning, `Finished`, 120 rows of the
+        // program's output, then its panic.
+        let raw = fixture("cargo_run_panic.txt");
+        assert!(raw.contains("panicked at src/main.rs:7:23"));
+        for status in [RunStatus::default(), exited(101), exited(0)] {
+            assert_eq!(
+                check_run("cargo", "cargo", &raw, status),
+                CheckDecision::AsIs,
+                "{status:?}"
+            );
+        }
+        // Judged by content alone, too.
+        assert_eq!(check_run("", "", &raw, RunStatus::default()), CheckDecision::AsIs);
+    }
+
+    #[test]
+    fn a_check_chained_with_another_program_is_sent_as_is() {
+        let mut run = pytest_lines(300);
+        run.push_str("\n============================= 300 passed in 9.87s ==============================\n");
+        run.push_str("Traceback (most recent call last):\n  File \"scripts/report.py\", line 3, in <module>\n    main()\nKeyError: 'total'\n");
+        assert_eq!(check_run("", "", &run, RunStatus::default()), CheckDecision::AsIs);
+        assert_eq!(check_run("pytest", "pytest", &run, exited(1)), CheckDecision::AsIs);
+    }
+
+    /// `cargo clippy` with `n` warnings over three lints.
+    fn clippy_warnings(n: usize) -> String {
+        let lints = [
+            ("needless_return", "unneeded `return` statement", "remove `return`"),
+            ("redundant_clone", "redundant clone", "remove this"),
+            ("len_zero", "length comparison to zero", "using `is_empty` is clearer"),
+        ];
+        let mut out = String::from("    Checking shop v0.1.0 (/repo)\n");
+        for i in 0..n {
+            let (lint, message, help) = lints[i % 3];
+            out.push_str(&format!(
+                "warning: {message}\n  --> src/m{i}.rs:{}:5\n   |\n{} |     return value_{i}.clone();\n   |     ^^^^^^^^^^^^^^^^^^^^^^^^\n   |\n   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#{lint}\n   = note: `#[warn(clippy::{lint})]` on by default\nhelp: {help}\n   |\n{} -     return value_{i}.clone();\n{} +     value_{i}\n   |\n\n",
+                10 + i,
+                10 + i,
+                10 + i,
+                10 + i
+            ));
+        }
+        out.push_str(&format!(
+            "warning: `shop` (lib) generated {n} warnings (run `cargo clippy --fix --lib -p shop` to apply {n} suggestions)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s\n"
+        ));
+        out
+    }
+
+    #[test]
+    fn clippy_warnings_keep_every_location() {
+        let raw = clippy_warnings(30);
+        let out = match check_run("cargo", "cargo", &raw, exited(0)) {
+            CheckDecision::Shorter(out) => out,
+            other => panic!("{other:?}"),
+        };
+        for i in 0..30 {
+            assert!(out.contains(&format!("src/m{i}.rs:{}", 10 + i)), "src/m{i}.rs: {out}");
+        }
+        assert!(
+            out.ends_with("lge: output of `cargo` reduced to its result and its 30 warnings (every location listed). Running the same command again before changing anything prints it whole.\n"),
+            "{out}"
+        );
+        assert!(
+            count(&out) * 10 <= count(&raw) * 3,
+            "{} of {}",
+            count(&out),
+            count(&raw)
+        );
     }
 
     #[test]
     fn a_passing_test_run_becomes_one_line_and_unknown_output_is_left_alone() {
-        let mut raw = String::from(
-            "============================= test session starts ==============================\ncollected 400 items\n\n",
-        );
-        for i in 0..400 {
-            raw.push_str(&format!(
-                "tests/test_orders.py::test_case_number_{i} PASSED                              [{:3}%]\n",
-                i / 4
-            ));
-        }
+        let mut raw = pytest_lines(400);
         raw.push_str("\n============================= 400 passed in 12.34s =============================\n");
         let out = failures_only("pytest", &raw).unwrap();
         assert!(out.starts_with("ok") && out.contains("400 passed"), "{out}");
@@ -949,5 +1448,279 @@ mod tests {
             .map(|i| format!("step {i}: doing some work that is not a known tool format\n"))
             .collect();
         assert_eq!(failures_only("pytest", &unknown), None);
+        // Without a tool, the label is the command.
+        match check_run("", "", &raw, RunStatus::default()) {
+            CheckDecision::Shorter(out) => assert!(
+                out.contains("lge: output of the command reduced to its result."),
+                "{out}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_hidden_file_of_a_capped_search_is_named_with_its_count() {
+        let mut text = String::new();
+        for f in 0..30 {
+            for l in 0..(30 - f) {
+                text.push_str(&flat(&module(f), l + 1));
+            }
+        }
+        let out = cap_search(&text, &|_| false).unwrap();
+        let closing = out.lines().last().unwrap();
+        // Ten files are shown; the other twenty are named, best first.
+        let hidden: Vec<String> = (10..30).map(|f| format!("{} ({})", module(f), 30 - f)).collect();
+        assert!(
+            closing.contains(&format!("Not shown: {}.", hidden.join(", "))),
+            "{closing}"
+        );
+        assert!(!closing.contains("more files"), "{closing}");
+    }
+
+    #[test]
+    fn a_search_over_thousands_of_files_stays_within_the_list_budget() {
+        let mut text = String::new();
+        for f in 0..2000 {
+            for l in 0..(1 + f % 3) {
+                text.push_str(&flat(&format!("src/pkg_{f:04}/handlers.py"), l + 1));
+            }
+        }
+        let total: usize = (0..2000).map(|f| 1 + f % 3).sum();
+        let out = cap_search(&text, &|_| false).unwrap();
+        let closing = out.lines().last().unwrap();
+        let list = closing
+            .split_once("Not shown: ")
+            .and_then(|(_, rest)| rest.split_once(", and "))
+            .map(|(list, _)| list)
+            .expect("a long list ends with a count");
+        assert!(count(list) <= NOT_SHOWN_BUDGET, "{}", count(list));
+        let named = list.split(", ").count();
+        // The count of what is not named is exact.
+        let shown_files: usize = closing
+            .split_once(", from ")
+            .and_then(|(_, r)| r.split_once(' '))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap();
+        let more = 2000 - shown_files - named;
+        let named_lines: usize = list
+            .split(", ")
+            .map(|e| {
+                e.rsplit_once(" (")
+                    .unwrap()
+                    .1
+                    .trim_end_matches(')')
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        let more_lines = total - 60 - named_lines;
+        assert!(
+            closing.contains(&format!(
+                ", and {more} more files ({more_lines} matching lines; rg -l with the same pattern lists them). Narrow"
+            )),
+            "{closing}"
+        );
+    }
+
+    #[test]
+    fn file_names_with_spaces_stay_whole() {
+        let mut text = String::new();
+        for f in 0..30 {
+            for l in 0..10 {
+                text.push_str(&flat(&format!("docs/my notes {f:02}/read me.md"), l + 1));
+            }
+        }
+        let out = cap_search(&text, &|_| false).unwrap();
+        assert!(out.contains("docs/my notes 00/read me.md:1:"), "{out}");
+        assert!(
+            out.contains("Not shown: docs/my notes 10/read me.md (10), docs/my notes 11/read me.md (10)"),
+            "{out}"
+        );
+        // Without a known search command, such lines are not taken for matches.
+        assert_eq!(cap_numbered_search(&text, &|_| false), None);
+    }
+
+    fn args(pattern: &str) -> SearchArgs {
+        SearchArgs {
+            pattern: Some(pattern.to_string()),
+            ..SearchArgs::default()
+        }
+    }
+
+    #[test]
+    fn a_minified_line_is_clipped_around_its_match() {
+        let filler = "var a=function(b){return b+1};".repeat(700);
+        let line = format!("{filler}createOrder(payload){filler}");
+        let total = line.chars().count();
+        let text = format!("dist/app.min.js:1:{line}\nsrc/a.ts:3:const x = createOrder(y);\n");
+        let out = clip_match_lines(&text, &args("createOrder")).unwrap();
+        let first = out.lines().next().unwrap();
+        assert!(first.starts_with("dist/app.min.js:1:..."), "{first}");
+        assert!(first.contains("createOrder(payload)"), "{first}");
+        assert!(
+            first.ends_with(&format!(
+                "...[lge: +{} chars; whole line: sed -n '1p' dist/app.min.js]",
+                total - 300
+            )),
+            "{first}"
+        );
+        // 100 characters before the match.
+        let window = first
+            .strip_prefix("dist/app.min.js:1:...")
+            .and_then(|w| w.split_once("...[lge:"))
+            .unwrap()
+            .0;
+        assert_eq!(window.chars().count(), 300);
+        assert_eq!(window.find("createOrder"), Some(100));
+        assert!(
+            out.ends_with("\nsrc/a.ts:3:const x = createOrder(y);\n"),
+            "short lines stay"
+        );
+    }
+
+    #[test]
+    fn clipping_honours_the_search_flags() {
+        let body = |needle: &str| format!("{}{needle}{}", "x".repeat(2000), "y".repeat(2000));
+        // -F: the pattern's metacharacters are literal.
+        let text = format!("a.js:7:{}\n", body("a.b(c"));
+        let fixed = SearchArgs {
+            fixed: true,
+            ..args("a.b(c")
+        };
+        assert!(clip_match_lines(&text, &fixed).unwrap().contains("a.b(c"));
+        // -i: the case of the match does not matter.
+        let text = format!("a.js:7:{}\n", body("CreateOrder"));
+        let insensitive = SearchArgs {
+            ignore_case: true,
+            ..args("createorder")
+        };
+        assert!(clip_match_lines(&text, &insensitive).unwrap().contains("CreateOrder"));
+        // No match (or a pattern that does not compile): the start of the line.
+        for unmatched in [args("not-there"), args("(unclosed")] {
+            let out = clip_match_lines(&text, &unmatched).unwrap();
+            assert!(
+                out.starts_with(&format!("a.js:7:{}...[lge: +", "x".repeat(300))),
+                "{out}"
+            );
+        }
+        // Lines of 500 characters or less are left alone; so is output without numbers.
+        let exactly = format!("a.js:7:{}\n", "z".repeat(500));
+        assert_eq!(clip_match_lines(&exactly, &args("z")), None);
+        let unnumbered = format!("a.js:{}\n", "z".repeat(5000));
+        assert_eq!(clip_match_lines(&unnumbered, &args("z")), None);
+    }
+
+    #[test]
+    fn clipping_cuts_on_character_boundaries() {
+        let body = format!("{}needle{}", "é日".repeat(800), "ü本".repeat(800));
+        let text = format!("src/ünï code.txt:12:{body}\n");
+        let out = clip_match_lines(&text, &args("needle")).unwrap();
+        assert!(out.starts_with("src/ünï code.txt:12:...é日"), "{out}");
+        assert!(out.contains("needle"));
+        assert!(
+            out.ends_with(&format!(
+                "...[lge: +{} chars; whole line: sed -n '12p' 'src/ünï code.txt']\n",
+                body.chars().count() - 300
+            )),
+            "{out}"
+        );
+        // The heading layout keeps its own prefix and names the heading's path.
+        let heading = format!("src/b.rs\n4:{body}\n");
+        let out = clip_match_lines(&heading, &args("needle")).unwrap();
+        assert!(out.starts_with("src/b.rs\n4:..."), "{out}");
+        assert!(out.contains("whole line: sed -n '4p' src/b.rs]"), "{out}");
+    }
+
+    #[test]
+    fn json_loses_only_its_whitespace() {
+        let mut pretty = String::from("{\n  \"items\": [\n");
+        for i in 0..200 {
+            pretty.push_str(&format!(
+                "    {{\n      \"id\": {i},\n      \"price\": 1.50e3,\n      \"name\": \"item  number {i}\",\n      \"note\": \"tab\\t and \\\"quote\\\" and \\u00e9\"\n    }},\n"
+            ));
+        }
+        pretty.push_str("    null\n  ]\n}\n");
+        let out = minify_json(&pretty).unwrap();
+        assert!(out.starts_with("{\"items\":[{\"id\":0,\"price\":1.50e3,\"name\":\"item  number 0\",\"note\":\"tab\\t and \\\"quote\\\" and \\u00e9\"},"), "{out}");
+        assert!(!out.contains('\n'));
+        let reparsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(reparsed, serde_json::from_str::<serde_json::Value>(&pretty).unwrap());
+        // NDJSON, broken JSON, scalars and plain text are refused.
+        let ndjson = "{\"a\": 1}\n{\"a\": 2}\n".repeat(200);
+        assert_eq!(minify_json(&ndjson), None);
+        assert_eq!(minify_json(&pretty[..pretty.len() - 3]), None);
+        assert_eq!(minify_json("\"just a string\""), None);
+        assert_eq!(minify_json(&"not json at all\n".repeat(200)), None);
+        // Already compact: nothing to gain.
+        assert_eq!(minify_json(&out), None);
+    }
+
+    #[test]
+    fn rtk_marks_are_recognised() {
+        for text in [
+            "lines here\n[+3 hidden: rtk recall f1d40b752001]\n",
+            "[rtk: condensed 120 lines]",
+            "... 40 lines omitted by rtk-proxy ...",
+            "[full output: ~/.rtk/tee/1.log]",
+            "see the full output in recall file]",
+            "[full diff: rtk git diff --no-compact]",
+        ] {
+            assert!(condensed_upstream(text), "{text}");
+        }
+        for text in ["rtk recall abc", "the rtk crate", "full output follows", "[rtk]"] {
+            assert!(!condensed_upstream(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn inert_cleaning_changes_only_what_a_terminal_would_not_show() {
+        assert_eq!(inert("plain text\nmore\n"), None);
+        assert_eq!(
+            inert("\u{1b}[32mok\u{1b}[0m  \nprogress 10%\rprogress 100%\n"),
+            Some("ok\nprogress 100%\n".to_string())
+        );
+        let repeated = "retrying the connection to the database\n".repeat(5);
+        assert_eq!(
+            inert(&repeated),
+            Some("retrying the connection to the database\nlge: the line above repeats 4 more times\n".to_string())
+        );
+        // The terminal part only: repeats and trailing blanks stay.
+        assert_eq!(terminal_only(&repeated), None);
+        assert_eq!(
+            terminal_only("\u{1b}[1mbold\u{1b}[0m  \n"),
+            Some("bold  \n".to_string())
+        );
+        assert_eq!(terminal_only("50%\r100%\n"), Some("100%\n".to_string()));
+    }
+
+    #[test]
+    fn a_numbered_read_keeps_its_numbers_and_real_line_numbers_in_markers() {
+        let (text, symbols) = python_file();
+        let numbered: String = text
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("{:>6}\t{l}\n", i + 1))
+            .collect();
+        let out = skeleton(
+            "svc/orders.py",
+            &numbered,
+            1,
+            &symbols,
+            &|s| s.name == "cancel_order",
+            true,
+        )
+        .unwrap();
+        assert!(out.contains("     3\tdef create_order(order_id):\n     4\t    \"\"\"Docs of create_order.\"\"\"\n      \t    # lge: 31 lines of function `create_order` left out; read them with: sed -n '5,35p' svc/orders.py\n"), "{out}");
+        // A read from further down keeps the numbers it had.
+        let tail: String = numbered.lines().skip(40).map(|l| format!("{l}\n")).collect();
+        let out = skeleton("svc/orders.py", &tail, 41, &symbols, &|_| false, true).unwrap();
+        assert!(
+            out.contains("lines of function `refund_order` left out; read them with: sed -n '"),
+            "{out}"
+        );
+        assert!(out.lines().nth(1).unwrap().starts_with("    41\t"), "{out}");
+        // Numbers that do not match the range, or lines without them: nothing.
+        assert_eq!(skeleton("svc/orders.py", &tail, 1, &symbols, &|_| false, true), None);
+        assert_eq!(skeleton("svc/orders.py", &text, 1, &symbols, &|_| false, true), None);
     }
 }

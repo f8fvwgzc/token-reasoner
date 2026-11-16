@@ -1,8 +1,10 @@
 //! cargo: compiler and clippy diagnostics (`error[E0308]: ...` with a ` --> file:line:col`
 //! location) and test results (`---- name stdout ----` blocks, the `failures:` list and
 //! `test result:` lines). `cargo test` prints both, so they are one parser.
+//! `cargo nextest run` prints the same diagnostics, then one status line per test and
+//! the captured output of each failing one.
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, count_of, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 use regex::Regex;
@@ -52,6 +54,38 @@ pattern!(THREAD_ID, r"^(thread '.*') \(\d+\) panicked");
 pattern!(EMPTY_GUTTER, r"^\s*\|\s*$");
 // A doc test is named after its file and line: `src/lib.rs - add_one (line 6)`.
 pattern!(DOCTEST, r"^(\S+) - .*\(line (\d+)\)$");
+
+// The lines a cargo run closes with: a test binary's result, the build's `Finished`,
+// nextest's `Summary`.
+pattern!(CLOSING, r"^(?:test result: |\s*Finished |\s*Summary \[)");
+// What cargo prints after a failed test run, down to the list of targets to rerun
+// (`` `--lib` `` in a single package, `` `-p shop --lib` `` in a workspace).
+pattern!(
+    EPILOGUE,
+    r"^(?:error: (?:test|doctest) failed, to rerun pass|error: \d+ targets? failed:|\s+`-)"
+);
+
+// nextest: `        FAIL [   0.005s] shop cart::tests::totals_items`, with a
+// `(1/3)` counter in newer versions.
+pattern!(
+    NEXTEST_FAIL,
+    r"^\s*(?:FAIL|SIGSEGV|SIGABRT|SIGBUS|SIGILL|TIMEOUT|LEAK|LEAK-FAIL) \[\s*[\d.]+s\]\s+(?:\(\s*\d+/\d+\)\s+)?(\S+) (\S+)\s*$"
+);
+pattern!(
+    NEXTEST_STATUS,
+    r"^\s*(?:PASS|FAIL|SIGSEGV|SIGABRT|SIGBUS|SIGILL|TIMEOUT|LEAK|LEAK-FAIL|FLAKY|SLOW|SKIP|TRY \d+ \w+|RETRY|START|DELAY) \[\s*[\d.]+s\]"
+);
+pattern!(NEXTEST_PASS, r"^\s*PASS \[\s*[\d.]+s\]");
+pattern!(
+    NEXTEST_SUMMARY,
+    r"^\s*Summary \[\s*[\d.]+s\] (\d+ tests? run: \d+ passed.*?)\s*$"
+);
+// `--- STDOUT:              shop cart::tests::totals_items ---`, `──── STDERR: shop a::b`
+pattern!(
+    NEXTEST_OUTPUT,
+    r"^\s*(?:-{3,}|─{2,}) ?(?:STDOUT|STDERR|OUTPUT):\s+(\S+) (\S+)(?:\s+[-─]+)?\s*$"
+);
+pattern!(NEXTEST_RULE, r"^\s*-{12,}\s*$");
 
 /// One test binary's run, from `running N tests` to `test result:`.
 #[derive(Default)]
@@ -130,6 +164,9 @@ impl<'a> TestRun<'a> {
 pub(crate) fn parse(text: &str) -> Parsed {
     let lines: Vec<&str> = text.lines().collect();
     let mut parsed = Parsed::default();
+    // nextest's lines, and the output it captured, are read apart from the rest: a
+    // captured `test result:` line is a test's output, not a binary of this run.
+    let nextest = nextest(&lines);
     let mut run: Option<TestRun> = None;
     let (mut passed, mut failed, mut ignored, mut results) = (0usize, 0usize, 0usize, 0usize);
     let caused_by = caused_by(&lines);
@@ -141,6 +178,9 @@ pub(crate) fn parse(text: &str) -> Parsed {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
+        if nextest.as_ref().is_some_and(|n| n.consumed[i - 1]) {
+            continue;
+        }
 
         // Before the list of names, the failures section is captured output only.
         if let Some(r) = run.as_mut().filter(|r| r.list_at.is_some_and(|at| i <= at)) {
@@ -268,7 +308,129 @@ pub(crate) fn parse(text: &str) -> Parsed {
     } else if !parsed.warnings.is_empty() {
         parsed.summary = Some(format!("{} warnings", parsed.warnings.len()));
     }
+    parsed.suites = results;
+    if let Some(n) = nextest {
+        n.apply(&mut parsed);
+    }
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&CLOSING], &[&EPILOGUE]);
     parsed
+}
+
+/// What a nextest run printed: one status line per test, the output it captured for
+/// each failing test, and a `Summary` line.
+struct Nextest<'a> {
+    /// Lines read here, which the rest of the parser must not read again.
+    consumed: Vec<bool>,
+    /// Failing tests as `binary test`, in the order they finished, with their output.
+    failed: Vec<(String, Vec<&'a str>)>,
+    passed: usize,
+    summary: Option<&'a str>,
+}
+
+/// Reads nextest's lines, or `None` when the output has none.
+fn nextest<'a>(lines: &[&'a str]) -> Option<Nextest<'a>> {
+    if !lines
+        .iter()
+        .any(|l| NEXTEST_STATUS.is_match(l) || NEXTEST_SUMMARY.is_match(l))
+    {
+        return None;
+    }
+    let mut n = Nextest {
+        consumed: vec![false; lines.len()],
+        failed: Vec::new(),
+        passed: 0,
+        summary: None,
+    };
+    let mut outputs: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(c) = NEXTEST_SUMMARY.captures(line) {
+            n.consumed[i] = true;
+            n.summary = c.get(1).map(|m| m.as_str());
+        } else if let Some(c) = NEXTEST_OUTPUT.captures(line) {
+            n.consumed[i] = true;
+            let name = format!("{} {}", &c[1], &c[2]);
+            let start = i + 1;
+            let mut end = start;
+            while end < lines.len()
+                && !NEXTEST_OUTPUT.is_match(lines[end])
+                && !NEXTEST_STATUS.is_match(lines[end])
+                && !NEXTEST_SUMMARY.is_match(lines[end])
+                && !NEXTEST_RULE.is_match(lines[end])
+            {
+                n.consumed[end] = true;
+                end += 1;
+            }
+            match outputs.iter_mut().find(|(o, _)| *o == name) {
+                Some((_, block)) => block.extend_from_slice(&lines[start..end]),
+                None => outputs.push((name, lines[start..end].to_vec())),
+            }
+            i = end;
+            continue;
+        } else if NEXTEST_STATUS.is_match(line) {
+            n.consumed[i] = true;
+            // After the summary, nextest lists the failing tests again.
+            if n.summary.is_none() {
+                if let Some(c) = NEXTEST_FAIL.captures(line) {
+                    let name = format!("{} {}", &c[1], &c[2]);
+                    if !n.failed.iter().any(|(f, _)| *f == name) {
+                        n.failed.push((name, Vec::new()));
+                    }
+                } else if NEXTEST_PASS.is_match(line) {
+                    n.passed += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    for (name, block) in &mut n.failed {
+        if let Some((_, out)) = outputs.iter().find(|(o, _)| o == name) {
+            block.clone_from(out);
+        }
+    }
+    Some(n)
+}
+
+impl Nextest<'_> {
+    fn apply(self, parsed: &mut Parsed) {
+        let found = !self.failed.is_empty();
+        for (name, block) in &self.failed {
+            // The libtest harness lines nextest captured say only that the test failed.
+            let test = name.split_once(' ').map_or("", |(_, t)| t);
+            let block: Vec<&str> = block
+                .iter()
+                .copied()
+                .filter(|l| {
+                    !RUNNING.is_match(l)
+                        && !TEST_LINE.is_match(l)
+                        && !RESULT.is_match(l)
+                        && l.trim() != "failures:"
+                        && l.trim() != test
+                })
+                .collect();
+            parsed.failures.push(test_failure(name, &block));
+        }
+        if found {
+            // cargo's closing words for the failures listed above.
+            parsed
+                .failures
+                .retain(|f| !(f.name == "error" && f.message == "test run failed" && f.file.is_empty()));
+            parsed.partial = false;
+        }
+        parsed.recognised = true;
+        let failed = self.failed.len();
+        match self.summary {
+            Some(summary) => {
+                parsed.reported = Some(count_of(summary, "failed"));
+                parsed.summary = Some(summary.to_string());
+            }
+            None if failed + self.passed > 0 => {
+                parsed.summary = Some(format!("{} passed, {failed} failed", self.passed));
+            }
+            None => {}
+        }
+    }
 }
 
 /// Builds the failure for one diagnostic. The first value says whether the block looks

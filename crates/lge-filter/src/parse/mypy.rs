@@ -4,7 +4,7 @@
 //! The line shape is shared by many compilers (`file:line:col: error: message`), so
 //! this parser also serves them when the tool is unknown.
 
-use super::{number, pattern, Parsed};
+use super::{closing_state, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -15,6 +15,10 @@ pattern!(
 pattern!(CODE, r"^(.*?)\s+\[([a-z][a-z0-9-]*)\]$");
 pattern!(FOUND, r"^Found (\d+) errors? in \d+ files? \(.*\)$");
 pattern!(SUCCESS, r"^Success: (no issues found in \d+ source files?)$");
+pattern!(
+    CLOSING,
+    r"^(?:Found \d+ errors? in \d+ files?|Success: no issues found)"
+);
 
 /// An error being read: its message can wrap over several lines with `--pretty`.
 struct Open {
@@ -96,6 +100,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
         }
     }
     parsed.recognised |= !parsed.failures.is_empty() || !parsed.warnings.is_empty();
+    (parsed.closed, parsed.trailing) = closing_state(text, &[&CLOSING], &[]);
     parsed
 }
 

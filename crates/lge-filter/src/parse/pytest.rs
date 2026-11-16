@@ -6,7 +6,7 @@
 //! line and the excerpt. Either can be missing (`-rN`, `--tb=no`, a run cut short), so
 //! each is used alone when the other is absent.
 
-use super::{count_of, number, pattern, Parsed};
+use super::{closing_state, count_of, number, pattern, Parsed};
 use crate::format::{clip_lines, failure};
 use crate::Failure;
 
@@ -31,6 +31,17 @@ pattern!(ADDRESS, r" at 0x[0-9a-fA-F]+>");
 pattern!(
     EXCEPTION_LINE,
     r"^(?:assert\b|[\w.]*(?:Error|Exception|Warning|Exit|Interrupt|Failed)\b)"
+);
+
+// The closing tally, with or without the `=` rule around it. A number comes before the
+// word, so `== warnings summary ==` is not taken for it.
+pattern!(
+    CLOSE_RULED,
+    r"^=+ (?:.*\b\d+ (?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b|no tests ran\b).*=+\s*$"
+);
+pattern!(
+    CLOSE_QUIET,
+    r"^(?:\d+ (?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b.*|no tests ran) in [\d.]+s"
 );
 
 const INTERNAL: &str = "INTERNALERROR>";
@@ -192,6 +203,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
     }
 
     let reported = tally.map(|t| count_of(t, "failed") + count_of(t, "error") + count_of(t, "errors"));
+    let (closed, trailing) = closing_state(text, &[&CLOSE_RULED, &CLOSE_QUIET], &[]);
     Parsed {
         recognised: session || tally.is_some() || !blocks.is_empty() || !entries.is_empty() || !failures.is_empty(),
         partial: false,
@@ -199,6 +211,9 @@ pub(crate) fn parse(text: &str) -> Parsed {
         reported,
         failures,
         warnings: Vec::new(),
+        closed,
+        trailing,
+        ..Parsed::default()
     }
 }
 

@@ -730,6 +730,22 @@ pub struct UsageRecord {
     pub recommended_level: String,
     /// Which levers were on, for comparison: `baseline`, `pack`, `pack+mcp`, ...
     pub mode: String,
+    /// What each proxy rule did in the session, as JSON (`by_rule`, `cohorts`,
+    /// `condensed_upstream`). Counts only. Empty for other runners.
+    #[serde(default)]
+    pub rule_stats: String,
+    /// The proxy's cache monitor for the session, as JSON (cache breaks, cold
+    /// restarts, raw retries, requests). Counts only. Empty for other runners.
+    #[serde(default)]
+    pub monitor: String,
+    /// Tokens the proxy kept out of the requests it sent, summed over every
+    /// request: each request counts every replaced item present in it.
+    #[serde(default)]
+    pub removed_tokens_sent: i64,
+    /// Tokens the proxy added to the requests it sent (its context packs),
+    /// summed the same way.
+    #[serde(default)]
+    pub added_tokens_sent: i64,
 }
 
 /// Short note written at the end of a task, read at the start of the next.

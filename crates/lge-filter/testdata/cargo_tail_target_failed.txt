@@ -1,0 +1,100 @@
+test api_checkout_flow_case_10 ... ok
+test api_checkout_flow_case_11 ... ok
+test api_checkout_flow_case_1 ... ok
+test api_checkout_flow_case_14 ... ok
+test api_checkout_flow_case_13 ... ok
+test api_checkout_flow_case_15 ... ok
+test api_checkout_flow_case_16 ... ok
+test api_checkout_flow_case_18 ... ok
+test api_checkout_flow_case_17 ... ok
+test api_checkout_flow_case_19 ... ok
+test api_checkout_flow_case_2 ... ok
+test api_checkout_flow_case_20 ... ok
+test api_checkout_flow_case_21 ... ok
+test api_checkout_flow_case_22 ... ok
+test api_checkout_flow_case_23 ... ok
+test api_checkout_flow_case_24 ... ok
+test api_checkout_flow_case_25 ... ok
+test api_checkout_flow_case_26 ... ok
+test api_checkout_flow_case_27 ... ok
+test api_checkout_flow_case_28 ... ok
+test api_checkout_flow_case_29 ... ok
+test api_checkout_flow_case_3 ... ok
+test api_checkout_flow_case_30 ... ok
+test api_checkout_flow_case_31 ... ok
+test api_checkout_flow_case_32 ... ok
+test api_checkout_flow_case_33 ... ok
+test api_checkout_flow_case_34 ... ok
+test api_checkout_flow_case_35 ... ok
+test api_checkout_flow_case_36 ... ok
+test api_checkout_flow_case_37 ... ok
+test api_checkout_flow_case_38 ... ok
+test api_checkout_flow_case_39 ... ok
+test api_checkout_flow_case_4 ... ok
+test api_checkout_flow_case_40 ... ok
+test api_checkout_flow_case_41 ... ok
+test api_checkout_flow_case_42 ... ok
+test api_checkout_flow_case_43 ... ok
+test api_checkout_flow_case_44 ... ok
+test api_checkout_flow_case_45 ... ok
+test api_checkout_flow_case_46 ... ok
+test api_checkout_flow_case_47 ... ok
+test api_checkout_flow_case_48 ... ok
+test api_checkout_flow_case_49 ... ok
+test api_checkout_flow_case_5 ... ok
+test api_checkout_flow_case_50 ... ok
+test api_checkout_flow_case_51 ... ok
+test api_checkout_flow_case_52 ... ok
+test api_checkout_flow_case_53 ... ok
+test api_checkout_flow_case_54 ... ok
+test api_checkout_flow_case_55 ... ok
+test api_checkout_flow_case_56 ... ok
+test api_checkout_flow_case_57 ... ok
+test api_checkout_flow_case_58 ... ok
+test api_checkout_flow_case_59 ... ok
+test api_checkout_flow_case_6 ... ok
+test api_checkout_flow_case_60 ... ok
+test api_checkout_flow_case_61 ... ok
+test api_checkout_flow_case_62 ... ok
+test api_checkout_flow_case_63 ... ok
+test api_checkout_flow_case_64 ... ok
+test api_checkout_flow_case_65 ... ok
+test api_checkout_flow_case_66 ... ok
+test api_checkout_flow_case_67 ... ok
+test api_checkout_flow_case_68 ... ok
+test api_checkout_flow_case_69 ... ok
+test api_checkout_flow_case_7 ... ok
+test api_checkout_flow_case_70 ... ok
+test api_checkout_flow_case_71 ... ok
+test api_checkout_flow_case_72 ... ok
+test api_checkout_flow_case_73 ... ok
+test api_checkout_flow_case_74 ... ok
+test api_checkout_flow_case_75 ... ok
+test api_checkout_flow_case_76 ... ok
+test api_checkout_flow_case_77 ... ok
+test api_checkout_flow_case_78 ... ok
+test api_checkout_flow_case_79 ... ok
+test api_checkout_flow_case_8 ... ok
+test api_checkout_flow_case_80 ... ok
+test api_checkout_flow_case_81 ... ok
+test api_checkout_flow_case_82 ... ok
+test api_checkout_flow_case_83 ... ok
+test api_checkout_flow_case_84 ... ok
+test api_checkout_flow_case_85 ... ok
+test api_checkout_flow_case_86 ... ok
+test api_checkout_flow_case_87 ... ok
+test api_checkout_flow_case_88 ... ok
+test api_checkout_flow_case_89 ... ok
+test api_checkout_flow_case_9 ... ok
+test api_checkout_flow_case_90 ... ok
+
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests shop
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `--lib`

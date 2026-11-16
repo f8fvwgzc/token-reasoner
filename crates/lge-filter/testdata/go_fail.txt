@@ -1,0 +1,37 @@
+# example.com/shop/broken
+broken/broken.go:4:9: undefined: undefinedThing
+broken/broken.go:8:14: cannot use "s" (untyped string constant) as int value in variable declaration
+broken/broken.go:9:9: cannot use x (variable of type int) as string value in return statement
+FAIL	example.com/shop/broken [build failed]
+--- FAIL: TestTotal (0.00s)
+    cart_test.go:7: Total() = 3.01, want 3
+--- FAIL: TestEmpty (0.00s)
+    cart_test.go:13: Total(nil) = 0.01, want 0
+        second line of the message
+--- FAIL: TestTable (0.00s)
+    --- FAIL: TestTable/one (0.00s)
+        cart_test.go:26: got 1.01, want 1
+FAIL
+FAIL	example.com/shop/cart	0.356s
+?   	example.com/shop/notests	[no test files]
+--- FAIL: TestPanics (0.00s)
+panic: runtime error: index out of range [5] with length 3 [recovered, repanicked]
+
+goroutine 35 [running]:
+testing.tRunner.func1.2({0x102f10280, 0x6261911a2018})
+	/usr/local/go/src/testing/testing.go:2125 +0x1a0
+testing.tRunner.func1()
+	/usr/local/go/src/testing/testing.go:2128 +0x2c8
+panic({0x102f10280?, 0x6261911a2018?})
+	/usr/local/go/src/runtime/panic.go:859 +0x120
+example.com/shop/pricing.Discount(...)
+	/home/dev/shop/pricing/pricing.go:3
+example.com/shop/pricing.TestPanics(0x6261911d8488?)
+	/home/dev/shop/pricing/pricing_test.go:8 +0x20
+testing.tRunner(0x6261911d8488, 0x102f1b718)
+	/usr/local/go/src/testing/testing.go:2195 +0xc4
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go/src/testing/testing.go:2260 +0x3b8
+FAIL	example.com/shop/pricing	1.010s
+ok  	example.com/shop/util	0.687s
+FAIL

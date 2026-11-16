@@ -17,6 +17,12 @@ pub trait DaemonApi {
     fn add_repo(&self, path: &Path) -> Result<String>;
     /// `DELETE /lge/api/repos`: drop a folder from the daemon's list.
     fn remove_repo(&self, root: &str) -> Result<()>;
+    /// `GET /lge/api/sessions/<thread>/requests`: the daemon's in-memory
+    /// trace of one conversation, one record per model request. A daemon
+    /// that keeps no traces answers with an error.
+    fn requests(&self, thread: &str) -> Result<Value> {
+        bail!("this daemon keeps no request traces (asked for {thread})")
+    }
 }
 
 /// The daemon at a local `http://` address.
@@ -102,5 +108,12 @@ impl DaemonApi for HttpDaemon {
         // The path goes in the body: nothing to escape in a query string.
         self.call("DELETE", "/lge/api/repos", Some(&json!({ "path": root })))
             .map(|_| ())
+    }
+
+    fn requests(&self, thread: &str) -> Result<Value> {
+        if !super::trace::safe_thread_id(thread) {
+            bail!("the thread id `{thread}` cannot go in a URL as it is");
+        }
+        self.call("GET", &format!("/lge/api/sessions/{thread}/requests"), None)
     }
 }

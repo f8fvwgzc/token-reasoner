@@ -1,0 +1,3 @@
+/usr/bin/ld: /tmp/ccQx3b2a.o: in function `main':
+link.c:(.text+0xe): undefined reference to `missing_function'
+collect2: error: ld returned 1 exit status
