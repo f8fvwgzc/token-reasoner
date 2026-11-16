@@ -4,7 +4,9 @@
 //! `rg` and `grep` read every file that `.gitignore` does not exclude, so one
 //! forgotten `artifacts/` folder can fill an agent's search output (and its
 //! tokens) with junk. [`bulky_dirs`] finds such folders, up to two levels below
-//! the root, so the user can add one line to `.gitignore`.
+//! the root, so the user can add one line to the file [`ignore_file`] names:
+//! `.gitignore` inside a git repository, `.ignore` outside one, where `rg`
+//! does not read `.gitignore` at all.
 
 use crate::{is_dependency_or_generated, is_generated, lang_of, SKIP_DIRS};
 use std::collections::BTreeMap;
@@ -78,6 +80,19 @@ impl BulkyDir {
         }
         line.push('/');
         line
+    }
+}
+
+/// The file under `root` where an ignore line hides a folder from searches.
+/// `rg` reads `.gitignore` only inside a git repository (the root or a folder
+/// above it has `.git`, a folder or a worktree's file). Outside one it reads
+/// `.ignore` but not `.gitignore`, so a line there would quiet lge's warning
+/// and still leave the folder in every search. lge reads both.
+pub fn ignore_file(root: &Path) -> &'static str {
+    if root.ancestors().any(|dir| dir.join(".git").exists()) {
+        ".gitignore"
+    } else {
+        ".ignore"
     }
 }
 
@@ -560,5 +575,22 @@ mod tests {
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(200_000), "200,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn the_ignore_file_is_the_one_rg_reads_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("several repos");
+        fs::create_dir_all(root.join("api")).unwrap();
+        // Not a git repository: rg ignores .gitignore here.
+        assert_eq!(ignore_file(&root), ".ignore");
+        // A repository, or a folder inside one (a worktree has a .git file).
+        fs::create_dir_all(root.join("api/.git")).unwrap();
+        assert_eq!(ignore_file(&root.join("api")), ".gitignore");
+        fs::create_dir_all(root.join("api/web")).unwrap();
+        assert_eq!(ignore_file(&root.join("api/web")), ".gitignore");
+        fs::create_dir_all(root.join("wt")).unwrap();
+        fs::write(root.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(ignore_file(&root.join("wt")), ".gitignore");
     }
 }

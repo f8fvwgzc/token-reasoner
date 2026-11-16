@@ -7,6 +7,9 @@
   note when the typed one was deleted or moved. Before, it showed an empty list.
 - A folder added to lge and later deleted or moved shows as `missing` with a hint to
   remove it, instead of `ready` with its old counts.
+- The warning about folders that searches would read names `.ignore` instead of
+  `.gitignore` when the folder is not a git repository: `rg` does not read `.gitignore`
+  there, so the old advice quieted the warning without changing any search.
 
 ## v0.0.2 (2026-11-16)
 

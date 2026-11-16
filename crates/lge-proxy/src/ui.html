@@ -156,7 +156,7 @@ const size = b => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; b = b ||
 const bulky = r => {
   const list = r.bulky || [];
   if (!list.length) return '';
-  const rows = list.slice(0, 5).map(d => `<div class="warn">Searches would read <span class="mono">${esc(d.path)}/</span> (${size(d.bytes)}, ${n(d.files)} files): ${esc(d.reason)}. Add <span class="mono">${esc(d.ignore_line)}</span> to <span class="mono">${esc(r.root)}/.gitignore</span></div>`);
+  const rows = list.slice(0, 5).map(d => `<div class="warn">Searches would read <span class="mono">${esc(d.path)}/</span> (${size(d.bytes)}, ${n(d.files)} files): ${esc(d.reason)}. Add <span class="mono">${esc(d.ignore_line)}</span> to <span class="mono">${esc(d.ignore_file || (r.root + '/.gitignore'))}</span></div>`);
   if (list.length > 5) rows.push(`<div class="warn">and ${list.length - 5} more such folders</div>`);
   return rows.join('');
 };

@@ -257,8 +257,11 @@ tokens not sent over every request net of lge's own packs. Below that:
 Under each folder the page also warns about folders that searches would wade through:
 build output, dependencies, logs or archives that `.gitignore` does not exclude (such as
 `artifacts/` or `dist/`, or anything over 50 MB or 5,000 files without source in it),
-with their size and the exact line to add to `.gitignore`. `lge index` prints the same
-warning.
+with their size and the exact line to add, and to which file: `.gitignore` inside a git
+repository, `.ignore` in a folder that is not one (such as a folder holding several
+repositories), because `rg` reads `.gitignore` only inside a git repository. Nothing is
+wrong when the warning shows: it only points at search output that could be smaller, and
+a folder you need searched should stay as it is. `lge index` prints the same warning.
 
 Every model request also leaves one line in `~/.lge/serve.log`, without any content:
 

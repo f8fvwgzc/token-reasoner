@@ -522,7 +522,7 @@ fn main() -> Result<()> {
                     d.files,
                     d.reason,
                     d.ignore_line(),
-                    root.join(".gitignore").display()
+                    root.join(lge_index::ignore_file(&root)).display()
                 );
             }
             match lge_memory::ingest_repo_history(&store, &root, lge_retrieve::unix_now()) {

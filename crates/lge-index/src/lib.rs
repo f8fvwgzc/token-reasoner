@@ -15,7 +15,7 @@ pub mod git;
 mod python;
 mod typescript;
 
-pub use bulky::{bulky_dirs, bulky_dirs_with, BulkyDir, BulkyLimits, BULKY_NAMES};
+pub use bulky::{bulky_dirs, bulky_dirs_with, ignore_file, BulkyDir, BulkyLimits, BULKY_NAMES};
 pub use generic::parse_generic;
 pub use python::parse_python;
 pub use typescript::parse_typescript;

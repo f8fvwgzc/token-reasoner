@@ -1852,7 +1852,10 @@ impl Daemon {
         let stat = |k: &str| stats.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(0);
         let bulky: Vec<Value> = lock(&repo.bulky)
             .iter()
-            .map(|d| json!({ "path": d.path, "bytes": d.bytes, "files": d.files, "reason": d.reason, "ignore_line": d.ignore_line() }))
+            .map(|d| {
+                let file = repo.root.join(lge_index::ignore_file(&repo.root));
+                json!({ "path": d.path, "bytes": d.bytes, "files": d.files, "reason": d.reason, "ignore_line": d.ignore_line(), "ignore_file": file.to_string_lossy() })
+            })
             .collect();
         json!({
             "root": repo.root.to_string_lossy(),

@@ -682,6 +682,11 @@ fn bulky_folders_are_reported_with_the_line_that_hides_them() {
     assert_eq!(bulky.len(), 1, "the ignored `logs/` is not reported: {status}");
     assert_eq!(bulky[0]["path"], "artifacts");
     assert_eq!(bulky[0]["ignore_line"], "/artifacts/");
+    // The fixture is not a git repository, where rg reads `.ignore` but not `.gitignore`.
+    assert!(
+        bulky[0]["ignore_file"].as_str().unwrap().ends_with("/.ignore"),
+        "{status}"
+    );
     assert_eq!(
         (bulky[0]["files"].as_u64(), bulky[0]["bytes"].as_u64()),
         (Some(1), Some(4096))
