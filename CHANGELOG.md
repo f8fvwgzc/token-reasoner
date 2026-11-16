@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The page's folder picker starts at the home folder when nothing is typed (and no
+  workspace limit is set), accepts `~/`, and shows the nearest existing folder with a
+  note when the typed one was deleted or moved. Before, it showed an empty list.
+- A folder added to lge and later deleted or moved shows as `missing` with a hint to
+  remove it, instead of `ready` with its old counts.
+
 ## v0.0.2 (2026-11-16)
 
 lge still never changes the model, the reasoning level, the system prompt, tool

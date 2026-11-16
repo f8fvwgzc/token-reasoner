@@ -1838,6 +1838,13 @@ impl Daemon {
     fn repo_json(&self, repo: &Repo) -> Value {
         let state = lock(&repo.state);
         let (word, detail, stats) = match &*state {
+            // Deleted or moved since it was added: its graph is stale, and no
+            // request can come from it any more.
+            _ if !repo.root.is_dir() => (
+                "missing",
+                "The folder no longer exists (deleted or moved). Remove it from the list.".to_string(),
+                Vec::new(),
+            ),
             RepoState::Indexing => ("indexing", String::new(), Vec::new()),
             RepoState::Failed(e) => ("failed", e.clone(), Vec::new()),
             RepoState::Ready(server) => ("ready", String::new(), server.store().stats().unwrap_or_default()),
@@ -2058,30 +2065,8 @@ impl Daemon {
 
     /// Folders under `path`, for the folder picker.
     fn browse(&self, path: Option<String>) -> Value {
-        let Some(path) = path.filter(|p| !p.is_empty()).map(PathBuf::from) else {
-            let roots: Vec<Value> = self.cfg.workspaces.iter().map(|w| json!({ "name": w.to_string_lossy(), "path": w.to_string_lossy(), "git": w.join(".git").exists() })).collect();
-            return json!({ "path": "", "folders": roots });
-        };
-        if !self.allowed(&path) {
-            return json!({ "path": path.to_string_lossy(), "folders": [], "error": "outside the folders this daemon may index" });
-        }
-        let mut folders: Vec<(String, PathBuf)> = std::fs::read_dir(&path)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
-                    .filter(|(name, _)| !name.starts_with('.') && name != "node_modules" && name != "target")
-                    .collect()
-            })
-            .unwrap_or_default();
-        folders.sort();
-        let folders: Vec<Value> = folders
-            .into_iter()
-            .take(500)
-            .map(|(name, p)| json!({ "name": name, "path": p.to_string_lossy(), "git": p.join(".git").exists() }))
-            .collect();
-        json!({ "path": path.to_string_lossy(), "parent": path.parent().filter(|p| self.allowed(p)).map(|p| p.to_string_lossy().to_string()), "folders": folders })
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        browse_listing(path.as_deref(), &self.cfg.workspaces, home.as_deref())
     }
 
     /// Token counts of sessions the agent recorded itself, as the baseline.
@@ -2290,8 +2275,117 @@ pub fn run(daemon: Arc<Daemon>, server: tiny_http::Server) {
     }
 }
 
+/// The folders the page's picker shows for `path`. With no path it starts at
+/// the workspaces, or at `home` when any folder may be indexed. A path that no
+/// longer exists (a folder deleted or renamed) shows the nearest folder above
+/// it that does, with a note, instead of an empty list.
+fn browse_listing(path: Option<&str>, workspaces: &[PathBuf], home: Option<&Path>) -> Value {
+    let allowed = |p: &Path| workspaces.is_empty() || workspaces.iter().any(|w| p.starts_with(w));
+    let typed = path.map(str::trim).filter(|p| !p.is_empty());
+    let requested = match typed {
+        Some("~") => home.map(Path::to_path_buf),
+        Some(p) => match (p.strip_prefix("~/"), home) {
+            (Some(rest), Some(h)) => Some(h.join(rest)),
+            _ => Some(PathBuf::from(p)),
+        },
+        None if workspaces.is_empty() => home.map(Path::to_path_buf),
+        None => None,
+    };
+    let Some(requested) = requested else {
+        let roots: Vec<Value> = workspaces
+            .iter()
+            .map(
+                |w| json!({ "name": w.to_string_lossy(), "path": w.to_string_lossy(), "git": w.join(".git").exists() }),
+            )
+            .collect();
+        let error = roots.is_empty().then_some("Type the path of a folder, then Browse.");
+        return json!({ "path": "", "folders": roots, "error": error });
+    };
+    let mut dir = requested.clone();
+    while !dir.is_dir() {
+        match dir.parent() {
+            Some(up) if !up.as_os_str().is_empty() => dir = up.to_path_buf(),
+            _ => break,
+        }
+    }
+    let note = (dir != requested && dir.is_dir())
+        .then(|| format!("{} does not exist; showing {}", requested.display(), dir.display()));
+    if !dir.is_dir() {
+        return json!({ "path": requested.to_string_lossy(), "folders": [], "error": format!("{} does not exist", requested.display()) });
+    }
+    if !allowed(&dir) {
+        return json!({ "path": dir.to_string_lossy(), "folders": [], "error": "outside the folders this daemon may index" });
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return json!({ "path": dir.to_string_lossy(), "folders": [], "error": format!("{} cannot be read: {e}", dir.display()) });
+        }
+    };
+    let mut folders: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .filter(|(name, _)| !name.starts_with('.') && name != "node_modules" && name != "target")
+        .collect();
+    folders.sort();
+    let folders: Vec<Value> = folders
+        .into_iter()
+        .take(500)
+        .map(|(name, p)| json!({ "name": name, "path": p.to_string_lossy(), "git": p.join(".git").exists() }))
+        .collect();
+    json!({
+        "path": dir.to_string_lossy(),
+        "parent": dir.parent().filter(|p| allowed(p)).map(|p| p.to_string_lossy().to_string()),
+        "folders": folders,
+        "note": note,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_folder_picker_starts_at_home_and_survives_a_deleted_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(h.join("code/shop/.git")).unwrap();
+        std::fs::create_dir_all(h.join("notes")).unwrap();
+        let names = |v: &Value| -> Vec<String> {
+            v["folders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Nothing typed and no workspace limit: the home folder.
+        let start = browse_listing(None, &[], Some(&h));
+        assert_eq!(start["path"].as_str(), Some(h.to_str().unwrap()));
+        assert_eq!(names(&start), ["code", "notes"]);
+        assert_eq!(names(&browse_listing(Some("  "), &[], Some(&h))), ["code", "notes"]);
+        assert_eq!(names(&browse_listing(Some("~/code"), &[], Some(&h))), ["shop"]);
+
+        // A folder that was deleted: the nearest one above it, with a note.
+        let gone = h.join("code/old-project/src");
+        let up = browse_listing(Some(gone.to_str().unwrap()), &[], Some(&h));
+        assert_eq!(up["path"].as_str(), Some(h.join("code").to_str().unwrap()));
+        assert_eq!(names(&up), ["shop"]);
+        assert!(up["note"].as_str().unwrap().contains("does not exist"), "{up}");
+        assert_eq!(up["folders"][0]["git"], true);
+
+        // With workspaces, nothing typed lists them; outside them is refused.
+        let ws = vec![h.join("code")];
+        let roots = browse_listing(None, &ws, Some(&h));
+        assert_eq!(
+            roots["folders"][0]["path"].as_str(),
+            Some(h.join("code").to_str().unwrap())
+        );
+        assert!(browse_listing(Some(h.join("notes").to_str().unwrap()), &ws, Some(&h))["error"].is_string());
+        // No home and nothing typed: a message, not a silent empty list.
+        assert!(browse_listing(None, &[], None)["error"].is_string());
+    }
     use super::*;
 
     fn patch(v: Value) -> SettingsPatch {

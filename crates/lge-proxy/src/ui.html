@@ -290,6 +290,7 @@ async function browse(path) {
     $('folders').hidden = false;
     if (b.path) $('path').value = b.path;
     if (b.error) say(b.error, 'bad');
+    else if (b.note) say(b.note, 'warn');
   } catch (e) { say(e.message, 'bad'); }
 }
 

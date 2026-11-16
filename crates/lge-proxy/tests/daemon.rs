@@ -715,6 +715,19 @@ fn bulky_folders_are_reported_with_the_line_that_hides_them() {
         .collect();
     assert_eq!(lines, ["/artifacts/", "/dist/"], "{status}");
 
+    // A folder deleted after it was added shows as missing, not ready, and
+    // can still be removed from the list.
+    let parked = r.repo.with_file_name("shop-parked");
+    std::fs::rename(&r.repo, &parked).unwrap();
+    let gone = r.json("/lge/api/status");
+    assert_eq!(gone["repos"][0]["state"], "missing", "{gone}");
+    assert!(gone["repos"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("no longer exists"));
+    std::fs::rename(&parked, &r.repo).unwrap();
+    assert_eq!(r.json("/lge/api/status")["repos"][0]["state"], "ready");
+
     // `DELETE /lge/api/repos` with the path in a JSON body (as `lge ab` sends it).
     let response = r
         .agent
