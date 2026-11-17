@@ -12,7 +12,8 @@ Codex (desktop app or CLI)  ──►  lge on 127.0.0.1:8787  ──►  OpenAI
                                   └─ page with tokens per session
 ```
 
-- The model and the reasoning level stay exactly what you chose.
+- The model stays what you chose, and so does the reasoning level unless you switch on
+  `router_apply` (off by default), which can only lower it for small tasks.
 - Your login stays as it is. Credentials pass through and are never stored.
 - If anything goes wrong inside lge, the original request is sent unchanged.
 - Everything runs on your machine. One Rust binary, one embedded database.
@@ -22,7 +23,21 @@ and two ways of measuring a difference are built in: `lge ab` runs your own task
 off and on, and a holdout share of conversations runs with every rule measured but not
 applied.
 
-What v0.0.3 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+What v0.0.4 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+
+- **The router can lower the reasoning effort, if you ask.** `router_apply` (on the page:
+  "Lower the reasoning effort when the router recommends it") is `off` by default. With
+  `low-only`, a conversation whose task the graph bounds to one file is sent at `low`
+  effort; with `low-and-medium`, a task in one service is sent at `medium` too. The
+  effort is only ever lowered, decided once on a conversation's first request and kept
+  for all of it (a restart included), and never changed for held-out or background
+  sessions, so the holdout arm measures what it costs. If the provider refuses the
+  request, the conversation goes back to your effort. No saving or quality effect is
+  measured yet: run `lge ab` or a holdout share before relying on it.
+- **Tests that pass on Linux and as root**: the A/B preflight test accepts dash's
+  `not found`, and the read-only-folder test is skipped where root can delete it.
+
+What v0.0.3 added:
 
 - **Packs that stay small in long conversations.** Every pack is re-sent on every later
   request, so the packs in one request share one budget (`pack_conversation_budget`,
@@ -397,7 +412,7 @@ it cannot read with certainty is judged by its content or left alone.
 
 ### Why reasoning tokens drop too
 
-The model and its reasoning level do not change, but the model reasons again on every
+With `router_apply` off, the model and its reasoning level do not change, but the model reasons again on every
 turn, over everything in front of it. lge lowers that in four ways:
 
 - **Fewer turns.** Every search or file read the context replaces is one round of
@@ -563,6 +578,7 @@ each, and what was left out on purpose, is in `docs/PRIOR_ART.md`.
 | Apply the rules to tool output | `shorten_outputs` | on | The master switch of every rule below; off, new outputs get no rule, not even in shadow |
 | Rules | `rules` | `check`, `search_cap`, `repeat_pointer`, `inert`, `path_fold`, `json_minify` on; `skeleton`, `line_clip`, `noise`, `lockfile` shadow; `rerun_delta`, `read_delta` measured only | The mode of each rule: off, shadow or on |
 | Holdout | `holdout_share` | 0 | The share of new conversations (0 to 1) that run every rule in shadow, for comparison |
+| Lower the reasoning effort when the router recommends it | `router_apply` | off | `off` logs the recommendation; `low-only` sends a one-file task at `low` effort; `low-and-medium` also sends a one-service task at `medium`. Only ever lowers, decided on a conversation's first request and kept for all of it |
 | Index on first use | `auto_index` | on | A git repository is indexed the first time Codex works in it |
 | - | `context_budget` | 1,500 | Tokens of one pack (at most 600 for a question about one file) |
 | Tokens of graph context in one request | `pack_conversation_budget` | 3,000 | The packs present in one request together; a new pack is built to fit in the room left and not added with less than 300 tokens of room. After a conversation's first pack, a pack is at most 600 and only for a file nothing before it named. Packs already sent keep their bytes |
@@ -655,7 +671,7 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
 | lge-store | `GraphStore` trait and the LadybugDB adapter; the only crate that touches the database |
 | lge-retrieve | Index pipeline, seeds, traversal, ranking, evidence packs, graph views |
 | lge-memory | Long-term memory: retain, recall, pages |
-| lge-router | Reasoning-level recommendation from change impact (logged, not applied) |
+| lge-router | Reasoning-level recommendation from change impact (logged; applied only with `router_apply`) |
 | lge-session | `lge run`: one Codex session per task from its evidence pack |
 | lge-filter | Lint, type, test and build output reduced to failures and warnings |
 | lge-usage | Codex token usage parsing and reports |

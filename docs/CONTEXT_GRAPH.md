@@ -5,6 +5,10 @@ change. The saving has to come from sending and generating fewer tokens for the 
 work. This file is the contract for that; it extends `docs/ARCHITECTURE.md` and wins
 where the two disagree.
 
+Since v0.0.4 the proxy has one opt-in exception, `router_apply` (off by default): it
+can lower the reasoning effort of a conversation the graph bounds to one file (or one
+service). With it off, everything below holds as written.
+
 No figure in `docs/PLAN.md` is measured yet. `lge usage report` exists so that every
 lever below is switched on separately and judged against a baseline.
 

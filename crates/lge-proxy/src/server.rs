@@ -22,7 +22,7 @@ use crate::rules::{
 };
 use crate::session::{Graph, Ledger, Options, PrefixStats, Saved, Session};
 use anyhow::{anyhow, bail, Context, Result};
-use lge_core::{content_hash, outcome, stable_id, UsageRecord};
+use lge_core::{content_hash, outcome, stable_id, Level, UsageRecord};
 use lge_retrieve::{index_repo, unix_now, IndexOptions};
 use lge_store::{GraphStore, Store};
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,72 @@ pub struct Settings {
     /// Rule id -> the unix time from which its recovery rate is counted (set
     /// when a demotion is cleared).
     pub rule_since: BTreeMap<String, i64>,
+    /// Which of the router's recommendations lower a conversation's reasoning
+    /// effort. Off by default: the effort stays what the client asked for.
+    pub router_apply: RouterApply,
+}
+
+/// Which router recommendations are applied to the reasoning effort.
+///
+/// An applied recommendation only ever lowers the effort the client asked for,
+/// never raises it, and is decided once, on a conversation's first request, so
+/// every request of the conversation has the same effort. Held-out and
+/// background conversations are never changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouterApply {
+    /// Log the recommendation only.
+    #[default]
+    Off,
+    /// Apply `low` (a change in one file); keep the effort otherwise.
+    LowOnly,
+    /// Apply `low` and `medium` (several files in one service).
+    LowAndMedium,
+}
+
+impl RouterApply {
+    pub fn allows(self, level: Level) -> bool {
+        match self {
+            RouterApply::Off => false,
+            RouterApply::LowOnly => level == Level::Low,
+            RouterApply::LowAndMedium => level != Level::Top,
+        }
+    }
+}
+
+/// The reasoning effort a router level stands for; `None` keeps the client's.
+fn effort_of(level: Level) -> Option<&'static str> {
+    match level {
+        Level::Low => Some("low"),
+        Level::Medium => Some("medium"),
+        Level::Top => None,
+    }
+}
+
+fn effort_rank(effort: &str) -> Option<u8> {
+    match effort {
+        "none" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        _ => None,
+    }
+}
+
+/// Lower the request's `reasoning.effort` to `level`'s. Never raises it, and
+/// leaves a request alone that names no effort, or one this version does not
+/// know. Returns the effort before and after when it changed.
+pub(crate) fn lower_effort(value: &mut Value, level: Level) -> Option<(String, String)> {
+    let target = effort_of(level)?;
+    let effort = value.get_mut("reasoning")?.get_mut("effort")?;
+    let asked = effort.as_str()?.to_string();
+    if effort_rank(target)? >= effort_rank(&asked)? {
+        return None;
+    }
+    *effort = Value::String(target.to_string());
+    Some((asked, target.to_string()))
 }
 
 impl Default for Settings {
@@ -136,6 +202,7 @@ impl Default for Settings {
             holdout_share: 0.0,
             demoted: BTreeMap::new(),
             rule_since: BTreeMap::new(),
+            router_apply: RouterApply::Off,
         }
     }
 }
@@ -154,6 +221,7 @@ struct SettingsPatch {
     holdout_share: Option<f64>,
     demoted: Option<BTreeMap<String, String>>,
     rule_since: Option<BTreeMap<String, i64>>,
+    router_apply: Option<RouterApply>,
     /// Request only: lift the demotion of this rule.
     clear_demotion: Option<String>,
 }
@@ -196,7 +264,17 @@ impl TryFrom<SettingsPatch> for Settings {
         s.holdout_share = valid_share(p.holdout_share.unwrap_or(0.0));
         s.demoted = p.demoted.unwrap_or_default();
         s.rule_since = p.rule_since.unwrap_or_default();
+        s.router_apply = p.router_apply.unwrap_or_default();
         Ok(s.synced())
+    }
+}
+
+/// The router level applied to a proxy conversation's reasoning effort, or ""
+/// when the client's effort was kept.
+fn applied_level(r: &UsageRecord) -> &str {
+    match r.level.as_str() {
+        "low" | "medium" if r.mode == "proxy" => &r.level,
+        _ => "",
     }
 }
 
@@ -253,6 +331,9 @@ impl Settings {
         }
         if let Some(v) = p.holdout_share {
             self.holdout_share = valid_share(v);
+        }
+        if let Some(v) = p.router_apply {
+            self.router_apply = v;
         }
         if let Some(id) = p.clear_demotion {
             let rule = RuleId::parse(&id).ok_or_else(|| anyhow!("no rule `{id}`"))?;
@@ -584,6 +665,8 @@ struct Rewritten {
     new_changes: usize,
     /// The label of a background request of Codex, for the log line.
     background: Option<String>,
+    /// The conversation's reasoning effort was first lowered in this request.
+    effort_decided: bool,
     conv: Arc<Mutex<Conv>>,
     /// The trace of this request, completed with the response's numbers. It
     /// travels with the request: Codex may send the next request of the same
@@ -1426,7 +1509,10 @@ impl Daemon {
                 ])
             });
         let conv = self.conv_for(&key, &seen, background.as_deref());
-        let mut options = lock(&self.settings).options();
+        let (mut options, router_apply) = {
+            let settings = lock(&self.settings);
+            (settings.options(), settings.router_apply)
+        };
         let repo = seen.cwd.as_deref().and_then(|cwd| self.repo_for(Path::new(cwd)));
         let fixed_instructions = instructions_text(&value);
         let fixed_tools = tools_hash(&value);
@@ -1434,9 +1520,11 @@ impl Daemon {
         let first = seen.first_user_message.clone();
         let model = seen.model.clone();
         let seen;
-        let new_changes;
+        let mut new_changes;
         let trace;
         let label;
+        let mut effort_decided = false;
+        let mut effort_changed = false;
         {
             let mut guard = lock(&conv);
             let c = &mut *guard;
@@ -1486,15 +1574,27 @@ impl Daemon {
                                 store: server.store(),
                                 root: server.root(),
                             };
+                            // Routed once per conversation. A conversation
+                            // restored after a restart keeps its decision, so
+                            // its reasoning effort never changes mid-way.
                             if !c.routed && !first.is_empty() && c.background.is_none() {
                                 c.routed = true;
-                                if let Ok(route) =
-                                    lge_router::route(graph.store, &first, &lge_router::RouterConfig::default())
-                                {
-                                    c.record.recommended_level = route.level.as_str().to_string();
-                                    c.record.reason = route.reason;
-                                    c.record.files = route.files;
-                                    c.record.services = route.services;
+                                if c.record.recommended_level.is_empty() {
+                                    if let Ok(route) =
+                                        lge_router::route(graph.store, &first, &lge_router::RouterConfig::default())
+                                    {
+                                        c.record.recommended_level = route.level.as_str().to_string();
+                                        c.record.reason = route.reason;
+                                        c.record.files = route.files;
+                                        c.record.services = route.services;
+                                        // Applied only from a conversation's first
+                                        // request: a later start would change the
+                                        // effort in the middle of it.
+                                        if c.requests == 1 && !c.holdout && router_apply.allows(route.level) {
+                                            c.record.level = route.level.as_str().to_string();
+                                            effort_decided = true;
+                                        }
+                                    }
                                 }
                             }
                             seen = transform(&mut value, &mut c.session, Some(&graph), &options);
@@ -1509,6 +1609,28 @@ impl Daemon {
                 }
             }
             new_changes = c.session.new_changes();
+            // The router's level, once applied, holds for every request of
+            // the conversation except Codex's background ones.
+            if label.is_none() && !c.holdout {
+                if let Some(level) = Level::parse(&c.record.level) {
+                    if let Some((asked, sent)) = lower_effort(&mut value, level) {
+                        effort_changed = true;
+                        if effort_decided {
+                            new_changes += 1;
+                            eprintln!(
+                                "lge: router applied: reasoning effort {asked} -> {sent} for conversation {} ({})",
+                                key.chars().take(8).collect::<String>(),
+                                c.record.reason
+                            );
+                        }
+                    } else if effort_decided {
+                        // Nothing to lower: the client already asked for this
+                        // effort or less, or named none.
+                        c.record.level = Level::Top.as_str().to_string();
+                        effort_decided = false;
+                    }
+                }
+            }
             // The annuity: tokens kept out of, and added to, what was sent.
             if again {
                 c.record.removed_tokens_sent -= c.last_sent.0;
@@ -1560,7 +1682,7 @@ impl Daemon {
             }
         }
         // Nothing was replaced or added: send the bytes exactly as they came.
-        let changed = seen.outputs_replaced > 0 || seen.contexts_present > 0;
+        let changed = seen.outputs_replaced > 0 || seen.contexts_present > 0 || effort_changed;
         let body = if changed {
             serde_json::to_vec(&value).ok()?
         } else {
@@ -1571,6 +1693,7 @@ impl Daemon {
             changed,
             new_changes,
             background: label,
+            effort_decided,
             conv,
             trace,
         })
@@ -1805,7 +1928,18 @@ impl Daemon {
                     .read_to_end(&mut error);
                 // Codex sends a conversation's requests one at a time, so the
                 // request's new decisions are still the session's latest.
-                lock(&r.conv).session.revert_new();
+                {
+                    let mut c = lock(&r.conv);
+                    c.session.revert_new();
+                    // The provider may have refused the lowered effort: the
+                    // conversation keeps the client's effort from now on.
+                    if r.effort_decided {
+                        c.record.level = Level::Top.as_str().to_string();
+                        c.record
+                            .reason
+                            .push_str("; not applied: the provider refused the request");
+                    }
+                }
                 let again = self.rewrite_safely(plain, thread.as_deref(), &origin, true);
                 // Unchanged now: the client's own bytes and headers, as they came.
                 let (retry_headers, retry_body) = match &again {
@@ -2154,6 +2288,7 @@ impl Daemon {
                     "input_tokens": r.input_tokens, "cached_input_tokens": r.cached_input_tokens,
                     "output_tokens": r.output_tokens, "reasoning_tokens": r.reasoning_tokens,
                     "recommended_level": r.recommended_level,
+                    "applied_level": applied_level(r),
                     "outputs_shortened": s.outputs_shortened, "tokens_before": s.tokens_before, "tokens_after": s.tokens_after,
                     "contexts_added": s.contexts_added, "context_tokens": s.context_tokens,
                     "removed_tokens_sent": r.removed_tokens_sent, "added_tokens_sent": r.added_tokens_sent,
@@ -2585,6 +2720,44 @@ fn browse_listing(path: Option<&str>, workspaces: &[PathBuf], home: Option<&Path
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_effort_is_only_ever_lowered() {
+        let lowered = |asked: Value, level: Level| {
+            let mut body = json!({ "model": "m", "reasoning": { "effort": asked, "summary": "auto" } });
+            let change = lower_effort(&mut body, level);
+            (
+                change,
+                body["reasoning"]["effort"].clone(),
+                body["reasoning"]["summary"].clone(),
+            )
+        };
+        let (change, effort, summary) = lowered(json!("xhigh"), Level::Low);
+        assert_eq!(change, Some(("xhigh".to_string(), "low".to_string())));
+        assert_eq!(
+            (effort, summary),
+            (json!("low"), json!("auto")),
+            "only the effort changes"
+        );
+        assert_eq!(lowered(json!("high"), Level::Medium).1, json!("medium"));
+        // Never raised, never below what was asked, top keeps it, unknown values stay.
+        assert_eq!(lowered(json!("minimal"), Level::Low).0, None);
+        assert_eq!(lowered(json!("low"), Level::Low).0, None);
+        assert_eq!(lowered(json!("low"), Level::Medium).0, None);
+        assert_eq!(lowered(json!("high"), Level::Top).0, None);
+        assert_eq!(lowered(json!("turbo"), Level::Low).0, None);
+        assert_eq!(lowered(json!(3), Level::Low).0, None);
+        let mut none = json!({ "model": "m" });
+        assert_eq!(lower_effort(&mut none, Level::Low), None);
+        assert_eq!(none, json!({ "model": "m" }));
+    }
+
+    #[test]
+    fn router_apply_allows_by_level() {
+        assert!(!RouterApply::Off.allows(Level::Low));
+        assert!(RouterApply::LowOnly.allows(Level::Low) && !RouterApply::LowOnly.allows(Level::Medium));
+        assert!(RouterApply::LowAndMedium.allows(Level::Medium) && !RouterApply::LowAndMedium.allows(Level::Top));
+    }
 
     #[test]
     fn the_folder_picker_starts_at_home_and_survives_a_deleted_folder() {

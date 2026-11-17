@@ -1276,6 +1276,10 @@ fn a_subfolder_of_the_repository_is_where_each_session_starts() {
 #[cfg(unix)]
 #[test]
 fn a_copy_that_cannot_be_removed_is_named() {
+    if !permissions_enforced() {
+        eprintln!("skipped: this user can delete read-only folders (root?), so no copy stays behind");
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let (_dir, repo, work) = repository();
     let daemon = FakeDaemon::new();
@@ -1303,6 +1307,21 @@ fn a_copy_that_cannot_be_removed_is_named() {
     }
     assert!(said.contains("2 copy folder(s) could not be removed"), "{said}");
     assert!(said.contains("git worktree prune"), "{said}");
+}
+
+/// Whether a read-only folder stops this user from deleting what is in it
+/// (it does not for root).
+#[cfg(unix)]
+fn permissions_enforced() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("f"), "").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let enforced = std::fs::remove_file(locked.join("f")).is_err();
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+    enforced
 }
 
 // ---- base commit, prompt note, approvals ----------------------------------------
@@ -1877,7 +1896,11 @@ fn the_preflight_stops_the_run_before_any_session_and_names_each_bad_task() {
         text.contains("- missing-tool: the shell could not run the check (exit 127)"),
         "{text}"
     );
-    assert!(text.contains("command not found"), "{text}");
+    // bash and zsh say "command not found", dash (Debian's /bin/sh) "not found".
+    assert!(
+        text.contains("nosuch_tool_for_lge_ab: not found") || text.contains("command not found"),
+        "{text}"
+    );
     assert!(
         text.contains("- bad-quoting: the shell could not run the check (exit 2)"),
         "{text}"

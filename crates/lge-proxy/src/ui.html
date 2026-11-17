@@ -151,6 +151,13 @@
       <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
       <span class="row"><span>Tokens of graph context in one request at most (every pack is re-sent on every later request):</span>
         <input type="number" id="pack_conversation_budget" min="0" step="100"> <button id="pack_budget_save">Save</button></span>
+      <span class="row"><span>Lower the reasoning effort when the router recommends it:</span>
+        <select id="router_apply">
+          <option value="off">off (log the recommendation only)</option>
+          <option value="low-only">low only (a change in one file)</option>
+          <option value="low-and-medium">low and medium (one service)</option>
+        </select>
+        <span class="dim">Never raises the effort. Decided on a conversation's first request and kept for all of it. Held-out and background sessions are never changed.</span></span>
     </div>
   </section>
 </main>
@@ -213,7 +220,7 @@ function render(s) {
   const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_retired)
     ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} over budget, ${n(x.packs_retired)} retired` : '';
   $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input / request</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${packsOf(x)}</div></td>
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${packsOf(x)}</div></td>
       <td class="n">${n(x.requests)}</td><td class="n">${n(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
       <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
@@ -293,6 +300,7 @@ function render(s) {
     $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_auto').checked = s.settings.auto_index;
   }
   if (document.activeElement !== $('pack_conversation_budget')) $('pack_conversation_budget').value = s.settings.pack_conversation_budget;
+  if (document.activeElement !== $('router_apply')) $('router_apply').value = s.settings.router_apply || 'off';
 }
 
 async function refresh() { try { render(await api('status')); } catch (e) { $('sub').textContent = 'not reachable: ' + e.message; } }
@@ -351,6 +359,10 @@ $('rules').onclick = async e => {
 $('pack_budget_save').onclick = async () => {
   const v = Math.max(0, Math.round(Number($('pack_conversation_budget').value) || 0));
   try { await api('settings', 'POST', { pack_conversation_budget: v }); } catch (err) { say(err.message, 'bad'); }
+  refresh();
+};
+$('router_apply').onchange = async e => {
+  try { await api('settings', 'POST', { router_apply: e.target.value }); } catch (err) { say(err.message, 'bad'); }
   refresh();
 };
 $('holdout_save').onclick = async () => {

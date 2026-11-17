@@ -14,8 +14,36 @@ Codex desktop app / Codex CLI  ->  lge on 127.0.0.1:8787  ->  OpenAI
   what each rule did, the packs, Codex's background requests, the cache monitor, the
   fixed prefix, the holdout comparison and the folders in the graph.
 
-The model and the reasoning level are whatever the agent asked for. The proxy never
-changes them.
+The model is whatever the agent asked for. So is the reasoning level, unless
+`router_apply` is switched on (off by default; see "Lowering the reasoning effort").
+
+## Lowering the reasoning effort
+
+`router_apply` lets the router's recommendation change `reasoning.effort` in the request:
+
+| Value | What is applied |
+|---|---|
+| `off` (default) | Nothing. The recommendation is logged on the page and in the usage record |
+| `low-only` | `low` when the task's change impact stays in one file |
+| `low-and-medium` | Also `medium` when it stays in one service |
+
+- The effort is only ever lowered: a request already at the target or below it, one that
+  names no effort, or one with an effort this version does not know is left alone, and
+  the conversation is marked as not applied.
+- It is decided once, on the conversation's first request, from the router's result for
+  the first typed message, and needs the graph ready at that moment. Every later request
+  of the conversation gets the same effort, even if the setting changes or the daemon
+  restarts, so the prompt cache is never broken by it.
+- Held-out conversations and Codex's background requests (and background sessions) are
+  never changed, so the holdout arm keeps measuring the difference.
+- If the provider refuses the first request (400, 413, 422), it is sent again with the
+  client's effort, and the conversation keeps the client's effort from then on.
+- The page marks an applied session with "router: low (applied)", and `serve.log` has a
+  `router applied` line with the effort before and after. The usage record's `level` is
+  the applied level (`top` = the client's effort kept).
+
+There is no automatic retry at a higher effort: the proxy cannot tell whether a task
+succeeded. `lge run` in routed mode does retry after failed local checks.
 
 ## What it changes in a request
 
@@ -597,6 +625,7 @@ takes its default, so a file written by v0.0.1 or v0.0.2 still loads.
 | `pack_conversation_budget` | Tokens of graph context in one request | `3000` | Tokens of the packs present in one request together, each whole (frame and remembered facts included). A new pack is built to fit in the room the packs before it leave and is not added with less than 300 tokens of room, so a value under 300 adds no pack; a follow-up pack is at most 600. Packs already sent keep their bytes |
 | `auto_index` | Index a git repository the first time | `true` | A git repository inside the workspace is indexed the first time the agent works in it |
 | `holdout_share` | Holdout | `0` | The share of new conversations held out, from 0 to 1; any other value is 0 |
+| `router_apply` | Lower the reasoning effort when the router recommends it | `"off"` | `"off"`, `"low-only"` or `"low-and-medium"`; any other value is refused. See "Lowering the reasoning effort" |
 | `demoted` | The rule's status | `{}` | Rules the recovery check moved to shadow, with the reason. Written by the daemon |
 | `rule_since` | - | `{}` | Per rule, the time from which its recovery rate counts. Set by "Re-enable" |
 
