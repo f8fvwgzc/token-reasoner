@@ -15,7 +15,7 @@
 
 use crate::command::{is_read_only, normalise, patch_paths, purpose, script_edits, script_plan, Purpose, ScriptPlan};
 use crate::rules::{Mode, RuleId};
-use crate::session::{output_key, producer_of, same_path, CallView, Draft, Graph, Options, Session};
+use crate::session::{output_key, producer_of, same_path, Before, CallView, Draft, Graph, Options, Session};
 use crate::shorten::RunStatus;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -148,8 +148,10 @@ fn message_text(item: &Value) -> Option<String> {
     }
 }
 
-/// Wrappers the agent puts around context it adds as user messages.
-const INJECTED_STARTS: [&str; 8] = [
+/// Wrappers the agent puts around context it adds as user messages, lower-cased.
+/// The last is how Codex opens the summary it writes when it compacts a
+/// conversation (codex-rs/prompts/templates/compact/summary_prefix.md).
+const INJECTED_STARTS: [&str; 9] = [
     "# agents.md instructions",
     "<environment_context>",
     "<turn_aborted>",
@@ -158,6 +160,7 @@ const INJECTED_STARTS: [&str; 8] = [
     "<codex_internal_context",
     "<external_",
     "<lge_context>",
+    "another language model started to solve this problem and produced a summary",
 ];
 
 /// True when a user-role message was written by the agent, not typed by the
@@ -175,6 +178,46 @@ fn is_injected(item: &Value, text: &str) -> bool {
     let t = text.trim_start().to_ascii_lowercase();
     INJECTED_STARTS.iter().any(|m| t.starts_with(m)) || t.starts_with('<')
 }
+
+/// The text of a message the user typed, or `None` for any other item.
+fn typed_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    message_text(item).filter(|t| !is_injected(item, t))
+}
+
+/// True when `path` is named in one of `items` before a message: in a tool
+/// call's arguments, in a tool's output, or in a pack lge added.
+fn mentioned_in(items: &[Value], path: &str) -> bool {
+    let named = |text: &str| crate::session::mentions(text, path);
+    items
+        .iter()
+        .any(|item| match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "function_call" => item.get("arguments").and_then(Value::as_str).is_some_and(named),
+            "custom_tool_call" => item.get("input").and_then(Value::as_str).is_some_and(named),
+            "local_shell_call" => item.get("action").is_some_and(|a| named(&a.to_string())),
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
+                match item.get("output") {
+                    Some(Value::String(text)) => named(text),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .any(named),
+                    _ => false,
+                }
+            }
+            "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
+                message_text(item).is_some_and(|t| t.starts_with(CONTEXT_OPEN_TAG) && named(&t))
+            }
+            _ => false,
+        })
+}
+
+/// How every pack lge adds starts.
+const CONTEXT_OPEN_TAG: &str = "<lge_context>";
 
 fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let open = format!("<{name}>");
@@ -525,6 +568,21 @@ fn hash_of(parts: &[&Value]) -> u64 {
         bytes.push(b'\n');
     }
     u64::from_str_radix(&lge_core::content_hash(&bytes)[..16], 16).unwrap_or(0)
+}
+
+/// For each input item, a hash of the client's items up to and including it:
+/// the same value in two requests means the same items up to there.
+fn prefix_hashes(client: &[u64]) -> Vec<u64> {
+    let mut acc = 0u64;
+    client
+        .iter()
+        .map(|h| {
+            let mut bytes = acc.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&h.to_le_bytes());
+            acc = u64::from_str_radix(&lge_core::content_hash(&bytes)[..16], 16).unwrap_or(0);
+            acc
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1255,121 @@ fn rewrite_by_content(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background requests
+// ---------------------------------------------------------------------------
+
+/// The header (and `client_metadata` key) in which Codex names the sub-agent
+/// a request comes from (codex-rs/codex-api/src/requests/headers.rs,
+/// codex-rs/core/src/responses_metadata.rs).
+pub const SUBAGENT_HEADER: &str = "x-openai-subagent";
+/// The sub-agent label of a spawned agent doing real work in its own thread:
+/// its requests are a conversation like any other.
+const SPAWNED_AGENT: &str = "collab_spawn";
+/// The default model of Codex's approval reviewer
+/// (codex-rs/model-provider/src/provider.rs), whose label is `guardian`.
+const REVIEWER_MODEL: &str = "codex-auto-review";
+/// How the desktop app's request for a task's title starts (the app's own
+/// prompt; it is not in codex-rs).
+const TITLE_PROMPT: &str = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt";
+/// Characters of a sub-agent label kept.
+const LABEL_CHARS: usize = 40;
+/// The header (and `client_metadata` key) in which Codex sends a turn's
+/// metadata as JSON, its thread's `thread_source` among it
+/// (codex-rs/core/src/responses_metadata.rs).
+pub const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+
+/// A field of a request's turn metadata, from the body's `client_metadata`
+/// or else from the header (`turn_metadata`).
+fn turn_metadata_field(turn_metadata: Option<&str>, body: &Value, field: &str) -> Option<String> {
+    let from_body = body
+        .get("client_metadata")
+        .and_then(|m| m.get(TURN_METADATA_HEADER))
+        .and_then(Value::as_str);
+    [from_body, turn_metadata].into_iter().flatten().find_map(|json| {
+        let metadata: Value = serde_json::from_str(json).ok()?;
+        metadata.get(field)?.as_str().map(str::to_string)
+    })
+}
+
+/// True for the request in which Codex asks the model for the summary of a
+/// compaction: its turn metadata's `request_kind` is `compaction`
+/// (codex-rs/core/src/responses_metadata.rs). It is a request of the
+/// conversation itself (no sub-agent header), sent to `/responses`.
+pub fn compaction_request(turn_metadata: Option<&str>, body: &Value) -> bool {
+    turn_metadata_field(turn_metadata, body, "request_kind").as_deref() == Some("compaction")
+}
+
+/// The label of a request Codex makes in the background, or `None` for a
+/// request of a conversation the person works in. Background: the
+/// `x-openai-subagent` header, or the same key of the body's
+/// `client_metadata`, names a sub-agent other than a spawned agent
+/// (`review`, `memory_consolidation`, `guardian`, ...; codex-rs maps a
+/// `compact` sub-agent too, but no request of it sends one); the turn
+/// metadata's `thread_source` is a task title, a recap, an approval review
+/// or a memory consolidation (see [`lge_usage::background_thread_source`]);
+/// the model is the approval reviewer's (label `guardian`); or the
+/// instructions or the first typed message open with the desktop app's
+/// title prompt (label `title`). `subagent` and `turn_metadata` are the
+/// headers' values.
+pub fn background_label(subagent: Option<&str>, turn_metadata: Option<&str>, body: &Value) -> Option<String> {
+    let label = |value: &str| -> Option<String> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case(SPAWNED_AGENT) {
+            return None;
+        }
+        Some(if value.is_empty() {
+            "subagent".to_string()
+        } else {
+            value.chars().take(LABEL_CHARS).collect()
+        })
+    };
+    let metadata = body
+        .get("client_metadata")
+        .and_then(|m| m.get(SUBAGENT_HEADER))
+        .and_then(Value::as_str);
+    if let Some(found) = subagent.and_then(label).or_else(|| metadata.and_then(label)) {
+        return Some(found);
+    }
+    if let Some(found) = turn_metadata_field(turn_metadata, body, "thread_source")
+        .as_deref()
+        .and_then(lge_usage::background_thread_source)
+    {
+        return Some(found.to_string());
+    }
+    if body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case(REVIEWER_MODEL))
+    {
+        return Some("guardian".to_string());
+    }
+    let title = |text: &str| text.trim_start().starts_with(TITLE_PROMPT);
+    if body.get("instructions").and_then(Value::as_str).is_some_and(title) {
+        return Some("title".to_string());
+    }
+    match body.get("input") {
+        Some(Value::String(text)) if title(text) => return Some("title".to_string()),
+        Some(Value::Array(items)) => {
+            // The messages up to the first one the person typed.
+            for item in items {
+                if item.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                let Some(text) = message_text(item) else { continue };
+                if title(&text) {
+                    return Some("title".to_string());
+                }
+                if item.get("role").and_then(Value::as_str) == Some("user") && !is_injected(item, &text) {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Read what the request says about itself, without changing it.
 pub fn inspect(body: &Value) -> Seen {
     let mut seen = Seen {
@@ -1255,6 +1428,21 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
     let client: Vec<u64> = items.iter().map(|item| hash_of(&[item])).collect();
     let previous = session.previous_client_hashes();
     let mut new_outputs: Vec<OutputFact> = Vec::new();
+    // Where the client rewrote its history since the previous request (a
+    // compaction, an edit, a rollback): packs of messages at or after it are
+    // retired, the newest typed message may keep its own, and every item
+    // before it keeps its bytes.
+    let client_break = session.client_break(&client);
+    let prefixes = prefix_hashes(&client);
+    let newest = items
+        .iter()
+        .rposition(|item| typed_text(item).is_some())
+        .unwrap_or(usize::MAX);
+    // Typed texts seen so far in this request: a copy of one gets no pack, so
+    // the packs present never exceed the conversation budget (in a
+    // conversation of an older version, a copy replays its text's pack).
+    let mut typed_before: HashSet<String> = HashSet::new();
+    let copies_replay = !session.no_pack_for_copies();
 
     let mut known = Known::new(session, graph, opts, seen.cwd.clone(), &calls);
     let mut out: Vec<Value> = Vec::with_capacity(items.len() + 2);
@@ -1300,12 +1488,29 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                 out.push(item);
             }
             "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
-                let text = message_text(&item);
-                let typed = text.as_deref().is_some_and(|t| !is_injected(&item, t));
+                let at = forwarded.len();
                 // Looked up with or without a graph: a message decided once
                 // keeps its pack, or its lack of one, on every later turn.
-                let context = match (text, typed) {
-                    (Some(text), true) => known.session.context_after(graph, &text, opts),
+                // A copy of a message typed earlier in the request gets none,
+                // decided from the items before it like everything else.
+                let typed = typed_text(&item).map(|text| {
+                    let copy = !typed_before.insert(text.clone());
+                    (text, copy)
+                });
+                let context = match typed {
+                    Some((text, copy)) if !copy || copies_replay => {
+                        let earlier: &[Value] = &out;
+                        let mentioned = |path: &str| mentioned_in(earlier, path);
+                        let before = Before {
+                            pack_tokens: known.session.present_tokens().1.max(0) as usize,
+                            mentions: &mentioned,
+                            rewritten: client_break.is_some_and(|b| b <= at),
+                            // The anchor is the first copy's.
+                            prefix: (!copy).then(|| prefixes[at]),
+                            newest: at == newest,
+                        };
+                        known.session.context_after(graph, &text, &before, opts)
+                    }
                     _ => None,
                 };
                 match context {
@@ -2278,6 +2483,11 @@ mod tests {
         ] {
             assert!(is_injected(&typed, text), "{text}");
         }
+        // The summary Codex writes when it compacts is not typed either.
+        assert!(is_injected(
+            &typed,
+            "Another language model started to solve this problem and produced a summary of its thinking process."
+        ));
         // The agent's own labels win over the text when they are present.
         tagged["internal_chat_message_metadata_passthrough"] = json!({ "content_item_kinds": ["user.text"] });
         assert!(!is_injected(&tagged, "<looks like a tag>"));
@@ -2294,6 +2504,73 @@ mod tests {
             (seen.cwd.as_deref(), seen.first_user_message.as_str()),
             (Some("/repo/app"), "please fix the login bug")
         );
+    }
+
+    #[test]
+    fn background_requests_are_told_by_header_metadata_model_and_title_prompt() {
+        let plain = json!({ "model": "gpt-test", "input": [user("<environment_context>x</environment_context>"), user("fix the login bug")] });
+        assert_eq!(background_label(None, None, &plain), None);
+        // Codex's sub-agent header, any label but a spawned agent's.
+        for label in ["guardian", "review", "compact", "memory_consolidation", "my-task"] {
+            assert_eq!(background_label(Some(label), None, &plain).as_deref(), Some(label));
+        }
+        assert_eq!(background_label(Some("collab_spawn"), None, &plain), None);
+        assert_eq!(background_label(Some(" "), None, &plain).as_deref(), Some("subagent"));
+        // The same key in the body's client metadata.
+        let mut meta = plain.clone();
+        meta["client_metadata"] = json!({ "x-openai-subagent": "guardian", "thread_id": "t" });
+        assert_eq!(background_label(None, None, &meta).as_deref(), Some("guardian"));
+        meta["client_metadata"]["x-openai-subagent"] = json!("collab_spawn");
+        assert_eq!(background_label(None, None, &meta), None);
+        // The approval reviewer's model, in any case.
+        let mut model = plain.clone();
+        model["model"] = json!("Codex-Auto-Review");
+        assert_eq!(background_label(None, None, &model).as_deref(), Some("guardian"));
+        // The desktop app's title prompt, in the instructions or the first typed message.
+        let prompt = format!("{TITLE_PROMPT}.\n\nUser prompt: fix the login bug");
+        let mut instructions = plain.clone();
+        instructions["instructions"] = json!(prompt);
+        assert_eq!(background_label(None, None, &instructions).as_deref(), Some("title"));
+        let first = json!({ "model": "gpt-test", "input": [user("<environment_context>x</environment_context>"), user(&prompt)] });
+        assert_eq!(background_label(None, None, &first).as_deref(), Some("title"));
+        // Quoted later, or after a typed message, it is not one.
+        let later = json!({ "model": "gpt-test", "input": [user("fix the login bug"), user(&prompt)] });
+        assert_eq!(background_label(None, None, &later), None);
+        let quoted = json!({ "input": [user(&format!("why does this start with: {prompt}"))] });
+        assert_eq!(background_label(None, None, &quoted), None);
+
+        // Codex's own temporary threads (a task title, a recap) and its
+        // reviewer and memory threads, by the turn metadata's thread source,
+        // in the body's client metadata or in the header.
+        let turn = |source: &str| json!({ "turn_id": "t1", "thread_source": source }).to_string();
+        for (source, label) in [
+            ("thread_title", "title"),
+            ("system", "recap"),
+            ("guardian_review", "guardian"),
+            ("memory_consolidation", "memory_consolidation"),
+        ] {
+            let mut body = plain.clone();
+            body["client_metadata"] = json!({ "x-codex-turn-metadata": turn(source) });
+            assert_eq!(background_label(None, None, &body).as_deref(), Some(label), "{source}");
+            assert_eq!(
+                background_label(None, Some(&turn(source)), &plain).as_deref(),
+                Some(label),
+                "{source}"
+            );
+        }
+        for source in ["user", "subagent", "automation"] {
+            assert_eq!(background_label(None, Some(&turn(source)), &plain), None, "{source}");
+        }
+        assert_eq!(background_label(None, Some("not json"), &plain), None);
+
+        // Codex's request for a compaction's summary is told by its request kind.
+        let mut summary = plain.clone();
+        summary["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"request_kind":"compaction"}"# });
+        assert!(compaction_request(None, &summary));
+        assert!(compaction_request(Some(r#"{"request_kind":"compaction"}"#), &plain));
+        assert!(!compaction_request(Some(r#"{"request_kind":"turn"}"#), &plain));
+        assert!(!compaction_request(None, &plain));
+        assert_eq!(background_label(None, None, &summary), None, "not a background session");
     }
 
     #[test]

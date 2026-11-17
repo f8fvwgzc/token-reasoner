@@ -46,6 +46,10 @@ pub struct Options {
     pub context_budget: usize,
     /// Packs added per conversation at most.
     pub max_contexts: usize,
+    /// Tokens of the packs present in one request together at most. A pack
+    /// is re-sent on every later request, so this bounds what packs add to
+    /// each request of a long conversation.
+    pub pack_conversation_budget: usize,
 }
 
 impl Default for Options {
@@ -57,9 +61,17 @@ impl Default for Options {
             holdout: false,
             context_budget: 1500,
             max_contexts: 6,
+            pack_conversation_budget: PACK_CONVERSATION_BUDGET,
         }
     }
 }
+
+/// The default of [`Options::pack_conversation_budget`].
+pub const PACK_CONVERSATION_BUDGET: usize = 3000;
+/// Tokens of a pack after the first one of a conversation at most.
+pub const FOLLOW_UP_PACK_TOKENS: usize = 600;
+/// Below this many tokens of room in the conversation budget, no pack is added.
+pub const MIN_PACK_ROOM: usize = 300;
 
 impl Options {
     /// The options that decide an item again exactly as it was decided before
@@ -113,6 +125,13 @@ pub struct Saved {
     /// Packs decided in a holdout conversation, which were not added, and their tokens.
     pub contexts_would_add: usize,
     pub context_tokens_would_add: usize,
+    /// Follow-up packs not added because every starting point was in a file
+    /// the conversation had already shown.
+    pub contexts_known: usize,
+    /// Packs not added because the conversation budget had no room for them.
+    pub contexts_over_budget: usize,
+    /// Packs no longer inserted after the client compacted its history.
+    pub contexts_retired: usize,
 }
 
 impl Saved {
@@ -138,7 +157,7 @@ fn ledger_key(id: &str) -> String {
 /// daemon that restarted to send the same bytes for the items decided before,
 /// whatever the settings say by then, without counting them again. Kept in the
 /// conversation's usage record; hashes and rule ids only, never content.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Ledger {
     /// The first 12 hex characters of a tool output's key -> the rules whose
@@ -148,6 +167,36 @@ pub struct Ledger {
     /// The first 12 hex characters of a typed message's key -> a pack was
     /// added after it.
     pub contexts: BTreeMap<String, bool>,
+    /// The same key -> the tokens the pack was built to fit in, so it is
+    /// built again to the same size. Missing for packs of older versions,
+    /// which were built without such a cap.
+    pub pack_caps: BTreeMap<String, usize>,
+    /// The same keys, for packs no longer inserted after a compaction.
+    pub retired: BTreeSet<String>,
+    /// The same key -> the hash of the client's items up to and including
+    /// the message, when its pack was last inserted (see [`Before::prefix`]).
+    /// The same hash again means the history kept its prefix up to the
+    /// message, after a restart too. Missing for packs of older versions.
+    pub anchors: BTreeMap<String, u64>,
+    /// A copy of a message typed earlier in the same request gets no pack.
+    /// False in a ledger of an older version, where a copy got its text's
+    /// pack: such a conversation keeps doing so, so its bytes replay.
+    #[serde(default)]
+    pub no_pack_for_copies: bool,
+}
+
+impl Default for Ledger {
+    /// The ledger of a new conversation.
+    fn default() -> Self {
+        Ledger {
+            outputs: BTreeMap::new(),
+            contexts: BTreeMap::new(),
+            pack_caps: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            anchors: BTreeMap::new(),
+            no_pack_for_copies: true,
+        }
+    }
 }
 
 /// What was decided for one tool output, replayed on every later turn.
@@ -180,6 +229,10 @@ It was worked out from the source: use its conclusions instead of re-deriving th
 and read only the line ranges you need.\n\n";
 /// Tokens of remembered facts added to one context.
 const MEMORY_BUDGET: usize = 300;
+/// Remembered facts are added only when at least this many tokens fit.
+const MIN_MEMORY_TOKENS: usize = 50;
+/// The heading of the remembered facts in a pack.
+const MEMORY_HEADING: &str = "\n\n## From project memory (decisions, conventions, recent commits)\n";
 pub const CONTEXT_CLOSE: &str = "</lge_context>";
 
 /// What a later call must do to count as getting back what an item left out.
@@ -233,9 +286,63 @@ struct RequestLog {
     /// Tokens of the context items present in this request.
     added_present: i64,
     /// What this request's packs added to what the conversation is about.
-    seeds_added: Vec<String>,
     symbols_added: Vec<String>,
     relevant_files_added: Vec<String>,
+    /// Ledger keys of the packs this request retired.
+    retired_added: Vec<String>,
+    /// Ledger keys whose anchor this request set, with the anchor before.
+    anchors_before: Vec<(String, Option<u64>)>,
+    /// Starting points of the packs inserted so far in this request: what the
+    /// items before the next message already show.
+    present_seeds: BTreeSet<String>,
+}
+
+/// What comes before a typed message in its request: what the decision about
+/// its pack may depend on. All of it is read from the items before the
+/// message, which never change while the history keeps its prefix.
+pub struct Before<'a> {
+    /// Tokens of the packs present before the message in the request.
+    pub pack_tokens: usize,
+    /// True when a repository-relative path appears before the message in a
+    /// tool call's arguments or output, or in a pack.
+    pub mentions: &'a dyn Fn(&str) -> bool,
+    /// The client changed an item at or before the message since the previous
+    /// request (a compaction, an edit): the history did not keep its prefix
+    /// up to the message, so a pack decided in an earlier request is no
+    /// longer inserted, unless the message is `newest` and the pack fits the
+    /// conversation budget. A change after the message leaves its pack alone.
+    pub rewritten: bool,
+    /// A hash of the client's items up to and including the message; `None`
+    /// outside a request. A pack decided in an earlier request whose anchor
+    /// in the [`Ledger`] differs was moved by a rewrite as well, which a
+    /// daemon that restarted sees only this way.
+    pub prefix: Option<u64>,
+    /// The message is the newest typed message of the request.
+    pub newest: bool,
+}
+
+/// A pack built for a message, before it is kept.
+struct Built {
+    /// The pack's text; `None` when it does not fit in the cap.
+    text: Option<String>,
+    /// Ids and files of its starting points, and the files it names.
+    seeds: Vec<String>,
+    seed_files: Vec<String>,
+    files: Vec<String>,
+}
+
+/// True when `path` appears in `text` as a whole path: not as the end of a
+/// longer name (`data.py` in `metadata.py`) or the start of one.
+pub(crate) fn mentions(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    text.match_indices(path).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + path.len()..].chars().next();
+        !before.is_some_and(name) && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 #[derive(Default)]
@@ -253,8 +360,10 @@ pub struct Session {
     /// Symbols and files the conversation is about, from the packs so far.
     relevant_symbols: BTreeSet<String>,
     relevant_files: BTreeSet<String>,
-    /// Seeds of the packs already added, so the same pack is not added twice.
-    seeds_shown: BTreeSet<String>,
+    /// Message key -> the starting points of the pack added after it. A
+    /// message whose starting points are all in packs inserted before it in
+    /// the request gets none: the same pack is not added twice.
+    pack_seeds: HashMap<String, Vec<String>>,
     /// Words of what the user typed, lower-cased.
     words: BTreeSet<String>,
     /// Items sent whole because they re-ran a shortened command with nothing
@@ -605,72 +714,171 @@ impl Session {
     /// message: a symbol the message names, or a search hit that shares at
     /// least two words with it. "ok, do it" gets nothing. In a holdout
     /// conversation the pack is decided and counted, and never added.
+    ///
+    /// The message is taken to come after every message decided so far, each
+    /// once, with their packs before it; [`Session::context_after`] is the
+    /// same for a message at its place in a request.
     pub fn context_for(&mut self, graph: &Graph, user_text: &str, opts: &Options) -> Option<String> {
-        self.context_after(Some(graph), user_text, opts)
+        let present: Vec<(&String, String)> = self
+            .contexts
+            .iter()
+            .filter(|(id, _)| !self.ledger.retired.contains(&ledger_key(id)))
+            .filter_map(|(id, text)| Some((id, text.clone()?)))
+            .collect();
+        let pack_tokens = present.iter().map(|(_, t)| count(t)).sum();
+        self.request.present_seeds = present
+            .iter()
+            .filter_map(|(id, _)| self.pack_seeds.get(*id))
+            .flatten()
+            .cloned()
+            .collect();
+        let texts: Vec<String> = present.into_iter().map(|(_, t)| t).collect();
+        let mentioned = |path: &str| texts.iter().any(|t| mentions(t, path));
+        let before = Before {
+            pack_tokens,
+            mentions: &mentioned,
+            rewritten: false,
+            prefix: None,
+            newest: true,
+        };
+        self.context_after(Some(graph), user_text, &before, opts)
     }
 
-    /// [`Session::context_for`] whether a graph is ready or not: a message
-    /// first seen without a graph gets no pack, for good, so a graph that
-    /// becomes ready (or goes away) later never changes what was sent after an
-    /// old message.
-    pub fn context_after(&mut self, graph: Option<&Graph>, user_text: &str, opts: &Options) -> Option<String> {
+    /// [`Session::context_for`] for a message at its place in a request,
+    /// whether a graph is ready or not: a message first seen without a graph
+    /// gets no pack, for good, so a graph that becomes ready (or goes away)
+    /// later never changes what was sent after an old message.
+    ///
+    /// A pack decided in an earlier request is inserted again with the same
+    /// bytes while the history keeps its prefix up to its message. After a
+    /// rewrite at or before the message (see [`Before::rewritten`]) it is
+    /// retired for good, unless its message is the newest one and it still
+    /// fits the conversation budget.
+    pub fn context_after(
+        &mut self,
+        graph: Option<&Graph>,
+        user_text: &str,
+        before: &Before,
+        opts: &Options,
+    ) -> Option<String> {
         let id = key(&["context", user_text]);
-        if let Some(known) = self.contexts.get(&id) {
-            if let Some(text) = known {
-                self.request.added_present += count(text) as i64;
-            }
-            return known.clone();
+        let lk = ledger_key(&id);
+        let kept = self.context_of(graph, &id, &lk, user_text, before, opts);
+        // A held-out conversation counts what it would have added the same way.
+        if kept.is_some() || opts.holdout {
+            let seeds = self.pack_seeds.get(&id).cloned().unwrap_or_default();
+            self.request.present_seeds.extend(seeds);
+        }
+        kept
+    }
+
+    fn context_of(
+        &mut self,
+        graph: Option<&Graph>,
+        id: &str,
+        lk: &str,
+        user_text: &str,
+        before: &Before,
+        opts: &Options,
+    ) -> Option<String> {
+        if let Some(known) = self.contexts.get(id).cloned() {
+            return self.keep_or_retire(lk, known?, before, opts);
         }
         let words: BTreeSet<String> = split_words(user_text).into_iter().collect();
         self.words.extend(words.iter().cloned());
-        // Decided before the daemon restarted: the same answer, counted once.
-        if let Some(&had) = self.ledger.contexts.get(&ledger_key(&id)) {
-            let again = match (had, graph) {
-                (true, Some(graph)) => self.decide_context(graph, user_text, &words, opts, true),
+        // Decided before the daemon restarted: the same answer, built to the
+        // same size, counted once.
+        if let Some(&had) = self.ledger.contexts.get(lk) {
+            let again = match graph {
+                Some(graph) if had && !self.ledger.retired.contains(lk) => {
+                    let cap = self.ledger.pack_caps.get(lk).copied();
+                    self.rebuild_context(graph, id, user_text, cap, opts)
+                }
                 _ => None,
             };
-            if let Some(text) = &again {
-                self.pinned_contexts += 1;
-                self.request.added_present += count(text) as i64;
-            }
-            self.contexts.insert(id, again.clone());
-            return again;
+            self.contexts.insert(id.to_string(), again.clone());
+            self.pinned_contexts += usize::from(again.is_some());
+            return self.keep_or_retire(lk, again?, before, opts);
         }
-        let decided = graph.and_then(|graph| self.decide_context(graph, user_text, &words, opts, false));
+        let decided = graph.and_then(|graph| self.decide_context(graph, id, user_text, &words, before, opts));
         let kept = match decided {
-            Some(text) if opts.holdout => {
+            Some((text, _)) if opts.holdout => {
                 self.saved.contexts_would_add += 1;
                 self.saved.context_tokens_would_add += count(&text);
                 None
             }
-            Some(text) => {
+            Some((text, cap)) => {
                 let tokens = count(&text);
                 self.saved.contexts_added += 1;
                 self.saved.context_tokens += tokens;
                 self.request.added_present += tokens as i64;
+                self.ledger.pack_caps.insert(lk.to_string(), cap);
+                if let Some(prefix) = before.prefix {
+                    self.ledger.anchors.insert(lk.to_string(), prefix);
+                }
                 Some(text)
             }
             None => None,
         };
-        self.ledger.contexts.insert(ledger_key(&id), kept.is_some());
-        self.contexts.insert(id.clone(), kept.clone());
-        self.new_this_request.push(id);
+        self.ledger.contexts.insert(lk.to_string(), kept.is_some());
+        self.contexts.insert(id.to_string(), kept.clone());
+        self.new_this_request.push(id.to_string());
         kept
     }
 
-    /// The pack for a typed message. `pinned`: it was added before the daemon
-    /// restarted, so the switch and the cap, which it passed then, are not
-    /// asked again.
+    /// A pack decided in an earlier request, inserted again as it was while
+    /// the history keeps its prefix up to its message. When the client
+    /// rewrote an item at or before the message (a compaction, an edit), or
+    /// the hash of the items up to the message is not the one the pack was
+    /// last inserted with, only the newest typed message keeps its pack, and
+    /// only while it fits the conversation budget; every other pack is
+    /// retired for good. Those items are not cached anyway; the items before
+    /// the rewrite keep every byte.
+    fn keep_or_retire(&mut self, lk: &str, text: String, before: &Before, opts: &Options) -> Option<String> {
+        if self.ledger.retired.contains(lk) {
+            return None;
+        }
+        let anchor = self.ledger.anchors.get(lk).copied();
+        let moved = matches!((anchor, before.prefix), (Some(a), Some(p)) if a != p);
+        let tokens = count(&text);
+        if (before.rewritten || moved)
+            && !(before.newest && before.pack_tokens + tokens <= opts.pack_conversation_budget)
+        {
+            self.ledger.retired.insert(lk.to_string());
+            self.saved.contexts_retired += 1;
+            self.request.retired_added.push(lk.to_string());
+            return None;
+        }
+        // Inserted with the items before it as they are now.
+        if let Some(prefix) = before.prefix.filter(|p| anchor != Some(*p)) {
+            self.request.anchors_before.push((lk.to_string(), anchor));
+            self.ledger.anchors.insert(lk.to_string(), prefix);
+        }
+        self.request.added_present += tokens as i64;
+        Some(text)
+    }
+
+    /// The pack for a typed message seen for the first time, and the tokens
+    /// it was built to fit in.
+    ///
+    /// Packs are sent again on every later request, so their cost grows with
+    /// the conversation. The packs present in one request never exceed
+    /// [`Options::pack_conversation_budget`] together: a new pack gets at most
+    /// the room left, and none with less than [`MIN_PACK_ROOM`]. After the
+    /// conversation's first pack, a pack is at most [`FOLLOW_UP_PACK_TOKENS`]
+    /// and is added only when one of its starting points is in a file that no
+    /// tool call, tool output or pack before the message named.
     fn decide_context(
         &mut self,
         graph: &Graph,
+        id: &str,
         user_text: &str,
         words: &BTreeSet<String>,
+        before: &Before,
         opts: &Options,
-        pinned: bool,
-    ) -> Option<String> {
+    ) -> Option<(String, usize)> {
         let packs = self.saved.contexts_added + self.saved.contexts_would_add + self.pinned_contexts;
-        if !pinned && (!opts.inject_context || packs >= opts.max_contexts) || user_text.len() > 8000 {
+        if !opts.inject_context || packs >= opts.max_contexts || user_text.len() > 8000 {
             return None;
         }
         let seeds = find_seeds(graph.store, user_text, &SeedOptions::default()).ok()?;
@@ -686,15 +894,73 @@ impl Session {
         if !strong {
             return None;
         }
-        // Nothing new to say: these starting points were already given.
-        if seeds.iter().all(|s| self.seeds_shown.contains(&s.hit.id)) {
+        // Nothing new to say: the packs before the message give these starting
+        // points already. Read from the packs inserted before it in the
+        // request, so a pack retired or dropped from the history counts as
+        // not given, after a restart the same.
+        if seeds.iter().all(|s| self.request.present_seeds.contains(&s.hit.id)) {
+            self.saved.contexts_known += 1;
             return None;
+        }
+        let room = opts.pack_conversation_budget.saturating_sub(before.pack_tokens);
+        if room < MIN_PACK_ROOM {
+            self.saved.contexts_over_budget += 1;
+            return None;
+        }
+        let follow_up = self.ledger.contexts.values().any(|added| *added) || self.saved.contexts_would_add > 0;
+        let cap = if follow_up {
+            room.min(FOLLOW_UP_PACK_TOKENS)
+        } else {
+            room
+        };
+        let built = self.build_pack(graph, user_text, opts, Some(cap))?;
+        if follow_up && !built.seed_files.iter().any(|f| !f.is_empty() && !(before.mentions)(f)) {
+            self.saved.contexts_known += 1;
+            return None;
+        }
+        let Some(text) = built.text.clone() else {
+            self.saved.contexts_over_budget += 1;
+            return None;
+        };
+        self.remember_pack(id, &built);
+        Some((text, cap))
+    }
+
+    /// The pack of a message that got one before the daemon restarted, built
+    /// to the size it had then: the switch, the cap and the checks, which it
+    /// passed then, are not asked again.
+    fn rebuild_context(
+        &mut self,
+        graph: &Graph,
+        id: &str,
+        user_text: &str,
+        cap: Option<usize>,
+        opts: &Options,
+    ) -> Option<String> {
+        if user_text.len() > 8000 {
+            return None;
+        }
+        let built = self.build_pack(graph, user_text, opts, cap)?;
+        let text = built.text.clone()?;
+        self.remember_pack(id, &built);
+        Some(text)
+    }
+
+    /// Build the pack for `user_text` in at most `cap` tokens in all, its
+    /// frame and remembered facts included; `None` for no cap (packs of
+    /// older versions). Remembered facts are left out when they do not fit.
+    /// The same graph, facts and cap give the same bytes.
+    fn build_pack(&self, graph: &Graph, user_text: &str, opts: &Options, cap: Option<usize>) -> Option<Built> {
+        let frame = count(&format!("{CONTEXT_OPEN}\n{CONTEXT_CLOSE}"));
+        let mut budget = pack_budget(graph.store, user_text, opts);
+        if let Some(cap) = cap {
+            budget = budget.min(cap.saturating_sub(frame));
         }
         let pack = evidence_pack(
             graph.store,
             user_text,
             &PackOptions {
-                budget: pack_budget(graph.store, user_text, opts),
+                budget,
                 ..PackOptions::default()
             },
         )
@@ -702,40 +968,63 @@ impl Session {
         if pack.seeds.is_empty() {
             return None;
         }
-        for seed in &pack.seeds {
-            if self.seeds_shown.insert(seed.id.clone()) {
-                self.request.seeds_added.push(seed.id.clone());
-            }
-            if self.relevant_symbols.insert(seed.id.clone()) {
-                self.request.symbols_added.push(seed.id.clone());
+        let body = pack.text.trim_end();
+        let bare = format!("{CONTEXT_OPEN}{body}\n{CONTEXT_CLOSE}");
+        // Decisions and conventions stored in earlier sessions: the model uses
+        // them instead of working them out again.
+        let memory_budget = match cap {
+            None => MEMORY_BUDGET,
+            Some(cap) => MEMORY_BUDGET.min(cap.saturating_sub(count(&bare) + count(MEMORY_HEADING))),
+        };
+        let mut text = None;
+        if memory_budget >= MIN_MEMORY_TOKENS {
+            let remembered = lge_memory::recall(
+                graph.store,
+                user_text,
+                &lge_memory::RecallOptions {
+                    budget: memory_budget,
+                    now: lge_retrieve::unix_now(),
+                    limit: 8,
+                    ..lge_memory::RecallOptions::default()
+                },
+                None,
+            );
+            if let Ok(found) = remembered {
+                if !found.items.is_empty() {
+                    text = Some(format!(
+                        "{CONTEXT_OPEN}{body}{MEMORY_HEADING}{}\n{CONTEXT_CLOSE}",
+                        found.text.trim_end()
+                    ));
+                }
             }
         }
-        for file in &pack.files {
+        let fits = |t: &str| cap.is_none_or(|cap| count(t) <= cap);
+        let text = match text {
+            Some(with_memory) if fits(&with_memory) => Some(with_memory),
+            _ => Some(bare).filter(|t| fits(t)),
+        };
+        Some(Built {
+            text,
+            seeds: pack.seeds.iter().map(|s| s.id.clone()).collect(),
+            seed_files: pack.seeds.iter().map(|s| s.file_path.clone()).collect(),
+            files: pack.files,
+        })
+    }
+
+    /// What a pack that is kept adds to what the conversation is about, and
+    /// the starting points of the message `id`'s pack.
+    fn remember_pack(&mut self, id: &str, built: &Built) {
+        self.pack_seeds.insert(id.to_string(), built.seeds.clone());
+        for seed in &built.seeds {
+            if self.relevant_symbols.insert(seed.clone()) {
+                self.request.symbols_added.push(seed.clone());
+            }
+        }
+        for file in &built.files {
             if self.relevant_files.insert(file.clone()) {
                 self.request.relevant_files_added.push(file.clone());
             }
         }
-        // Decisions and conventions stored in earlier sessions: the model uses
-        // them instead of working them out again.
-        let mut text = pack.text.trim_end().to_string();
-        let remembered = lge_memory::recall(
-            graph.store,
-            user_text,
-            &lge_memory::RecallOptions {
-                budget: MEMORY_BUDGET,
-                now: lge_retrieve::unix_now(),
-                limit: 8,
-                ..lge_memory::RecallOptions::default()
-            },
-            None,
-        );
-        if let Ok(found) = remembered {
-            if !found.items.is_empty() {
-                text.push_str("\n\n## From project memory (decisions, conventions, recent commits)\n");
-                text.push_str(found.text.trim_end());
-            }
-        }
-        Some(format!("{CONTEXT_OPEN}{text}\n{CONTEXT_CLOSE}"))
     }
 
     /// What to send in place of the output of a shell command, or `None` to
@@ -840,6 +1129,9 @@ impl Session {
             if let Some(context) = self.contexts.get_mut(&id) {
                 *context = None;
                 self.ledger.contexts.insert(ledger_key(&id), false);
+                self.ledger.pack_caps.remove(&ledger_key(&id));
+                self.ledger.anchors.remove(&ledger_key(&id));
+                self.pack_seeds.remove(&id);
                 continue;
             }
             self.pointers.remove(&id);
@@ -848,11 +1140,6 @@ impl Session {
             self.outputs.insert(id, Decision::default());
         }
         let log = std::mem::take(&mut self.request);
-        // A pack that never reached the model said nothing: a later message
-        // about the same code may get one.
-        for seed in &log.seeds_added {
-            self.seeds_shown.remove(seed);
-        }
         for symbol in &log.symbols_added {
             self.relevant_symbols.remove(symbol);
         }
@@ -868,6 +1155,16 @@ impl Session {
         }
         for f in &log.files_added {
             self.shortened_files.remove(f);
+        }
+        // The retry decides them again, the same way.
+        for k in &log.retired_added {
+            self.ledger.retired.remove(k);
+        }
+        for (k, anchor) in log.anchors_before.iter().rev() {
+            match anchor {
+                Some(a) => self.ledger.anchors.insert(k.clone(), *a),
+                None => self.ledger.anchors.remove(k),
+            };
         }
         self.saved = log.saved_before.clone();
         (self.prefix_pairs, self.prefix) = log.prefix_before.clone();
@@ -1372,12 +1669,24 @@ impl Session {
         }
     }
 
+    /// The first input item whose client hash differs from the previous
+    /// request's, over their common length: the client rewrote its history
+    /// there (a compaction, an edit). `None` when the request starts with
+    /// every item the previous one had, or there was none.
+    pub(crate) fn client_break(&self, client: &[u64]) -> Option<usize> {
+        self.prefix_pairs
+            .iter()
+            .zip(client)
+            .position(|((old, _), new)| old != new)
+    }
+
     /// Compare this request's (client hash, forwarded hash) per input item
     /// with the previous request's, over their common length. The first item
     /// whose client hash differs is a client break and ends the walk; before
     /// it, an item whose client hash is the same but whose forwarded hash is
-    /// not is a break lge caused. At most one of each is counted per request,
-    /// at the first such item.
+    /// not is a break lge caused (a pack is retired only at or after the
+    /// client's break, so a retirement before it is lge's too). At most one
+    /// of each is counted per request, at the first such item.
     /// Returns the item index of each break.
     pub(crate) fn compare_prefix(&mut self, pairs: Vec<(u64, u64)>) -> (Option<usize>, Option<usize>) {
         let mut lge = None;
@@ -1414,6 +1723,12 @@ impl Session {
     /// counted again.
     pub fn restore(&mut self, ledger: Ledger) {
         self.ledger = ledger;
+    }
+
+    /// A copy of a message typed earlier in the same request gets no pack
+    /// (see [`Ledger::no_pack_for_copies`]).
+    pub(crate) fn no_pack_for_copies(&self) -> bool {
+        self.ledger.no_pack_for_copies
     }
 
     /// The rules an item decided before a restart got, when the ledger has
@@ -1712,6 +2027,36 @@ mod tests {
             "an earlier decision stays"
         );
         assert_eq!(session.saved, saved);
+    }
+
+    #[test]
+    fn a_ledger_of_an_older_version_keeps_sending_packs_after_copies() {
+        assert!(Ledger::default().no_pack_for_copies, "a new conversation");
+        let older: Ledger = serde_json::from_str(r#"{"outputs":{},"contexts":{"0123456789ab":true}}"#).unwrap();
+        assert!(!older.no_pack_for_copies, "a ledger written before the field existed");
+        assert!(older.anchors.is_empty() && older.retired.is_empty());
+        let again: Ledger = serde_json::from_str(&serde_json::to_string(&Ledger::default()).unwrap()).unwrap();
+        assert_eq!(again, Ledger::default());
+        let mut session = Session::default();
+        session.restore(older);
+        assert!(!session.no_pack_for_copies());
+    }
+
+    #[test]
+    fn a_path_is_mentioned_only_as_a_whole_path() {
+        assert!(mentions("cat orders_api/repo.py", "orders_api/repo.py"));
+        assert!(mentions(
+            "/work/shop/orders_api/repo.py:23:def find_order",
+            "orders_api/repo.py"
+        ));
+        assert!(mentions(
+            "{\"cmd\":\"sed -n '1,9p' ./orders_api/repo.py\"}",
+            "orders_api/repo.py"
+        ));
+        assert!(!mentions("cat orders_api/repo.pyc", "orders_api/repo.py"));
+        assert!(!mentions("cat src/metadata.py", "data.py"));
+        assert!(!mentions("cat src/my-data.py", "data.py"));
+        assert!(!mentions("anything", ""));
     }
 
     #[test]

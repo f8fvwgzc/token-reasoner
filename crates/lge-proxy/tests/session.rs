@@ -1,7 +1,10 @@
 //! The proxy's decisions for one conversation, against a real indexed repository.
-use lge_proxy::responses::transform;
+use lge_proxy::responses::{transform, Seen};
 use lge_proxy::rules::{Mode, RuleModes};
-use lge_proxy::session::{pack_budget, Graph, Options, Session, CONTEXT_CLOSE, CONTEXT_OPEN, LOCAL_CONTEXT_BUDGET};
+use lge_proxy::session::{
+    pack_budget, Graph, Options, PrefixStats, Session, CONTEXT_CLOSE, CONTEXT_OPEN, FOLLOW_UP_PACK_TOKENS,
+    LOCAL_CONTEXT_BUDGET, MIN_PACK_ROOM,
+};
 use lge_retrieve::{budget::count, index_repo, IndexOptions};
 use lge_store::Store;
 use serde_json::{json, Value};
@@ -184,7 +187,9 @@ fn a_question_about_one_file_that_nothing_else_uses_gets_a_small_pack() {
         Some(small.as_str())
     );
 
-    let full = session.context_for(&graph, shared, &opts).expect("names a symbol");
+    let full = Session::default()
+        .context_for(&graph, shared, &opts)
+        .expect("names a symbol");
     let full_pack = lge_retrieve::evidence_pack(
         &store,
         shared,
@@ -198,8 +203,13 @@ fn a_question_about_one_file_that_nothing_else_uses_gets_a_small_pack() {
         full.contains(full_pack.text.trim_end()),
         "the configured budget is used: {full}"
     );
+    // After the conversation's first pack, a pack is a follow-up: small.
+    let follow = session
+        .context_for(&graph, shared, &opts)
+        .expect("a starting point in a new file");
+    assert!(count(&follow) <= FOLLOW_UP_PACK_TOKENS, "{}", count(&follow));
     assert_eq!(session.saved.contexts_added, 2);
-    assert_eq!(session.saved.context_tokens, count(&small) + count(&full));
+    assert_eq!(session.saved.context_tokens, count(&small) + count(&follow));
 }
 
 #[test]
@@ -593,4 +603,443 @@ fn a_holdout_conversation_decides_packs_but_never_adds_them() {
     let seen = transform(&mut body, &mut Session::default(), Some(&graph), &opts);
     assert_eq!(body, before);
     assert_eq!((seen.contexts_present, seen.added_present), (0, 0));
+}
+
+// ------------------------------------------------- packs in long conversations
+
+fn message(text: &str) -> Value {
+    json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] })
+}
+
+fn environment(root: &Path) -> Value {
+    message(&format!(
+        "<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
+        root.display()
+    ))
+}
+
+/// Send `items` as one request of the conversation; the items forwarded.
+fn turn(session: &mut Session, graph: &Graph, items: &[Value], opts: &Options) -> (Vec<Value>, Seen) {
+    let mut body = json!({ "input": items });
+    let seen = transform(&mut body, session, Some(graph), opts);
+    (body["input"].as_array().unwrap().clone(), seen)
+}
+
+/// The text of a pack lge added, or `None` for any other item.
+fn pack_text(item: &Value) -> Option<&str> {
+    item["content"][0]["text"]
+        .as_str()
+        .filter(|t| t.starts_with("<lge_context>"))
+}
+
+/// Packs among forwarded items.
+fn packs(items: &[Value]) -> Vec<&str> {
+    items.iter().filter_map(pack_text).collect()
+}
+
+const ABOUT_ROUTES: &str = "create_order must validate the payload";
+const ABOUT_AUDIT: &str = "record the delivery of the email in the audit log";
+const ABOUT_MAILER: &str = "sendEmail should retry on a timeout";
+const ABOUT_REPO: &str = "find_order should use the cache";
+
+#[test]
+fn a_follow_up_pack_is_small_and_only_for_a_file_not_seen_before() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    // Alone, the message about the audit log gets a pack over the follow-up size.
+    let alone = Session::default()
+        .context_for(&graph, ABOUT_AUDIT, &opts)
+        .expect("names a symbol");
+    assert!(count(&alone) > FOLLOW_UP_PACK_TOKENS, "{}", count(&alone));
+
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    let pack = pack_text(&first[2]).expect("the first pack");
+    assert!(pack.contains("orders_api/repo.py"), "{pack}");
+    assert!(!pack.contains("notifier/src/"), "{pack}");
+
+    // A search names mailer.ts; the message is about repo.py, which the pack named.
+    items.push(exec_call("c1", "rg -n sendEmail notifier", &root));
+    items.push(exec_output(
+        "c1",
+        "notifier/src/mailer.ts:26:export async function sendEmail(to: string, subject: string, body: string): Promise<void> {\n",
+    ));
+    items.push(message(ABOUT_REPO));
+    let (second, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(second.len(), items.len() + 1, "already known: no pack");
+    assert_eq!(second[..first.len()], first[..], "the cached prefix must not change");
+    assert_eq!(session.saved.contexts_known, 1);
+
+    // About mailer.ts, which the search named.
+    items.push(message(ABOUT_MAILER));
+    let (third, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(third.len(), items.len() + 1, "already known: no pack");
+    assert_eq!(third[..second.len()], second[..], "the cached prefix must not change");
+    assert_eq!(session.saved.contexts_known, 2);
+
+    // About audit.ts, which nothing before named: a small pack.
+    items.push(message(ABOUT_AUDIT));
+    let (fourth, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(fourth.len(), items.len() + 2);
+    assert_eq!(fourth[..third.len()], third[..], "the cached prefix must not change");
+    let follow = pack_text(fourth.last().unwrap()).expect("a follow-up pack");
+    assert!(follow.contains("recordDelivery"), "{follow}");
+    assert!(count(follow) <= FOLLOW_UP_PACK_TOKENS, "{}", count(follow));
+    assert_eq!((session.saved.contexts_added, session.saved.contexts_known), (2, 2));
+    // Decided from the items before each message: the same request gives the same bytes.
+    let (again, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(again, fourth);
+    assert_eq!(session.saved.contexts_added, 2, "counted once");
+}
+
+#[test]
+fn the_packs_of_a_request_never_exceed_the_conversation_budget() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let budget = 1200;
+    let opts = Options {
+        pack_conversation_budget: budget,
+        ..Options::default()
+    };
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    let mut present = seen.added_present;
+    assert!(present as usize <= budget);
+
+    // A follow-up gets at most the room left, and at most the follow-up size.
+    items.push(message(ABOUT_AUDIT));
+    let (second, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&second).len(), 2);
+    let follow = count(packs(&second)[1]);
+    assert!(
+        follow <= FOLLOW_UP_PACK_TOKENS.min(budget - present as usize),
+        "{follow}"
+    );
+    present = seen.added_present;
+    assert!(present as usize <= budget, "{present}");
+
+    // Less than the minimum room is left: no pack, counted.
+    assert!(budget - (present as usize) < MIN_PACK_ROOM, "{present}");
+    items.push(message(ABOUT_MAILER));
+    let (third, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&third).len(), 2);
+    assert_eq!(third[..second.len()], second[..], "the cached prefix must not change");
+    assert_eq!(seen.added_present, present);
+    assert_eq!(session.saved.contexts_over_budget, 1);
+
+    // A budget below the minimum room adds nothing; a small one shrinks even the first pack.
+    let tiny = Options {
+        pack_conversation_budget: MIN_PACK_ROOM - 1,
+        ..Options::default()
+    };
+    let mut none = Session::default();
+    assert_eq!(none.context_for(&graph, ABOUT_ROUTES, &tiny), None);
+    assert_eq!(none.saved.contexts_over_budget, 1);
+    let alone = count(&Session::default().context_for(&graph, ABOUT_ROUTES, &opts).unwrap());
+    let small = Options {
+        pack_conversation_budget: alone - 60,
+        ..Options::default()
+    };
+    let squeezed = Session::default()
+        .context_for(&graph, ABOUT_ROUTES, &small)
+        .expect("a smaller first pack");
+    assert!(count(&squeezed) <= alone - 60, "{} of {alone}", count(&squeezed));
+}
+
+/// Two turns: a pack after the first message, a follow-up pack after the
+/// second. The items sent, and the forwarded items of the second turn.
+fn two_turns(session: &mut Session, graph: &Graph, root: &Path, opts: &Options) -> (Vec<Value>, Vec<Value>) {
+    let mut items = vec![environment(root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(session, graph, &items, opts);
+    items.push(exec_call("c1", "git status", root));
+    items.push(exec_output("c1", "On branch main\n"));
+    items.push(message(ABOUT_AUDIT));
+    let (second, _) = turn(session, graph, &items, opts);
+    assert_eq!(second[..first.len()], first[..], "the cached prefix must not change");
+    assert_eq!(packs(&second).len(), 2);
+    (items, second)
+}
+
+/// [`two_turns`], then a third turn that gets nothing. The items sent, and the
+/// forwarded items of the third turn: env, routes, pack, call, output, audit,
+/// pack, call, output, thanks.
+fn three_turns(session: &mut Session, graph: &Graph, root: &Path, opts: &Options) -> (Vec<Value>, Vec<Value>) {
+    let (mut items, second) = two_turns(session, graph, root, opts);
+    items.push(exec_call("c2", "git status", root));
+    items.push(exec_output("c2", "On branch main\n"));
+    items.push(message("thanks, looks good"));
+    let (third, _) = turn(session, graph, &items, opts);
+    assert_eq!(third[..second.len()], second[..], "the cached prefix must not change");
+    assert_eq!(packs(&third).len(), 2);
+    assert_eq!(session.prefix, PrefixStats::default());
+    (items, third)
+}
+
+/// How Codex opens the summary of a compaction (codex-rs/prompts/templates/compact/summary_prefix.md).
+const SUMMARY: &str = "Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary:\nThe payload check is half done.";
+
+/// Codex's history after it compacts (codex-rs/core/src/compact.rs,
+/// build_compacted_history and insert_initial_context_before_last_real_user_or_summary):
+/// the user messages it keeps, the initial context before the last of them,
+/// and its summary.
+fn compacted(root: &Path, kept: &[&str]) -> Vec<Value> {
+    let mut items: Vec<Value> = kept.iter().map(|text| message(text)).collect();
+    items.insert(kept.len().saturating_sub(1), environment(root));
+    items.push(message(SUMMARY));
+    items
+}
+
+#[test]
+fn after_a_compaction_older_packs_are_retired_and_every_other_byte_replays() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    let (_, second) = two_turns(&mut session, &graph, &root, &opts);
+    let audit_pack = packs(&second)[1].to_string();
+
+    // Codex compacts in the middle of the turn. The pack of the older message
+    // goes; the newest typed message keeps its pack, which fits the budget.
+    let mut items = compacted(&root, &[ABOUT_ROUTES, ABOUT_AUDIT]);
+    let (fourth, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(fourth.len(), items.len() + 1, "{fourth:?}");
+    assert_eq!(fourth[..3], items[..3], "the first message has no pack any more");
+    assert_eq!(pack_text(&fourth[3]), Some(audit_pack.as_str()), "the same bytes");
+    assert_eq!(fourth[4], items[3], "the summary gets no pack");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(0)));
+    assert_eq!(
+        session.prefix,
+        PrefixStats {
+            lge_breaks: 0,
+            client_breaks: 1,
+            first_lge_break_item: None,
+        },
+        "the client's break, not lge's"
+    );
+    assert_eq!(session.saved.contexts_retired, 1);
+
+    // Two more turns: every byte sent before is sent again.
+    items.push(exec_call("c3", "ls", &root));
+    items.push(exec_output("c3", "a\nb\n"));
+    items.push(message("ok, do it"));
+    let (fifth, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(fifth[..fourth.len()], fourth[..], "the cached prefix must not change");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, None));
+    items.push(message(ABOUT_MAILER));
+    let (sixth, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(sixth[..fifth.len()], fifth[..], "the cached prefix must not change");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, None));
+    let new = pack_text(sixth.last().unwrap()).expect("a pack about a file not seen before");
+    assert!(count(new) <= FOLLOW_UP_PACK_TOKENS);
+    assert_eq!((session.prefix.lge_breaks, session.prefix.client_breaks), (0, 1));
+    assert_eq!(session.saved.contexts_retired, 1, "retired once");
+
+    // After a restart the ledger gives the same bytes: the retired pack stays
+    // out, and the others are built again to their size.
+    let mut restarted = Session::default();
+    restarted.restore(session.ledger().clone());
+    let (again, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, sixth, "the same bytes after a restart");
+    assert_eq!(restarted.saved.contexts_retired, 0, "nothing retired again");
+}
+
+#[test]
+fn after_a_compaction_the_newest_pack_goes_too_when_it_no_longer_fits() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let mut session = Session::default();
+    two_turns(&mut session, &graph, &root, &Options::default());
+    let tight = Options {
+        pack_conversation_budget: 100,
+        ..Options::default()
+    };
+    let items = compacted(&root, &[ABOUT_ROUTES, ABOUT_AUDIT]);
+    let (fourth, seen) = turn(&mut session, &graph, &items, &tight);
+    assert_eq!(fourth, items, "no pack is left");
+    assert_eq!(session.saved.contexts_retired, 2);
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(0)));
+    // A retry of the same request (the provider refused it) retires them again, counted once.
+    session.revert_new();
+    let (retry, _) = turn(&mut session, &graph, &items, &tight);
+    assert_eq!(retry, items);
+    assert_eq!(session.saved.contexts_retired, 2);
+}
+
+#[test]
+fn an_edit_a_rollback_or_a_rewrite_late_in_the_history_keeps_every_byte_before_it() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let no_break = |session: &Session| {
+        assert_eq!(
+            session.prefix,
+            PrefixStats {
+                lge_breaks: 0,
+                client_breaks: 1,
+                first_lge_break_item: None,
+            }
+        );
+        assert_eq!(session.saved.contexts_retired, 0, "no pack is retired");
+    };
+
+    // The person edits their last message.
+    let mut session = Session::default();
+    let (items, third) = three_turns(&mut session, &graph, &root, &opts);
+    let mut edited = items[..7].to_vec();
+    edited.push(message("thanks, now run the tests please"));
+    let (fourth, seen) = turn(&mut session, &graph, &edited, &opts);
+    assert_eq!(
+        fourth[..third.len() - 1],
+        third[..third.len() - 1],
+        "the cached prefix must not change"
+    );
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(7)));
+    assert_eq!(packs(&fourth).len(), 2);
+    no_break(&session);
+    // The next turn replays every byte.
+    edited.push(exec_call("c3", "ls", &root));
+    edited.push(exec_output("c3", "a\nb\n"));
+    edited.push(message("ok"));
+    let (fifth, seen) = turn(&mut session, &graph, &edited, &opts);
+    assert_eq!(fifth[..fourth.len()], fourth[..], "the cached prefix must not change");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, None));
+
+    // Codex rolls the last turn back, and the person types another message.
+    let mut session = Session::default();
+    let (items, third) = three_turns(&mut session, &graph, &root, &opts);
+    let mut rolled_back = items[..5].to_vec();
+    rolled_back.push(message("now run the tests"));
+    let (fourth, seen) = turn(&mut session, &graph, &rolled_back, &opts);
+    assert_eq!(fourth[..7], third[..7], "the cached prefix must not change");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(5)));
+    no_break(&session);
+
+    // Codex rewrites one late tool output.
+    let mut session = Session::default();
+    let (mut items, third) = three_turns(&mut session, &graph, &root, &opts);
+    items[6] = exec_output("c2", "On branch main (output dropped)\n");
+    items.push(message("go on"));
+    let (fourth, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(fourth[..8], third[..8], "the cached prefix must not change");
+    assert_eq!((seen.lge_break_item, seen.client_break_item), (None, Some(6)));
+    assert_eq!(packs(&fourth).len(), 2);
+    no_break(&session);
+}
+
+#[test]
+fn a_compaction_right_after_a_restart_retires_older_packs_the_same_way() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    two_turns(&mut session, &graph, &root, &opts);
+    let mut restarted = Session::default();
+    restarted.restore(session.ledger().clone());
+
+    let items = compacted(&root, &[ABOUT_ROUTES, ABOUT_AUDIT]);
+    let (after_restart, _) = turn(&mut restarted, &graph, &items, &opts);
+    let (without, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&after_restart).len(), 1, "the older pack is retired");
+    assert_eq!(after_restart, without, "the same bytes with or without a restart");
+    assert_eq!(restarted.saved.contexts_retired, 1);
+
+    // A later request after one more restart keeps them.
+    let mut again = Session::default();
+    again.restore(restarted.ledger().clone());
+    let (later, _) = turn(&mut again, &graph, &items, &opts);
+    assert_eq!(later, without);
+    assert_eq!(again.saved.contexts_retired, 0);
+}
+
+#[test]
+fn after_a_compaction_a_message_about_a_retired_packs_code_gets_a_pack() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    two_turns(&mut session, &graph, &root, &opts);
+    let mut items = compacted(&root, &[ABOUT_ROUTES, ABOUT_AUDIT]);
+    let (fourth, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&fourth).len(), 1);
+    assert!(
+        !fourth.iter().any(|i| i.to_string().contains("orders_api/routes.py")),
+        "the retired pack's file is named nowhere"
+    );
+    let ledger = session.ledger().clone();
+
+    items.push(message("create_order must validate the payload total too"));
+    let (fifth, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(fifth[..fourth.len()], fourth[..], "the cached prefix must not change");
+    assert_eq!(packs(&fifth).len(), 2, "the retired pack's code is not in the request");
+    let new = pack_text(fifth.last().unwrap()).expect("a pack after the new message");
+    assert!(new.contains("orders_api/routes.py"), "{new}");
+
+    // Decided from the items before the message: a restart gives the same.
+    let mut restarted = Session::default();
+    restarted.restore(ledger);
+    let (again, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, fifth);
+}
+
+#[test]
+fn a_copy_of_a_message_gets_no_second_pack() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let budget = 1000;
+    let opts = Options {
+        pack_conversation_budget: budget,
+        ..Options::default()
+    };
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    let ledger = session.ledger().clone();
+    items.push(exec_call("c1", "git status", &root));
+    items.push(exec_output("c1", "On branch main\n"));
+    items.push(message(ABOUT_ROUTES));
+    let (second, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(second[..first.len()], first[..], "the cached prefix must not change");
+    assert_eq!(second[first.len()..], items[2..], "the copy gets none");
+    assert!(seen.added_present as usize <= budget, "{}", seen.added_present);
+    let (again, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(again, second);
+
+    // A conversation of an older version, where a copy got its text's pack,
+    // keeps doing so: its bytes replay.
+    let mut older = ledger;
+    older.no_pack_for_copies = false;
+    let mut restarted = Session::default();
+    restarted.restore(older);
+    let (old, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(old[..first.len()], first[..]);
+    assert_eq!(packs(&old).len(), 2, "the copy replays the pack");
 }

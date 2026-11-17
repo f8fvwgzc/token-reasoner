@@ -87,6 +87,12 @@ pub struct ParsedSession {
     /// The last message the agent wrote; empty when it wrote none.
     pub final_message: String,
     pub turns: u32,
+    /// The label of a thread Codex ran in the background (an approval review,
+    /// a title, a compaction, a memory consolidation), from the rollout's
+    /// first `session_meta` line; `None` for a thread someone worked in (see
+    /// [`background_session`]).
+    #[serde(default)]
+    pub background: Option<String>,
 }
 
 impl ParsedSession {
@@ -109,8 +115,63 @@ impl ParsedSession {
             },
             final_message: or(self.final_message, &other.final_message),
             turns: self.turns.max(other.turns),
+            background: self.background.or_else(|| other.background.clone()),
         }
     }
+}
+
+/// Characters of a background label kept.
+const BACKGROUND_LABEL_CHARS: usize = 40;
+
+/// The label of a thread Codex runs in the background, by its thread source
+/// (`thread_source` in a rollout's `session_meta` and in a request's turn
+/// metadata; codex-rs/protocol/src/protocol.rs `ThreadSource`): a task title
+/// and a recap (the TUI's temporary threads, sources `thread_title` and
+/// `system`), the approval reviewer, a memory consolidation. `None` for any
+/// other source (`user`, `subagent`, another feature).
+pub fn background_thread_source(thread_source: &str) -> Option<&'static str> {
+    match thread_source.trim() {
+        "thread_title" => Some("title"),
+        "system" => Some("recap"),
+        "guardian_review" => Some("guardian"),
+        "memory_consolidation" => Some("memory_consolidation"),
+        _ => None,
+    }
+}
+
+/// The label of a thread Codex ran in the background, from its rollout's
+/// `session_meta` payload, or `None` for a thread someone worked in.
+/// Background: a thread source [`background_thread_source`] names; a
+/// sub-agent `source` other than a spawned agent (`thread_spawn`): `review`,
+/// `compact`, `memory_consolidation`, or another by name (`guardian` for the
+/// approval reviewer); an internal `source` (`guardian`,
+/// `memory_consolidation`). The shapes are those of codex-rs's
+/// `SessionSource`: `"cli"`, `{"subagent":"review"}`,
+/// `{"subagent":{"other":"guardian"}}`, `{"internal":"guardian"}`, ...
+pub fn background_session(payload: &Value) -> Option<String> {
+    if let Some(label) = background_thread_source(text(payload, "thread_source")) {
+        return Some(label.to_string());
+    }
+    let cut = |s: &str| -> String {
+        let s = s.trim();
+        if s.is_empty() {
+            "subagent".to_string()
+        } else {
+            s.chars().take(BACKGROUND_LABEL_CHARS).collect()
+        }
+    };
+    let source = payload.get("source")?.as_object()?;
+    if let Some(sub) = source.get("subagent") {
+        return match sub {
+            Value::String(s) => Some(cut(s)),
+            Value::Object(o) if o.contains_key("thread_spawn") => None,
+            Value::Object(o) => Some(cut(o.get("other").and_then(Value::as_str).unwrap_or(""))),
+            _ => Some(cut("")),
+        };
+    }
+    source
+        .get("internal")
+        .map(|internal| cut(internal.as_str().unwrap_or("internal")))
 }
 
 /// Parses a `codex exec --json` event stream or the text of a rollout file.
@@ -483,6 +544,9 @@ struct Scan {
     threads: BTreeMap<String, ThreadUsage>,
     turns_started: u32,
     turns_ended: u32,
+    /// The first `session_meta` line was read: it describes the thread itself.
+    meta_seen: bool,
+    background: Option<String>,
 }
 
 impl Scan {
@@ -516,6 +580,10 @@ impl Scan {
                 // when the thread is a sub-agent, so it is only a fallback.
                 self.enter_thread(text(payload, "id"));
                 self.set_session_id(text(payload, "session_id"));
+                if !self.meta_seen {
+                    self.meta_seen = true;
+                    self.background = background_session(payload);
+                }
             }
             "turn_context" => self.turn_context(payload),
             "token_usage_record" => {
@@ -611,6 +679,7 @@ impl Scan {
             // A turn that was cut off has a start and no end; an old log may have
             // only the end. Either way it was one turn.
             turns: self.turns_started.max(self.turns_ended),
+            background: self.background,
         }
     }
 }
@@ -747,6 +816,7 @@ mod tests {
             usage: stream.usage,
             final_message: "from the rollout".to_string(),
             turns: 2,
+            background: None,
         };
         let merged = stream.clone().merged_with(&rollout);
         assert_eq!(merged.session_id, EXEC_ID, "the stream's own values stay");
@@ -1134,6 +1204,50 @@ mod tests {
             s.session_id, EXEC_ID,
             "no session_meta line: the id comes from the file name"
         );
+    }
+
+    #[test]
+    fn a_rollout_of_a_background_thread_is_labelled_from_its_session_meta() {
+        let label = |meta: &str| {
+            parse_codex_jsonl(&format!(
+                "{{\"type\":\"session_meta\",\"payload\":{meta}}}\n{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"later\",\"source\":{{\"subagent\":\"review\"}}}}}}"
+            ))
+            .background
+        };
+        // The approval reviewer (codex-rs/state/src/extract.rs is_guardian_review_source).
+        assert_eq!(
+            label(r#"{"id":"t","source":{"subagent":{"other":"guardian"}}}"#).as_deref(),
+            Some("guardian")
+        );
+        assert_eq!(
+            label(r#"{"id":"t","source":{"subagent":"review"}}"#).as_deref(),
+            Some("review")
+        );
+        assert_eq!(
+            label(r#"{"id":"t","source":{"subagent":"compact"}}"#).as_deref(),
+            Some("compact")
+        );
+        assert_eq!(
+            label(r#"{"id":"t","source":{"internal":"memory_consolidation"}}"#).as_deref(),
+            Some("memory_consolidation")
+        );
+        assert_eq!(
+            label(r#"{"id":"t","source":"vscode","thread_source":"guardian_review"}"#).as_deref(),
+            Some("guardian")
+        );
+        assert_eq!(
+            label(r#"{"id":"t","source":"cli","thread_source":"thread_title"}"#).as_deref(),
+            Some("title")
+        );
+        // Threads someone works in; only the first line describes the thread.
+        for meta in [
+            r#"{"id":"t","source":"cli"}"#,
+            r#"{"id":"t","source":"vscode","thread_source":"user"}"#,
+            r#"{"id":"t","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p","depth":1}}},"thread_source":"subagent"}"#,
+            r#"{"id":"t"}"#,
+        ] {
+            assert_eq!(label(meta), None, "{meta}");
+        }
     }
 
     #[test]

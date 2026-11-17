@@ -917,6 +917,10 @@ fn old_settings_load_with_the_skeleton_mapped() {
     assert_eq!(settings["rules"]["check"], "on");
     assert_eq!(settings["rules"]["noise"], "shadow");
     assert_eq!(settings["holdout_share"], 0.0);
+    assert_eq!(
+        settings["pack_conversation_budget"], 3000,
+        "a missing key takes its default"
+    );
     assert_eq!(status["settings_error"], Value::Null);
     // An older client that changes only shorten_reads, sending the rest back.
     let mut back = settings.clone();
@@ -1598,4 +1602,567 @@ fn only_this_daemons_own_pages_may_drive_it() {
         );
         assert_eq!(status, 200, "{origin}");
     }
+}
+
+// ------------------------------------------------- background requests, pack cost, long sessions
+
+const ABOUT_ROUTES: &str = "create_order must validate the payload";
+const ABOUT_AUDIT: &str = "record the delivery of the email in the audit log";
+const ABOUT_MAILER: &str = "sendEmail should retry on a timeout";
+
+/// The desktop app's prompt for a task's title, with the task after it.
+fn title_prompt(task: &str) -> String {
+    format!("You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\n\nThe user prompt:\n{task}")
+}
+
+impl Running {
+    /// A Responses request with `headers` added; what the provider received.
+    fn send_with(&self, body: &Value, headers: &[(&str, &str)]) -> Value {
+        let mut all = vec![("authorization", "Bearer k"), ("content-type", "application/json")];
+        all.extend_from_slice(headers);
+        let (status, _, _) = self.post("/v1/responses", &serde_json::to_vec(body).unwrap(), &all);
+        assert_eq!(status, 200);
+        serde_json::from_slice(&self.last().3).unwrap()
+    }
+}
+
+/// The status row of the session `id`.
+fn session_row(status: &Value, id: &str) -> Value {
+    status["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("no session {id}: {status}"))
+        .clone()
+}
+
+#[test]
+fn codex_background_requests_get_no_pack_and_are_counted_by_label() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    // Every new conversation would be held out; a background one never is.
+    r.api("/lge/api/settings", &json!({ "holdout_share": 1.0 }));
+    let shortened = |sent: &Value| sent["input"][3]["output"].as_str().unwrap().contains("Output:\nok");
+
+    // Codex's sub-agent header.
+    let guardian = r.send_with(
+        &request_body(&cwd, "bg-header", ABOUT_ROUTES),
+        &[("x-openai-subagent", "guardian")],
+    );
+    assert!(!has_context(&guardian), "no pack: {guardian}");
+    assert!(shortened(&guardian), "the rules apply as usual: {guardian}");
+    // The same key in the body's client metadata.
+    let mut metadata = request_body(&cwd, "bg-meta", ABOUT_ROUTES);
+    metadata["client_metadata"] = json!({ "x-openai-subagent": "review" });
+    let review = r.send_with(&metadata, &[]);
+    assert!(!has_context(&review) && shortened(&review), "{review}");
+    // The approval reviewer's model.
+    let mut model = request_body(&cwd, "bg-model", ABOUT_ROUTES);
+    model["model"] = json!("codex-auto-review");
+    let reviewer = r.send_with(&model, &[]);
+    assert!(!has_context(&reviewer) && shortened(&reviewer), "{reviewer}");
+    // The desktop app's title prompt.
+    let titled = r.send_with(&request_body(&cwd, "bg-title", &title_prompt(ABOUT_ROUTES)), &[]);
+    assert!(!has_context(&titled) && shortened(&titled), "{titled}");
+    // A later request of a background session gets none either.
+    let mut next = request_body(&cwd, "bg-header", ABOUT_ROUTES);
+    next["input"].as_array_mut().unwrap().push(user(ABOUT_AUDIT));
+    let later = r.send_with(&next, &[("x-openai-subagent", "guardian")]);
+    assert!(!has_context(&later), "{later}");
+
+    // A spawned agent does real work: a conversation like any other.
+    r.api("/lge/api/settings", &json!({ "holdout_share": 0.0 }));
+    let spawned = r.send_with(
+        &request_body(&cwd, "spawned", ABOUT_ROUTES),
+        &[("x-openai-subagent", "collab_spawn")],
+    );
+    assert!(has_context(&spawned), "{spawned}");
+
+    let status = r.json("/lge/api/status");
+    for (id, label) in [
+        ("bg-header", "guardian"),
+        ("bg-meta", "review"),
+        ("bg-model", "guardian"),
+        ("bg-title", "title"),
+    ] {
+        let s = session_row(&status, id);
+        assert_eq!(
+            (s["mode"].as_str(), s["background"].as_str()),
+            (Some("proxy-background"), Some(label)),
+            "{s}"
+        );
+        assert_eq!(s["outputs_shortened"], 1, "{s}");
+        assert_eq!(s["packs_added"], 0, "{s}");
+    }
+    assert_eq!(
+        session_row(&status, "bg-header")["input_tokens"],
+        2400,
+        "the usage is recorded"
+    );
+    let spawned = session_row(&status, "spawned");
+    assert_eq!(
+        (spawned["mode"].as_str(), spawned["background"].as_str()),
+        (Some("proxy"), None)
+    );
+    let by_label: Vec<(&str, u64, u64)> = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["label"].as_str().unwrap(),
+                b["sessions"].as_u64().unwrap(),
+                b["requests"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_label,
+        [("guardian", 2, 3), ("review", 1, 1), ("title", 1, 1)],
+        "{}",
+        status["background"]
+    );
+    // Left out of the holdout comparison and the before-and-after numbers.
+    assert_eq!(status["holdout"]["proxy"]["sessions"], 1);
+    assert_eq!(status["holdout"]["holdout"]["sessions"], 0);
+    let modes: Vec<&str> = status["modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["mode"].as_str().unwrap())
+        .collect();
+    assert_eq!(modes, ["proxy"]);
+    assert_eq!(status["packs"]["added"], 1);
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("x.background") && page.contains("s.background"));
+}
+
+#[test]
+fn the_pack_budget_is_a_setting_that_bounds_what_packs_add() {
+    let r = start();
+    assert_eq!(Settings::default().pack_conversation_budget, 3000);
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["settings"]["pack_conversation_budget"], 3000);
+    assert_eq!(status["long_sessions"]["note"], Value::Null, "no long session, no note");
+    let saved = r.api("/lge/api/settings", &json!({ "pack_conversation_budget": 250 }));
+    assert_eq!(saved["pack_conversation_budget"], 250);
+    let file: Value =
+        serde_json::from_str(&std::fs::read_to_string(r.dir.path().join("data/daemon.json")).unwrap()).unwrap();
+    assert_eq!(file["settings"]["pack_conversation_budget"], 250);
+    r.add_repo();
+    let sent = r.send_with(
+        &request_body(&r.repo.join("orders_api"), "conv-budget", ABOUT_ROUTES),
+        &[],
+    );
+    assert!(!has_context(&sent), "no room for a pack: {sent}");
+    let status = r.json("/lge/api/status");
+    assert_eq!(
+        (
+            status["packs"]["added"].as_u64(),
+            status["packs"]["over_budget"].as_u64()
+        ),
+        (Some(0), Some(1)),
+        "{}",
+        status["packs"]
+    );
+    assert_eq!(session_row(&status, "conv-budget")["packs_over_budget"], 1);
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("pack_conversation_budget"));
+}
+
+#[test]
+fn a_compaction_retires_old_packs_and_the_monitor_calls_it_the_clients_break() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    let environment = user(&format!(
+        "<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
+        cwd.display()
+    ));
+    let body = |items: &[Value]| json!({ "model": "gpt-test", "prompt_cache_key": "conv-compact", "input": items, "stream": true });
+    let call = |id: &str| {
+        [
+            json!({ "type": "function_call", "name": "shell", "call_id": id, "arguments": json!({ "command": ["bash", "-lc", "git status"] }).to_string() }),
+            json!({ "type": "function_call_output", "call_id": id, "output": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nOn branch main\n" }),
+        ]
+    };
+    let forwarded = |sent: &Value| sent["input"].as_array().unwrap().clone();
+
+    // Two turns: a pack, a follow-up pack.
+    let mut items = vec![environment.clone(), user(ABOUT_ROUTES)];
+    let first = forwarded(&r.send_with(&body(&items), &[]));
+    items.extend(call("c1"));
+    items.push(user(ABOUT_AUDIT));
+    let second = forwarded(&r.send_with(&body(&items), &[]));
+    assert_eq!(second[..first.len()], first[..], "the cached prefix must not change");
+    let audit_pack = second.last().unwrap().clone();
+    assert!(has_context(&audit_pack));
+
+    // Codex compacts in the middle of the turn (codex-rs/core/src/compact.rs):
+    // the user messages it keeps, the initial context before the last of them,
+    // and its summary. The first pack goes, the newest message keeps its own.
+    let mut items = vec![
+        user(ABOUT_ROUTES),
+        environment,
+        user(ABOUT_AUDIT),
+        user("Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary:\nhalf done."),
+    ];
+    let fourth = forwarded(&r.send_with(&body(&items), &[]));
+    assert_eq!(fourth[..3], items[..3]);
+    assert_eq!(fourth[3], audit_pack, "the newest message's pack, the same bytes");
+    assert_eq!(fourth.len(), items.len() + 1);
+
+    // Two more turns: every byte sent before is sent again.
+    items.extend(call("c3"));
+    items.push(user("ok, do it"));
+    let fifth = forwarded(&r.send_with(&body(&items), &[]));
+    assert_eq!(fifth[..fourth.len()], fourth[..], "the cached prefix must not change");
+    items.push(user(ABOUT_MAILER));
+    let sixth = forwarded(&r.send_with(&body(&items), &[]));
+    assert_eq!(sixth[..fifth.len()], fifth[..], "the cached prefix must not change");
+    assert!(
+        has_context(sixth.last().unwrap()),
+        "a pack about a file not seen before"
+    );
+
+    let status = r.json("/lge/api/status");
+    assert_eq!(
+        (
+            status["prefix"]["lge_breaks"].as_u64(),
+            status["prefix"]["client_breaks"].as_u64()
+        ),
+        (Some(0), Some(1)),
+        "the compaction is the client's break: {}",
+        status["prefix"]
+    );
+    let row = session_row(&status, "conv-compact");
+    assert_eq!(
+        (row["packs_added"].as_u64(), row["packs_retired"].as_u64()),
+        (Some(3), Some(1)),
+        "{row}"
+    );
+    assert_eq!(status["packs"]["retired"], 1);
+}
+
+#[test]
+fn long_sessions_are_named_in_a_note_under_the_table() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let now = lge_retrieve::unix_now();
+        let record = |id: &str, mode: &str, requests: u64, mean: i64| UsageRecord {
+            id: id.to_string(),
+            task_id: id.to_string(),
+            session_id: id.to_string(),
+            task: format!("task {id}"),
+            mode: mode.to_string(),
+            started_at: now - 600,
+            finished_at: now - 60,
+            input_tokens: mean * requests as i64,
+            monitor: json!({ "requests": requests }).to_string(),
+            ..UsageRecord::default()
+        };
+        for rec in [
+            record("long", "proxy", 50, 150_001),
+            record("at-the-limit", "proxy", 50, 150_000),
+            record("few-requests", "proxy", 49, 400_000),
+            record("background", "proxy-background", 80, 300_000),
+        ] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    let long = &status["long_sessions"];
+    let named: Vec<&str> = long["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(named, ["long"], "{long}");
+    assert_eq!(long["sessions"][0]["mean_input_tokens"], 150_001);
+    assert_eq!(
+        (long["min_requests"].as_u64(), long["min_mean_input_tokens"].as_u64()),
+        (Some(50), Some(150_000))
+    );
+    let note = long["note"].as_str().expect("a note");
+    assert!(
+        note.contains("model_auto_compact_token_limit") && note.contains("~/.codex/config.toml"),
+        "{note}"
+    );
+    // Every row shows its requests and the mean input per request.
+    let few = session_row(&status, "few-requests");
+    assert_eq!(
+        (few["requests"].as_u64(), few["mean_input_tokens"].as_i64()),
+        (Some(49), Some(400_000))
+    );
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("long_sessions") && page.contains("mean_input_tokens"));
+}
+
+#[test]
+fn codex_temporary_threads_are_background_by_their_thread_source() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    // The TUI's task title (codex-rs/tui/src/app/thread_title.rs): its own
+    // prompt, no sub-agent header, the thread source in the turn metadata header.
+    let prompt =
+        format!("Generate a concise, single-line task title of at most 36 characters.\n\nUser prompt:\n{ABOUT_ROUTES}");
+    let title = r.send_with(
+        &request_body(&cwd, "tui-title", &prompt),
+        &[(
+            "x-codex-turn-metadata",
+            r#"{"turn_id":"t1","thread_source":"thread_title"}"#,
+        )],
+    );
+    assert!(!has_context(&title), "no pack: {title}");
+    // A recap (thread source `system`), named in the body's client metadata.
+    let mut recap = request_body(&cwd, "tui-recap", ABOUT_ROUTES);
+    recap["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"thread_source":"system"}"# });
+    let recap = r.send_with(&recap, &[]);
+    assert!(!has_context(&recap), "no pack: {recap}");
+    // A thread someone works in.
+    let mut work = request_body(&cwd, "tui-work", ABOUT_ROUTES);
+    work["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"thread_source":"user"}"# });
+    assert!(has_context(&r.send_with(&work, &[])));
+
+    let status = r.json("/lge/api/status");
+    for (id, mode, label) in [
+        ("tui-title", "proxy-background", Some("title")),
+        ("tui-recap", "proxy-background", Some("recap")),
+        ("tui-work", "proxy", None),
+    ] {
+        let s = session_row(&status, id);
+        assert_eq!(
+            (s["mode"].as_str(), s["background"].as_str()),
+            (Some(mode), label),
+            "{s}"
+        );
+    }
+}
+
+#[test]
+fn past_background_threads_are_left_out_of_before_and_after() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("codex");
+    let day = home.join("sessions/2026/11/01");
+    std::fs::create_dir_all(&day).unwrap();
+    // Rollouts as Codex writes them: session_meta (codex-rs/protocol SessionMeta), then usage.
+    let rollout = |id: &str, meta: Value| {
+        let mut payload = json!({ "id": id });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(meta.as_object().unwrap().clone());
+        format!(
+            "{}\n{}\n",
+            json!({ "type": "session_meta", "payload": payload }),
+            json!({ "type": "event_msg", "payload": { "type": "token_count", "info": { "total_token_usage": { "input_tokens": 9000, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 1 } } } })
+        )
+    };
+    for (n, (id, meta)) in [
+        ("main-1", json!({ "source": "cli" })),
+        ("spawned-1", json!({ "source": { "subagent": { "thread_spawn": { "parent_thread_id": "main-1", "depth": 1 } } }, "thread_source": "subagent" })),
+        ("guard-1", json!({ "source": { "subagent": { "other": "guardian" } } })),
+        ("review-1", json!({ "source": { "subagent": "review" } })),
+        ("memory-1", json!({ "source": "cli", "thread_source": "memory_consolidation" })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(
+            day.join(format!("rollout-2026-11-01T00-00-0{n}-{id}.jsonl")),
+            rollout(id, meta),
+        )
+        .unwrap();
+    }
+    let mut cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    cfg.codex_home = Some(home);
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let agent = plain_agent();
+    let imported: Value = serde_json::from_slice(
+        &agent
+            .post(format!("http://{}/lge/api/import-history", s.addr))
+            .header("content-type", "application/json")
+            .send("{}")
+            .unwrap()
+            .into_body()
+            .read_to_vec()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (imported["imported"].as_u64(), imported["background"].as_u64()),
+        (Some(2), Some(3)),
+        "{imported}"
+    );
+    // The approval reviewer through the proxy is left out the same way.
+    let mut body = request_body(Path::new("/somewhere/else"), "guard-2", "review this command");
+    body["model"] = json!("codex-auto-review");
+    send_to(&agent, s.addr, &body);
+    let status = status_of(&agent, s.addr);
+    let modes: Vec<(&str, u64)> = status["modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["mode"].as_str().unwrap(), m["sessions"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(modes, [("history", 2)], "{}", status["modes"]);
+}
+
+#[test]
+fn held_out_sessions_are_not_counted_in_the_pack_totals() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    r.api("/lge/api/settings", &json!({ "holdout_share": 1.0 }));
+    let mut body = request_body(&cwd, "held-out", ABOUT_ROUTES);
+    assert!(!has_context(&r.send_with(&body, &[])));
+    body["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(user("create_order must also validate the payload size"));
+    assert!(!has_context(&r.send_with(&body, &[])));
+    let status = r.json("/lge/api/status");
+    let packs = &status["packs"];
+    assert_eq!(
+        (
+            packs["added"].as_u64(),
+            packs["known"].as_u64(),
+            packs["over_budget"].as_u64(),
+            packs["holdout_would_add"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0), Some(1)),
+        "{packs}"
+    );
+    assert_eq!(session_row(&status, "held-out")["mode"], "proxy-holdout");
+}
+
+#[test]
+fn a_background_session_from_before_its_label_leaves_the_holdout_arm() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    let agent = plain_agent();
+    let mut body = request_body(Path::new("/somewhere/else"), "old-guard", "review this command");
+    let _slot = Slot::take();
+    // Served by a daemon that did not tell background requests apart: a
+    // held-out session without a label and without a pack.
+    {
+        let first = Serving::start(Daemon::open(cfg.clone()).unwrap());
+        let settings = json!({ "holdout_share": 1.0 }).to_string();
+        let response = agent
+            .post(format!("http://{}/lge/api/settings", first.addr))
+            .header("content-type", "application/json")
+            .send(settings)
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        send_to(&agent, first.addr, &body);
+        let status = status_of(&agent, first.addr);
+        assert_eq!(session_row(&status, "old-guard")["mode"], "proxy-holdout");
+    }
+    // After the restart its next request is the reviewer's.
+    let second = Serving::start(Daemon::open(cfg).unwrap());
+    body["input"].as_array_mut().unwrap().push(user("and this one"));
+    body["model"] = json!("codex-auto-review");
+    send_to(&agent, second.addr, &body);
+    let status = status_of(&agent, second.addr);
+    let row = session_row(&status, "old-guard");
+    assert_eq!(
+        (row["mode"].as_str(), row["background"].as_str()),
+        (Some("proxy-background"), Some("guardian")),
+        "{row}"
+    );
+    assert_eq!(status["holdout"]["holdout"]["sessions"], 0, "{}", status["holdout"]);
+}
+
+#[test]
+fn the_long_session_note_counts_requests_as_the_table_does() {
+    // The provider fails the request: no usage, so the stored record keeps 49 requests.
+    let failing = provider_with(Box::new(|_, _, _| {
+        (500, r#"{"error":{"type":"server_error","message":"boom"}}"#.to_string())
+    }));
+    let r = start_with(failing, |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let now = lge_retrieve::unix_now();
+        store
+            .put_usage(&UsageRecord {
+                id: lge_core::stable_id(&["session", "long-thread"]),
+                task_id: "long-thread".to_string(),
+                session_id: "long-thread".to_string(),
+                task: "a long task".to_string(),
+                mode: "proxy".to_string(),
+                started_at: now - 600,
+                finished_at: now - 60,
+                input_tokens: 50 * 200_000,
+                monitor: json!({ "requests": 49 }).to_string(),
+                ..UsageRecord::default()
+            })
+            .unwrap();
+    });
+    let body = request_body(Path::new("/somewhere/else"), "long-thread", "run the tests");
+    let (status, _, _) = r.post(
+        "/v1/responses",
+        &serde_json::to_vec(&body).unwrap(),
+        &[("authorization", "Bearer k"), ("thread-id", "long-thread")],
+    );
+    assert_eq!(status, 500);
+    let status = r.json("/lge/api/status");
+    let row = session_row(&status, "long-thread");
+    assert_eq!(
+        (row["requests"].as_u64(), row["mean_input_tokens"].as_i64()),
+        (Some(50), Some(200_000))
+    );
+    let named: Vec<(&str, u64)> = status["long_sessions"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap(), s["requests"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(named, [("long-thread", 50)], "{}", status["long_sessions"]);
+    let note = status["long_sessions"]["note"].as_str().unwrap();
+    assert!(!note.contains('`'), "the page shows the note as text: {note}");
+}
+
+#[test]
+fn the_request_for_a_compactions_summary_gets_no_new_pack_and_is_counted_apart() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    let mut body = request_body(&cwd, "conv-summary", ABOUT_ROUTES);
+    let first = r.send_with(&body, &[]);
+    assert!(has_context(&first));
+    // Codex asks for the summary in the conversation itself
+    // (codex-rs/core/src/compact.rs): the history and its prompt, with the
+    // turn metadata's request kind, and no sub-agent header.
+    body["input"].as_array_mut().unwrap().push(user(ABOUT_AUDIT));
+    body["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"request_kind":"compaction"}"# });
+    let summary = r.send_with(&body, &[]);
+    let sent = summary["input"].as_array().unwrap();
+    let before = first["input"].as_array().unwrap();
+    assert_eq!(sent[..before.len()], before[..], "the cached prefix must not change");
+    assert_eq!(sent.len(), before.len() + 1, "no new pack: {summary}");
+
+    let status = r.json("/lge/api/status");
+    let row = session_row(&status, "conv-summary");
+    assert_eq!(
+        (row["mode"].as_str(), row["background"].as_str()),
+        (Some("proxy"), None)
+    );
+    let compaction: Vec<(u64, u64)> = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["label"] == "compaction")
+        .map(|b| (b["sessions"].as_u64().unwrap(), b["requests"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(compaction, [(0, 1)], "{}", status["background"]);
 }

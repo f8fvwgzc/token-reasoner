@@ -202,7 +202,9 @@ outputs), `rollout_files` (the session files of the last days, archived ones inc
 (`proxy`, `proxy-holdout`) by per-session medians with `bootstrap_median_diff` (95%
 interval, 2,000 resamples, xorshift64* with a fixed seed), and only from 30 sessions per
 arm (`MIN_ARM_SESSIONS`); `bootstrap_interval` is the same resampling for any statistic,
-which `lge ab` uses for its interval clustered by task.
+which `lge ab` uses for its interval clustered by task. Sessions of Codex's background
+requests (`proxy-background`) are in neither arm, and `background_session` and
+`background_thread_source` tell such threads apart in rollouts and turn metadata.
 
 ## lge-filter
 

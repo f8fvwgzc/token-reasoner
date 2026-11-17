@@ -1,6 +1,71 @@
 # Changelog
 
-## Unreleased
+## v0.0.3 (2026-11-17)
+
+Packs cost less in long conversations, and Codex's background requests no longer get
+them. lge still never changes the model, the reasoning level, the system prompt, tool
+definitions, reasoning items, tool calls, patches or diffs, and never edits Codex's
+configuration. No saving is measured yet: the holdout arm and `lge ab` measure it.
+
+### Packs in long conversations
+
+A pack is re-sent on every later request, so its cost grows with the conversation. For a
+typed message seen for the first time:
+
+- **One budget per request.** The packs present in one request are at most
+  `pack_conversation_budget` tokens together (new setting, 3,000 by default, on the page
+  and in `daemon.json`), counted over the whole pack, frame and remembered facts
+  included. A new pack is built to fit in the room left, remembered facts dropped first;
+  with less than 300 tokens of room it is not added.
+- **Small follow-ups.** After a conversation's first pack, a pack is at most 600 tokens.
+- **Only something new.** A follow-up is added only when one of its starting points is in
+  a file that no tool call, tool output or pack before the message in the request named
+  (its whole repository-relative path). A message whose starting points are all in packs
+  already present gets none, and so does a copy of a message typed earlier in the same
+  request.
+- **Retired after a compaction.** When the client changes its history at or before a
+  message (a compaction, an edit, a rollback), that message's pack is no longer inserted,
+  unless it is the newest typed message's and still fits the budget. A retired pack stays
+  out for good. Items before the client's change keep every byte, so an edit or rollback
+  of the last turn keeps the packs of earlier messages; a compaction, which rewrites the
+  history from its first item, retires every older pack. The cache monitor counts it as
+  the client's break.
+- **Same bytes after a restart.** The ledger keeps each pack's size, which packs were
+  retired, and a hash of the client's items up to each message (hashes only), so a
+  restarted daemon rebuilds the same packs and retires the same ones, a compaction made
+  while it was down included. A ledger from v0.0.2 still loads; its conversations keep
+  their packs as before.
+- Codex's compaction summary is no longer taken for a message the user typed.
+
+### Codex's background requests
+
+- Requests of the approval reviewer, `/review`, task titles and recaps, and memory
+  consolidation are told apart by the `x-openai-subagent` header or `client_metadata`
+  (any sub-agent except a spawned agent, `collab_spawn`), the turn metadata's
+  `thread_source`, the `codex-auto-review` model, or the desktop app's title prompt.
+- They get no new pack. Their outputs are shortened as before, their usage is recorded
+  under their label, and their `serve.log` line names it.
+- A conversation that starts with one is a background session (`proxy-background`): never
+  held out, no pack, no router call, tagged on the page, and left out of the holdout
+  comparison, "Before and after" and the long-session note. The page counts background
+  sessions and requests by label.
+- "Import past Codex sessions" leaves out Codex's background threads, read from each
+  rollout's `session_meta`, and says how many.
+- The request for a compaction's summary (turn metadata `request_kind` `compaction`) gets
+  no new pack and is counted under `compaction`; its conversation stays what it was.
+
+### Counters and long sessions
+
+- The page and the status count packs added, not added as already known, not added for
+  the budget, and retired, per session and over the sessions not held out (what
+  held-out sessions would have added is shown apart). The counts survive a restart.
+- Each session shows its mean input tokens per request. A note names the sessions of 50
+  or more requests over 150,000 input tokens per request and says what makes requests
+  smaller: a new session per task, or a lower `model_auto_compact_token_limit` in
+  Codex's config, at the cost of Codex working from a summary. A report only; the
+  choice is yours.
+
+### Fixes
 
 - The page's folder picker starts at the home folder when nothing is typed (and no
   workspace limit is set), accepts `~/`, and shows the nearest existing folder with a
@@ -10,6 +75,14 @@
 - The warning about folders that searches would read names `.ignore` instead of
   `.gitignore` when the folder is not a git repository: `rg` does not read `.gitignore`
   there, so the old advice quieted the warning without changing any search.
+
+### Not verified
+
+- Background requests and the compacted history are recognised as Codex's source builds
+  them (codex-rs), and the title request by the desktop app's prompt, whose wording may
+  change; none of it is checked against a real Codex capture yet.
+- What the pack budget, the follow-up rules and the retirement save is unmeasured until
+  the holdout arm or `lge ab` measures it.
 
 ## v0.0.2 (2026-11-16)
 

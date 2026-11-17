@@ -11,8 +11,8 @@ Codex desktop app / Codex CLI  ->  lge on 127.0.0.1:8787  ->  OpenAI
 - the **owner of the graphs**: one database per folder you add, kept fresh;
 - the **graph tools** for the agent, over MCP on HTTP (`/mcp`);
 - a **page** (`/`) that shows input, cached, output and reasoning tokens per session,
-  what each rule did, the cache monitor, the fixed prefix, the holdout comparison and
-  the folders in the graph.
+  what each rule did, the packs, Codex's background requests, the cache monitor, the
+  fixed prefix, the holdout comparison and the folders in the graph.
 
 The model and the reasoning level are whatever the agent asked for. The proxy never
 changes them.
@@ -25,9 +25,9 @@ Only two kinds of item in the conversation, and nothing else in the body:
 - **a message the user typed**, after which one context item may be added: the evidence
   pack for that message, in `<lge_context>` tags, when it names a symbol or clearly
   matches one (a search hit that shares at least two words with it). Small talk gets
-  nothing, the same starting points are never added twice, at most 6 packs are added per
-  conversation, and a pack whose starting points are all in one file that nothing
-  outside it uses is at most 600 tokens (else the context budget, 1,500 by default).
+  nothing, and Codex's background requests get no new pack (see "Codex's background
+  requests"). When a pack is added, how large it is and how long it stays: "Packs: when
+  they are added and how long they stay".
 
 Never touched: the system prompt, tool definitions, reasoning items, tool calls
 (code-mode scripts included), patches, diffs, reads of a line range that does not start
@@ -124,6 +124,164 @@ proxy can read:
 - **`LGE_RAW=1 <command>`** is never shortened, in a chain too. Codex matches its saved
   approvals against the start of a command, so a command that starts with `LGE_RAW=1` may
   not match an approval saved for the command alone and may ask again.
+
+## Packs: when they are added and how long they stay
+
+A pack is one context item, a user message in `<lge_context>` tags placed right after the
+typed message it is for: what the code graph says about the message (its conclusions
+first, then the places to start from) and, when they fit, up to 300 tokens of remembered
+facts (decisions, conventions, recent commits). Codex re-sends it on every later request,
+so a pack costs its tokens once per request after it, and a long conversation pays for
+its packs hundreds of times. The rules below bound that cost.
+
+### When a pack is added
+
+Decided once, the first time a typed message is seen in the conversation. A pack is added
+only when all of these hold (in brackets, what the page counts when that check fails):
+
+- "Add graph context" (`inject_context`) is on, and the request is neither one of Codex's
+  background requests nor the request for a compaction's summary (see "Codex's background
+  requests");
+- a graph of the repository Codex works in is ready; a message first seen while none is
+  gets no pack, for good;
+- the message is at most 8,000 bytes, and the conversation has had fewer than 6 packs;
+- the message names a symbol or clearly matches one (a search hit that shares at least
+  two words with it);
+- it is not a copy of a message typed earlier in the same request;
+- the packs present before it in the request do not already give all its starting points
+  ("already known");
+- those packs leave at least 300 tokens of `pack_conversation_budget` (3,000 by default)
+  ("over budget");
+- for a follow-up (any pack after the conversation's first), one of its starting points
+  is in a file that nothing before the message in the request named: no tool call's
+  arguments, no tool output as it was sent, no pack. A file counts as named when its
+  whole path relative to the repository root appears, not as part of a longer name
+  ("already known");
+- the pack fits in its size, at least without remembered facts ("over budget").
+
+Its size, counted over the whole item (its frame and remembered facts included): at most
+`context_budget` (1,500 by default), or 600 when its starting points are all in one file
+that nothing outside it uses; at most the room the packs before it leave in
+`pack_conversation_budget`; and, for a follow-up, at most 600. Remembered facts are left
+out first when they do not fit.
+
+In a held-out conversation a pack is decided the same way and counted as one it would
+have added, and never added; such packs take no room in the budget.
+
+### How long a pack stays
+
+A pack is sent again, with the same bytes and at the same place, on every later request
+while the history keeps its prefix up to its message, whatever the settings say by then.
+It is retired, no longer inserted for the rest of the conversation, when
+
+- the client changed an item at or before its message since the previous request (the
+  cache monitor's client break: a compaction, an edit, a rollback), or
+- after a restart, the hash of the client's items up to its message is not the one the
+  pack was last inserted with (the history changed while the daemon was down),
+
+unless its message is the newest typed message of the request and the pack still fits in
+`pack_conversation_budget` with the packs before it.
+
+Codex's compacted history (codex-rs/core/src/compact.rs: the user messages it keeps, the
+initial context before the last of them, its summary) differs from its first item on, so
+a compaction retires every older pack. An edit of the last message, a rollback of the
+last turns or a rewritten late output changes the history only from there: the packs of
+earlier messages keep being sent. Codex's compaction summary (it opens with "Another
+language model started to solve this problem") is not a typed message: it gets no pack
+and is never the newest message.
+
+A retired pack, or one whose message left the history, no longer counts as giving its
+starting points, so a later message about the same code may get a pack again.
+
+### Why this keeps the prompt cache
+
+- A message's pack is decided once, from the items before it in the request (the packs
+  present, the room they leave, the files named) and the conversation's packs so far,
+  then stored and replayed before the settings are read: a changed
+  `pack_conversation_budget`, `context_budget` or `inject_context` applies only to
+  messages seen afterwards.
+- A pack is retired only at or after the item where the client itself changed its
+  history. The provider's cache cannot match from there on anyway, so leaving the pack
+  out costs no cached token, and every item before it, packs included, keeps its bytes.
+  The newest message's pack, which may stay, is at or after that item too. The cache
+  monitor counts such a request as the client's break; any change lge made before the
+  client's break is counted as lge's (a bug).
+- After a restart, the ledger (see "Why the prompt cache keeps working") gives each pack
+  the size it was built to fit in, the packs retired, and a hash of the client's items up
+  to each message, so the daemon sends the same packs and retires the same ones as if it
+  had kept running.
+
+The page and the status count, over the sessions not held out and per session, the packs
+added, not added as already known, not added for the budget, and retired, and apart what
+held-out sessions would have added. The tokens of packs present in the requests are the
+session's "Added".
+
+## Codex's background requests
+
+Codex makes requests that no one works in: the approval reviewer, `/review`, task titles
+and recaps, memory consolidation. lge takes a request for one when
+
+- its `x-openai-subagent` header (or the same key of the body's `client_metadata`) names
+  a sub-agent other than `collab_spawn`: Codex sends `review`, `memory_consolidation`,
+  and `guardian` for the approval reviewer (an empty value is labelled `subagent`). A
+  spawned agent, `collab_spawn`, does real work and is a conversation like any other;
+- the `thread_source` of its turn metadata (`client_metadata["x-codex-turn-metadata"]`
+  or the `x-codex-turn-metadata` header, JSON) is `thread_title` (the TUI's task title,
+  label `title`), `system` (the TUI's recap, label `recap`), `guardian_review` (label
+  `guardian`) or `memory_consolidation`;
+- its model is `codex-auto-review` (any case), the reviewer's default model (label
+  `guardian`); or
+- its instructions, or one of its messages up to and including the first one the user
+  typed, open with the desktop app's title prompt ("You are a helpful assistant. You will
+  be presented with a user prompt, and your job is to provide a short title for a task
+  ...", label `title`).
+
+Such a request gets no new pack, and so no remembered facts; in a conversation that had
+packs before, those are sent again. The rules for tool output apply as usual, its usage
+is recorded, it is counted under its label, and its `serve.log` line ends with
+`(background: <label>)`.
+
+A conversation whose first request is a background one is a background session (record
+mode `proxy-background`, with its label): it is never held out, none of its requests gets
+a pack, the router's recommendation is not worked out for it, and it is left out of the
+holdout comparison, of "Before and after" and of the long-session note. The page tags it
+in the session table and counts background sessions and requests by label. A stored
+session with no label that never had a pack (one recorded by a version that did not tell
+background requests apart) becomes a background session, and leaves the holdout arm,
+when the first request it gets after the daemon starts is a background one; one that had
+packs keeps its arm.
+
+"Import past Codex sessions" leaves the same threads out of "Before and after": a rollout
+whose first `session_meta` names such a `thread_source`, a sub-agent source other than
+`thread_spawn` (`review`, `compact`, `memory_consolidation`, `guardian`, ...), or an
+internal source. It reports how many it left out.
+
+Codex's compactions are not background requests: codex-rs maps a `compact` sub-agent, but
+no request sends one. Codex asks for a compaction's summary within the conversation
+itself, with `request_kind` `compaction` in the turn metadata. That request gets no new
+pack (packs decided before are sent again) and is counted under the label `compaction`;
+the conversation stays what it was.
+
+## Long sessions
+
+The page shows each session's requests and its input tokens per request (its input
+tokens over its requests). Under the session table, a note names the sessions of the
+table, background ones left out, with at least 50 requests and more than 150,000 input
+tokens per request on average: every request of such a session re-sends that many
+tokens. The status gives the same list (`long_sessions`).
+
+It is a report only. lge never edits Codex's configuration; what to do is your choice.
+Two things make each request smaller:
+
+- a new session per task;
+- a lower `model_auto_compact_token_limit` in `~/.codex/config.toml`. Codex compacts a
+  conversation when its context reaches this limit (when it is not set, the model's own
+  limit), at most 90% of the model's context window, so a lower value compacts sooner and
+  keeps later requests smaller. The cost: after a compaction Codex works from its summary
+  and the messages it kept, not the whole history, so it may have to read files again;
+  each compaction is one more model request over the whole history; and the compacted
+  history is new to the provider's cache. At a compaction lge retires the packs of older
+  messages (see "How long a pack stays").
 
 ## Code mode
 
@@ -231,10 +389,12 @@ page. The file's settings are left as written until settings are saved from the 
 
 `holdout_share` (0 by default, from 0 to 1) holds out a share of new conversations: in
 them every rule runs in shadow and packs are decided and counted but not added, so the
-client's bytes are forwarded. A conversation is assigned once, when it is first seen, from
-the first 16 hex characters of the hash of its `prompt_cache_key` (which Codex shares
-between a parent and its sub-agents); a share of 1 holds out every conversation. The arm
-is stored with the session (`proxy` or `proxy-holdout`) and kept across restarts.
+client's bytes are forwarded. A conversation is assigned once, when it is first seen,
+from the first 16 hex characters of the hash of its `prompt_cache_key` (which Codex
+shares between a parent and its sub-agents); a share of 1 holds out every conversation.
+The arm is stored with the session (`proxy` or `proxy-holdout`) and kept across restarts.
+A background session (see "Codex's background requests") is never held out and is left
+out of the comparison.
 
 The page compares the two arms over the sessions of the last 30 days: per-session medians
 of input, cached, uncached, output and reasoning tokens, model requests, and tokens not
@@ -296,17 +456,26 @@ gets the same bytes. The remembered decision is looked up before the settings ar
 so switching a rule or the master switch changes only items seen afterwards. A pointer
 or a re-run sent whole depends only on earlier items of the same request, which never
 change. Context is inserted at the same place with the same text, and a typed message
-first seen while no graph is ready gets no pack, for good. Tests (`the cached prefix must
-not change`, `turning_shortening_off_mid_conversation_keeps_past_items`) hold this, and
-the cache monitor checks it on every request.
+first seen while no graph is ready gets no pack, for good. A pack is left out only at or
+after the item where the client itself changed its history, where the cache cannot match
+anyway (see "Packs: when they are added and how long they stay"). Tests (`the cached
+prefix must not change`, `turning_shortening_off_mid_conversation_keeps_past_items`,
+`after_a_compaction_older_packs_are_retired_and_every_other_byte_replays`,
+`an_edit_a_rollback_or_a_rewrite_late_in_the_history_keeps_every_byte_before_it`) hold
+this, and the cache monitor checks it on every request.
 
 The decisions are kept in memory, and each conversation's record keeps a ledger of
 them: for each item, the first 12 hex characters of its hash and the rules whose
-result was sent (for a typed message, whether a pack was added). After the daemon
-restarts, an item the ledger names is decided again with exactly those rules, whatever
-the settings say by then, and is not counted again. The result is the same unless the
-files changed in between (a pack or a skeleton is built from them); then that
-conversation pays one uncached turn.
+result was sent (for a typed message, whether a pack was added, the size it was built
+to fit in, a hash of the client's items up to the message when the pack was last
+inserted, and whether it was retired). After the daemon restarts, an item the ledger
+names is decided again with exactly those rules, whatever the settings say by then, and
+is not counted again; a pack is built again to the size it had. The result is the same
+unless what it is built from changed in between (the files for a pack or a skeleton, and
+for a pack also the remembered facts and `context_budget`); then that conversation pays
+one uncached turn. A ledger written by v0.0.2 still loads: its packs are built again
+without a size cap, as they were then, and a copy of an earlier message keeps getting
+its text's pack.
 
 ## Failing open
 
@@ -321,19 +490,24 @@ In the usage log (`usage.lbug` in the data directory), one record per conversati
 
 - token counts (input, cached, output, reasoning), the model name, the first typed
   message cut to 200 characters, the router's recommendation, the tokens of lge's packs,
-  timestamps, and the arm (`proxy` or `proxy-holdout`);
+  timestamps, and the arm (`proxy`, `proxy-holdout`, or `proxy-background` for Codex's
+  background requests);
 - per-rule counts: items, tokens before and after, the same in shadow, judged and
   recovered items, the skeleton cohorts (language and size band), and how many outputs
   arrived condensed by RTK;
 - monitor counts: cache breaks and the item index of the first one lge caused, retries,
-  cold restarts and their tokens, packs a held-out conversation would have added, model
-  requests, and the decision ledger above (hash prefixes and rule ids, no content);
+  cold restarts and their tokens, packs a held-out conversation would have added, packs
+  added, not added as already known or for the budget, and retired, model requests,
+  the background label and background requests by label, and the decision ledger above
+  (hash prefixes, rule ids, pack sizes, and for each pack a hash of the client's items
+  up to its message; no content);
 - two token totals: tokens not sent and tokens added, summed over every request.
 
 In `daemon.json`: the folders and the settings below, including demotions and their
 dates; `daemon.json.unreadable` only when the file could not be read. In `serve.log`: one
-line per model request without any content (sizes, status, usage), and lines for cache
-breaks lge caused, retries (status, error type and code) and demotions.
+line per model request without any content (sizes, status, usage, and the label of a
+background request), and lines for cache breaks lge caused, retries (status, error type
+and code) and demotions.
 
 Kept in memory only, never written: the request traces (below), the item hashes of the
 cache monitor, the tool list of the fixed-prefix report, and the results of replaying
@@ -350,11 +524,11 @@ never stored or logged. `lge ab` writes its own files in its work dir; see `docs
 
 | Endpoint | What it does |
 |---|---|
-| `GET /lge/api/status` | Settings, folders, sessions, rules with their counts and rates, cohorts, holdout comparison, cache monitor, fixed prefix, unused tools |
+| `GET /lge/api/status` | Settings, folders, sessions (with their background label, mean input per request and pack counts), rules with their counts and rates, cohorts, holdout comparison, cache monitor, fixed prefix, unused tools, packs (over the sessions not held out, with what held-out ones would have added), background requests by label, long sessions |
 | `POST /lge/api/settings` | Changes only the keys the JSON body names. `clear_demotion: "<rule>"` re-enables a demoted rule; `demoted` and `rule_since` in a body are ignored; an unknown rule id is ignored, an unknown mode is an error. Saving clears an unreadable-file warning |
 | `POST /lge/api/discover` | Replays the Codex sessions of the last 30 days through every rule, in memory |
 | `GET /lge/api/sessions/<thread-id>/requests` | The traces of one conversation, oldest first: per request its status, whether it was retried, the usage, the tokens lge added and removed, and its three largest new tool outputs (command cut to 120 characters, tokens, whether lge shortened it; no output text). Keyed by Codex's `thread-id` header, else the `prompt_cache_key`; the last 500 requests of the last 200 conversations, in memory |
-| `POST /lge/api/import-history` | Reads the token counts of past Codex sessions |
+| `POST /lge/api/import-history` | Reads the token counts of past Codex sessions, leaving out Codex's background threads |
 | `GET /lge/api/browse` | Folders under a path, for the folder picker |
 | `POST`/`DELETE /lge/api/repos` | Adds or removes a folder |
 
@@ -411,15 +585,16 @@ Optional, for the graph tools:
 ## Settings
 
 On the page, or `daemon.json` in the data directory. Every key may be missing: it then
-takes its default, so a file written by v0.0.1 still loads.
+takes its default, so a file written by v0.0.1 or v0.0.2 still loads.
 
 | Key | On the page | Default | Meaning |
 |---|---|---|---|
-| `inject_context` | Add graph context | `true` | The evidence pack after a typed message about the code |
+| `inject_context` | Add graph context | `true` | The evidence pack after a typed message about the code; never for Codex's background requests |
 | `shorten_outputs` | Apply the rules to tool output | `true` | The master switch of every rule; off, new items get no rule, not even in shadow |
 | `rules` | The rules table | `check`, `search_cap`, `repeat_pointer`, `inert`, `path_fold`, `json_minify`: `"on"`; `skeleton`, `line_clip`, `noise`, `lockfile`: `"shadow"`; `rerun_delta`, `read_delta`: `"shadow"` (measure only) | The mode of each rule: `"off"`, `"shadow"` or `"on"` |
 | `shorten_reads` | - | `false` | The older name of the skeleton switch: always `rules.skeleton == "on"`. In a file without `rules.skeleton`, `true` means `on` and `false` means `shadow` |
 | `context_budget` | - | `1500` | Tokens of one pack; a message about one file that nothing else uses gets at most 600 |
+| `pack_conversation_budget` | Tokens of graph context in one request | `3000` | Tokens of the packs present in one request together, each whole (frame and remembered facts included). A new pack is built to fit in the room the packs before it leave and is not added with less than 300 tokens of room, so a value under 300 adds no pack; a follow-up pack is at most 600. Packs already sent keep their bytes |
 | `auto_index` | Index a git repository the first time | `true` | A git repository inside the workspace is indexed the first time the agent works in it |
 | `holdout_share` | Holdout | `0` | The share of new conversations held out, from 0 to 1; any other value is 0 |
 | `demoted` | The rule's status | `{}` | Rules the recovery check moved to shadow, with the reason. Written by the daemon |
@@ -437,3 +612,11 @@ takes its default, so a file written by v0.0.1 still loads.
   sent, until their counts and recovery rates have been reviewed.
 - The terse-replies skill and the batch line of `lge init` are unmeasured until
   `lge ab --variant terse` and `--variant batch` measure them.
+- Background requests are told apart by what Codex's source sends (the sub-agent header
+  and `client_metadata`, the turn metadata's `thread_source` and `request_kind`, the
+  reviewer's model, a rollout's `session_meta` source) and by the desktop app's title
+  prompt, whose wording the app may change; the compacted history that retires packs is
+  built as Codex's source builds it.
+  None of it is checked against a real Codex capture yet. What the pack budget, the
+  follow-up rules and the retirement save is unmeasured until the holdout arm or
+  `lge ab` measures it.

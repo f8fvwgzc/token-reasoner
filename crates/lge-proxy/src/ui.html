@@ -73,7 +73,12 @@
 
   <section>
     <h2>Sessions through the proxy</h2>
-    <div class="card scroll"><table id="sessions"></table></div>
+    <div class="card">
+      <div class="scroll"><table id="sessions"></table></div>
+      <div class="warn" id="long_note" style="margin-top:10px" hidden></div>
+      <div class="dim" id="packs_line" style="margin-top:10px"></div>
+      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session</h3><div class="scroll"><table id="background"></table></div></div>
+    </div>
   </section>
 
   <section>
@@ -144,6 +149,8 @@
       <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
       <label class="switch"><input type="checkbox" id="s_shorten"> Apply the rules to tool output (each rule's own switch is in the table above)</label>
       <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
+      <span class="row"><span>Tokens of graph context in one request at most (every pack is re-sent on every later request):</span>
+        <input type="number" id="pack_conversation_budget" min="0" step="100"> <button id="pack_budget_save">Save</button></span>
     </div>
   </section>
 </main>
@@ -202,12 +209,25 @@ function render(s) {
       <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')
       : '<tr><td colspan="6" class="dim">No folder yet. Add one below, or start Codex in a git repository.</td></tr>');
 
-  $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}</div></td>
-      <td class="n">${n(x.requests)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
+  // Packs of a session, when it had any decision about one.
+  const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_retired)
+    ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} over budget, ${n(x.packs_retired)} retired` : '';
+  $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input / request</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${packsOf(x)}</div></td>
+      <td class="n">${n(x.requests)}</td><td class="n">${n(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
       <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
-      : '<tr><td colspan="10" class="dim">No session has gone through the proxy yet.</td></tr>');
+      : '<tr><td colspan="11" class="dim">No session has gone through the proxy yet.</td></tr>');
+  // Sessions whose every request re-sends a large input (a report: lge never edits Codex's configuration).
+  const ls = s.long_sessions || {};
+  const longList = ls.sessions || [];
+  $('long_note').hidden = !longList.length;
+  $('long_note').innerHTML = longList.length ? `${longList.map(l => `<b>${esc(l.task || l.id)}</b> (${n(l.requests)} requests, ${n(l.mean_input_tokens)} input tokens each on average)`).join(', ')}. ${esc(ls.note)}` : '';
+  const pk = s.packs || {};
+  $('packs_line').textContent = `Packs (sessions not held out): ${n(pk.added)} added, ${n(pk.known)} not added as already known, ${n(pk.over_budget)} not added for the conversation budget, ${n(pk.retired)} retired after a compaction; ${n(pk.tokens_sent)} tokens of packs sent over all requests. Held-out sessions would have added ${n(pk.holdout_would_add)}.`;
+  table('background', ['Label', '#Sessions', '#Requests', '#Input tokens of its sessions'],
+    (s.background || []).map(b => `<tr><td class="mono">${esc(b.label)}</td><td class="n">${n(b.sessions)}</td><td class="n">${n(b.requests)}</td><td class="n">${n(b.input_tokens)}</td></tr>`),
+    'No background request yet.');
 
   const err = $('settings_error');
   err.hidden = !s.settings_error; err.textContent = s.settings_error || '';
@@ -272,6 +292,7 @@ function render(s) {
   if (!settingsDirty) {
     $('s_inject').checked = s.settings.inject_context; $('s_shorten').checked = s.settings.shorten_outputs; $('s_auto').checked = s.settings.auto_index;
   }
+  if (document.activeElement !== $('pack_conversation_budget')) $('pack_conversation_budget').value = s.settings.pack_conversation_budget;
 }
 
 async function refresh() { try { render(await api('status')); } catch (e) { $('sub').textContent = 'not reachable: ' + e.message; } }
@@ -307,7 +328,7 @@ $('repos').onclick = async e => {
 };
 $('import').onclick = async () => {
   $('import').disabled = true;
-  try { const r = await api('import-history', 'POST', {}); say(`Imported ${r.imported} past sessions (${r.skipped} skipped, ${r.unreadable} unreadable).`, 'ok'); refresh(); }
+  try { const r = await api('import-history', 'POST', {}); say(`Imported ${r.imported} past sessions (${r.skipped} skipped, ${r.background || 0} of Codex's background threads left out, ${r.unreadable} unreadable).`, 'ok'); refresh(); }
   catch (e) { say(e.message, 'bad'); }
   $('import').disabled = false;
 };
@@ -325,6 +346,11 @@ $('rules').onchange = async e => {
 $('rules').onclick = async e => {
   const b = e.target.closest('button[data-enable]'); if (!b) return;
   try { await api('settings', 'POST', { clear_demotion: b.dataset.enable }); } catch (err) { say(err.message, 'bad'); }
+  refresh();
+};
+$('pack_budget_save').onclick = async () => {
+  const v = Math.max(0, Math.round(Number($('pack_conversation_budget').value) || 0));
+  try { await api('settings', 'POST', { pack_conversation_budget: v }); } catch (err) { say(err.message, 'bad'); }
   refresh();
 };
 $('holdout_save').onclick = async () => {

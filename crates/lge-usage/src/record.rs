@@ -88,6 +88,7 @@ mod tests {
             },
             final_message: "done".to_string(),
             turns: 1,
+            background: None,
         }
     }
 

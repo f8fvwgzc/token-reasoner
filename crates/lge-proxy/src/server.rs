@@ -13,7 +13,10 @@
 //!   first typed message cut to 200 characters, and the decisions needed to
 //!   repeat a rewrite (in memory).
 
-use crate::responses::{inspect, transform, OutputFact, Seen, Usage, UsageScanner};
+use crate::responses::{
+    background_label, compaction_request, inspect, transform, OutputFact, Seen, Usage, UsageScanner, SUBAGENT_HEADER,
+    TURN_METADATA_HEADER,
+};
 use crate::rules::{
     CohortStats, Mode, RuleId, RuleKind, RuleModes, RuleStats, DEMOTE_ABOVE, HEALTHY_BELOW, MIN_JUDGED,
 };
@@ -103,6 +106,8 @@ pub struct Settings {
     /// The skeleton rule is `on`. Kept for older clients.
     pub shorten_reads: bool,
     pub context_budget: usize,
+    /// Tokens of the packs present in one request together at most.
+    pub pack_conversation_budget: usize,
     /// Index a git repository the first time the agent works in it.
     pub auto_index: bool,
     /// The mode of each rule.
@@ -125,6 +130,7 @@ impl Default for Settings {
             shorten_outputs: o.shorten_outputs,
             shorten_reads: o.rules.skeleton == Mode::On,
             context_budget: o.context_budget,
+            pack_conversation_budget: o.pack_conversation_budget,
             auto_index: true,
             rules: o.rules,
             holdout_share: 0.0,
@@ -142,6 +148,7 @@ struct SettingsPatch {
     shorten_outputs: Option<bool>,
     shorten_reads: Option<bool>,
     context_budget: Option<usize>,
+    pack_conversation_budget: Option<usize>,
     auto_index: Option<bool>,
     rules: Option<serde_json::Map<String, Value>>,
     holdout_share: Option<f64>,
@@ -184,6 +191,7 @@ impl TryFrom<SettingsPatch> for Settings {
         s.inject_context = p.inject_context.unwrap_or(s.inject_context);
         s.shorten_outputs = p.shorten_outputs.unwrap_or(s.shorten_outputs);
         s.context_budget = p.context_budget.unwrap_or(s.context_budget);
+        s.pack_conversation_budget = p.pack_conversation_budget.unwrap_or(s.pack_conversation_budget);
         s.auto_index = p.auto_index.unwrap_or(s.auto_index);
         s.holdout_share = valid_share(p.holdout_share.unwrap_or(0.0));
         s.demoted = p.demoted.unwrap_or_default();
@@ -237,6 +245,9 @@ impl Settings {
         if let Some(v) = p.context_budget {
             self.context_budget = v;
         }
+        if let Some(v) = p.pack_conversation_budget {
+            self.pack_conversation_budget = v;
+        }
         if let Some(v) = p.auto_index {
             self.auto_index = v;
         }
@@ -271,6 +282,7 @@ impl Settings {
             shorten_outputs: self.shorten_outputs,
             rules,
             context_budget: self.context_budget,
+            pack_conversation_budget: self.pack_conversation_budget,
             ..Options::default()
         }
     }
@@ -382,6 +394,17 @@ struct MonitorJson {
     /// Each item's decision by hash, so a restarted daemon sends the same
     /// bytes for it and does not count it again.
     ledger: Ledger,
+    /// The label of a session of Codex's background requests (`guardian`,
+    /// `title`, `recap`, ...), fixed by its first request.
+    background: Option<String>,
+    /// Background requests by label, in this session.
+    background_requests: BTreeMap<String, u64>,
+    /// Packs added; follow-ups skipped as already known; packs skipped for
+    /// the conversation budget; packs retired after a compaction.
+    packs_added: u64,
+    packs_known: u64,
+    packs_over_budget: u64,
+    packs_retired: u64,
 }
 
 /// What a conversation's stored record had counted before this daemon
@@ -483,6 +506,11 @@ struct Conv {
     routed: bool,
     /// In the holdout arm: fixed when the conversation is first seen.
     holdout: bool,
+    /// A conversation of Codex's background requests, by label: fixed when
+    /// the conversation is first seen.
+    background: Option<String>,
+    /// Background requests by label.
+    background_requests: BTreeMap<String, u64>,
     carried: Carried,
     raw_retries: u64,
     cold_restarts: u64,
@@ -499,6 +527,7 @@ impl Conv {
     fn monitor_json(&self) -> MonitorJson {
         let base = &self.carried.monitor;
         let prefix = &self.session.prefix;
+        let saved = &self.session.saved;
         MonitorJson {
             prefix: PrefixStats {
                 lge_breaks: base.prefix.lge_breaks + prefix.lge_breaks,
@@ -511,6 +540,12 @@ impl Conv {
             contexts_would_add: base.contexts_would_add + self.session.saved.contexts_would_add as u64,
             requests: self.requests,
             ledger: self.session.ledger().clone(),
+            background: self.background.clone(),
+            background_requests: self.background_requests.clone(),
+            packs_added: base.packs_added + saved.contexts_added as u64,
+            packs_known: base.packs_known + saved.contexts_known as u64,
+            packs_over_budget: base.packs_over_budget + saved.contexts_over_budget as u64,
+            packs_retired: base.packs_retired + saved.contexts_retired as u64,
         }
     }
 
@@ -547,6 +582,8 @@ struct Rewritten {
     changed: bool,
     /// Items first decided in this request that changed what is sent.
     new_changes: usize,
+    /// The label of a background request of Codex, for the log line.
+    background: Option<String>,
     conv: Arc<Mutex<Conv>>,
     /// The trace of this request, completed with the response's numbers. It
     /// travels with the request: Codex may send the next request of the same
@@ -832,10 +869,34 @@ fn instructions_text(body: &Value) -> String {
     }
 }
 
-/// A proxy conversation's record (`proxy` or `proxy-holdout`).
-fn is_proxy_mode(mode: &str) -> bool {
-    mode == "proxy" || mode == "proxy-holdout"
+/// What a request's headers say about where it comes from, for
+/// [`background_label`].
+#[derive(Debug, Clone, Default)]
+struct Origin {
+    /// The `x-openai-subagent` header.
+    subagent: Option<String>,
+    /// The `x-codex-turn-metadata` header.
+    turn_metadata: Option<String>,
 }
+
+/// The label under which requests for a compaction's summary are counted.
+const COMPACTION_LABEL: &str = "compaction";
+
+/// The record mode of a conversation of Codex's background requests (an
+/// approval review, a review, a title, a recap, a memory consolidation): its
+/// rules apply as usual, it gets no pack, it is never held out, and it is
+/// left out of the holdout comparison and the before-and-after numbers.
+const BACKGROUND_MODE: &str = "proxy-background";
+
+/// A proxy conversation's record (`proxy`, `proxy-holdout` or `proxy-background`).
+fn is_proxy_mode(mode: &str) -> bool {
+    mode == "proxy" || mode == "proxy-holdout" || mode == BACKGROUND_MODE
+}
+
+/// A session whose requests re-send this many input tokens on average, over at
+/// least [`LONG_SESSION_REQUESTS`] requests, is named in the page's note.
+const LONG_SESSION_MEAN_INPUT: i64 = 150_000;
+const LONG_SESSION_REQUESTS: u64 = 50;
 
 /// What each rule did over `records`, counting a record for a rule only when
 /// it started at or after the rule's `since` time. Also gives, per rule, the
@@ -916,6 +977,73 @@ fn due_demotions(settings: &Settings, records: &[UsageRecord]) -> Vec<(String, S
         ));
     }
     out
+}
+
+/// Input tokens per model request of a session; 0 before its first request.
+fn mean_input(r: &UsageRecord, requests: u64) -> i64 {
+    if requests == 0 {
+        0
+    } else {
+        r.input_tokens / requests as i64
+    }
+}
+
+/// Codex's background requests by label: the sessions that were background
+/// sessions (their tokens included), and every background request, in such
+/// sessions or in others.
+fn background_totals(records: &[UsageRecord]) -> Vec<Value> {
+    // label -> (sessions, requests, input tokens)
+    let mut by_label: BTreeMap<String, (u64, u64, i64)> = BTreeMap::new();
+    for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
+        let m: MonitorJson = serde_json::from_str(&r.monitor).unwrap_or_default();
+        if let (Some(label), true) = (&m.background, r.mode == BACKGROUND_MODE) {
+            let slot = by_label.entry(label.clone()).or_default();
+            slot.0 += 1;
+            slot.2 += r.input_tokens;
+        }
+        for (label, n) in &m.background_requests {
+            by_label.entry(label.clone()).or_default().1 += n;
+        }
+    }
+    by_label
+        .into_iter()
+        .map(|(label, (sessions, requests, input))| {
+            json!({ "label": label, "sessions": sessions, "requests": requests, "input_tokens": input })
+        })
+        .collect()
+}
+
+/// The rows of the page's session table (`rows`, as the status gives them)
+/// that are not background sessions and re-send more than
+/// [`LONG_SESSION_MEAN_INPUT`] input tokens per request on average over at
+/// least [`LONG_SESSION_REQUESTS`] requests, with the note the page shows
+/// under the table. Read from the rows, so the note and the table give the
+/// same counts. A report only: lge never changes Codex's configuration.
+fn long_sessions(rows: &[Value]) -> Value {
+    let sessions: Vec<Value> = rows
+        .iter()
+        .filter(|row| row["mode"] != BACKGROUND_MODE)
+        .filter_map(|row| {
+            let requests = row["requests"].as_u64().unwrap_or(0);
+            let mean = row["mean_input_tokens"].as_i64().unwrap_or(0);
+            (requests >= LONG_SESSION_REQUESTS && mean > LONG_SESSION_MEAN_INPUT).then(
+                || json!({ "id": row["id"], "task": row["task"], "requests": requests, "mean_input_tokens": mean }),
+            )
+        })
+        .collect();
+    // Plain text: the page shows it as text.
+    let note = (!sessions.is_empty()).then(|| {
+        "Every request of these sessions re-sends that many input tokens. A new session per task, or a lower \
+         model_auto_compact_token_limit in ~/.codex/config.toml (Codex compacts sooner), makes each request \
+         smaller, at the cost of Codex working from a summary after a compaction."
+            .to_string()
+    });
+    json!({
+        "min_requests": LONG_SESSION_REQUESTS,
+        "min_mean_input_tokens": LONG_SESSION_MEAN_INPUT,
+        "sessions": sessions,
+        "note": note,
+    })
 }
 
 /// The type and code of a provider's error body, for the log. Nothing else of
@@ -1179,8 +1307,10 @@ impl Daemon {
     /// The conversation `key` belongs to, created on its first request. A new
     /// conversation continues the counters of a stored record with the same
     /// id (the daemon restarted), keeps its arm, and otherwise is placed in
-    /// the holdout arm by its bucket.
-    fn conv_for(&self, key: &str, seen: &Seen) -> Arc<Mutex<Conv>> {
+    /// the holdout arm by its bucket. A conversation whose first request is
+    /// one of Codex's background requests (`background`, its label) is a
+    /// background session, never held out.
+    fn conv_for(&self, key: &str, seen: &Seen, background: Option<&str>) -> Arc<Mutex<Conv>> {
         if let Some(c) = lock(&self.convs).get(key) {
             return c.clone();
         }
@@ -1191,8 +1321,20 @@ impl Daemon {
         let now = self.now();
         let mut session = Session::default();
         let (record, holdout, carried) = match stored {
-            Some(record) if is_proxy_mode(&record.mode) => {
+            Some(mut record) if is_proxy_mode(&record.mode) => {
                 let mut monitor: MonitorJson = serde_json::from_str(&record.monitor).unwrap_or_default();
+                // A session of Codex's background requests that started before
+                // lge told them apart (no label stored) becomes a background
+                // session when it never had a pack: no pack, never held out,
+                // and out of the comparisons from now on. Its items decided
+                // before keep their bytes; one with packs keeps its arm.
+                let had_pack = monitor.ledger.contexts.values().any(|added| *added) || record.pack_tokens > 0;
+                if let (Some(label), None, false) = (background, &monitor.background, had_pack) {
+                    if record.mode != BACKGROUND_MODE {
+                        record.mode = BACKGROUND_MODE.to_string();
+                    }
+                    monitor.background = Some(label.to_string());
+                }
                 // The items decided before the restart keep their bytes and are not counted again.
                 session.restore(std::mem::take(&mut monitor.ledger));
                 let carried = Carried {
@@ -1204,7 +1346,12 @@ impl Daemon {
                 (record, holdout, carried)
             }
             _ => {
-                let holdout = in_holdout(share, bucket_key);
+                let holdout = background.is_none() && in_holdout(share, bucket_key);
+                let mode = match (background, holdout) {
+                    (Some(_), _) => BACKGROUND_MODE,
+                    (None, true) => "proxy-holdout",
+                    (None, false) => "proxy",
+                };
                 let record = UsageRecord {
                     id,
                     task_id: key.to_string(),
@@ -1216,10 +1363,17 @@ impl Daemon {
                     started_at: now,
                     finished_at: now,
                     outcome: outcome::UNKNOWN.to_string(),
-                    mode: if holdout { "proxy-holdout" } else { "proxy" }.to_string(),
+                    mode: mode.to_string(),
                     ..UsageRecord::default()
                 };
-                (record, holdout, Carried::default())
+                let carried = Carried {
+                    monitor: MonitorJson {
+                        background: background.map(str::to_string),
+                        ..MonitorJson::default()
+                    },
+                    ..Carried::default()
+                };
+                (record, holdout, carried)
             }
         };
         let conv = Conv {
@@ -1233,6 +1387,8 @@ impl Daemon {
             repo: None,
             routed: false,
             holdout,
+            background: carried.monitor.background.clone(),
+            background_requests: carried.monitor.background_requests.clone(),
             carried,
             last_response_at: None,
             last_input_tokens: 0,
@@ -1247,12 +1403,17 @@ impl Daemon {
 
     /// Rewrite a Responses request body. Returns the bytes to forward and the
     /// conversation they belong to, or `None` to forward the original.
-    /// `again`: the same request a second time, after the provider refused it
-    /// and the request's new decisions were reverted; it is not counted as
-    /// another request.
-    fn rewrite(self: &Arc<Self>, body: &[u8], thread: Option<&str>, again: bool) -> Option<Rewritten> {
+    /// `origin`: the request's `x-openai-subagent` and `x-codex-turn-metadata`
+    /// headers. `again`: the same request a second time, after the provider
+    /// refused it and the request's new decisions were reverted; it is not
+    /// counted as another request.
+    fn rewrite(self: &Arc<Self>, body: &[u8], thread: Option<&str>, origin: &Origin, again: bool) -> Option<Rewritten> {
         let mut value: Value = serde_json::from_slice(body).ok()?;
         let seen = inspect(&value);
+        let background = background_label(origin.subagent.as_deref(), origin.turn_metadata.as_deref(), &value);
+        // Codex's request for a compaction's summary: a request of the
+        // conversation itself, counted apart, never a background session.
+        let compaction = compaction_request(origin.turn_metadata.as_deref(), &value);
         // Sub-agents share the cache key of their parent; the thread header tells them apart.
         let key = thread
             .map(str::to_string)
@@ -1264,7 +1425,7 @@ impl Daemon {
                     seen.cwd.as_deref().unwrap_or(""),
                 ])
             });
-        let conv = self.conv_for(&key, &seen);
+        let conv = self.conv_for(&key, &seen, background.as_deref());
         let mut options = lock(&self.settings).options();
         let repo = seen.cwd.as_deref().and_then(|cwd| self.repo_for(Path::new(cwd)));
         let fixed_instructions = instructions_text(&value);
@@ -1275,12 +1436,27 @@ impl Daemon {
         let seen;
         let new_changes;
         let trace;
+        let label;
         {
             let mut guard = lock(&conv);
             let c = &mut *guard;
             options.holdout = c.holdout;
+            // A background request (or any request of a background session),
+            // and the request for a compaction's summary, never get a new
+            // pack; their outputs are shortened as usual and packs decided
+            // before are sent again.
+            let background = background
+                .or_else(|| c.background.clone())
+                .or_else(|| compaction.then(|| COMPACTION_LABEL.to_string()));
+            if background.is_some() {
+                options.inject_context = false;
+            }
+            label = background.clone();
             if !again {
                 c.requests += 1;
+                if let Some(label) = &background {
+                    *c.background_requests.entry(label.clone()).or_default() += 1;
+                }
             }
             if c.record.task.is_empty() {
                 c.record.task = first.clone();
@@ -1310,7 +1486,7 @@ impl Daemon {
                                 store: server.store(),
                                 root: server.root(),
                             };
-                            if !c.routed && !first.is_empty() {
+                            if !c.routed && !first.is_empty() && c.background.is_none() {
                                 c.routed = true;
                                 if let Ok(route) =
                                     lge_router::route(graph.store, &first, &lge_router::RouterConfig::default())
@@ -1394,6 +1570,7 @@ impl Daemon {
             body,
             changed,
             new_changes,
+            background: label,
             conv,
             trace,
         })
@@ -1530,6 +1707,7 @@ impl Daemon {
         let mut rewritten: Option<Rewritten> = None;
         let mut plain: Option<Vec<u8>> = None;
         let mut thread: Option<String> = None;
+        let mut origin = Origin::default();
         // One line per model request in the log, without any content: what came
         // in, what was done with it, and whether the usage was read.
         let mut note = String::new();
@@ -1553,9 +1731,19 @@ impl Daemon {
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("thread-id"))
                 .map(|(_, v)| v.clone());
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.clone())
+            };
+            origin = Origin {
+                subagent: header(SUBAGENT_HEADER),
+                turn_metadata: header(TURN_METADATA_HEADER),
+            };
             rewritten = plain
                 .as_deref()
-                .and_then(|p| self.rewrite_safely(p, thread.as_deref(), false));
+                .and_then(|p| self.rewrite_safely(p, thread.as_deref(), &origin, false));
             note = format!(
                 "{} {}B {}",
                 encoding.as_deref().unwrap_or("plain"),
@@ -1568,6 +1756,9 @@ impl Daemon {
             );
             if let Some(r) = &rewritten {
                 note.push_str(&format!(" -> {}B", r.body.len()));
+                if let Some(label) = &r.background {
+                    note.push_str(&format!(" (background: {label})"));
+                }
                 body = r.body.clone();
                 headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
             }
@@ -1615,7 +1806,7 @@ impl Daemon {
                 // Codex sends a conversation's requests one at a time, so the
                 // request's new decisions are still the session's latest.
                 lock(&r.conv).session.revert_new();
-                let again = self.rewrite_safely(plain, thread.as_deref(), true);
+                let again = self.rewrite_safely(plain, thread.as_deref(), &origin, true);
                 // Unchanged now: the client's own bytes and headers, as they came.
                 let (retry_headers, retry_body) = match &again {
                     Some(a) if a.changed => (headers.clone(), a.body.clone()),
@@ -1738,11 +1929,19 @@ impl Daemon {
     }
 
     /// [`Daemon::rewrite`], with a panic taken as "forward the original".
-    fn rewrite_safely(self: &Arc<Self>, plain: &[u8], thread: Option<&str>, again: bool) -> Option<Rewritten> {
+    fn rewrite_safely(
+        self: &Arc<Self>,
+        plain: &[u8],
+        thread: Option<&str>,
+        origin: &Origin,
+        again: bool,
+    ) -> Option<Rewritten> {
         let daemon = self.clone();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| daemon.rewrite(plain, thread, again)))
-            .ok()
-            .flatten()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            daemon.rewrite(plain, thread, origin, again)
+        }))
+        .ok()
+        .flatten()
     }
 
     /// Keep the trace of the request that just ended.
@@ -1898,7 +2097,8 @@ impl Daemon {
             .collect();
         // Totals per mode: what past sessions cost, and what sessions through the proxy cost.
         let mut by_mode: BTreeMap<String, [i64; 5]> = BTreeMap::new();
-        for r in &records {
+        // Codex's background requests are not sessions anyone worked in.
+        for r in records.iter().filter(|r| r.mode != BACKGROUND_MODE) {
             let t = by_mode
                 .entry(if r.mode.is_empty() {
                     "other".to_string()
@@ -1923,6 +2123,9 @@ impl Daemon {
             saved.tokens_after += s.tokens_after;
             saved.contexts_added += s.contexts_added;
             saved.context_tokens += s.context_tokens;
+            saved.contexts_known += s.contexts_known;
+            saved.contexts_over_budget += s.contexts_over_budget;
+            saved.contexts_retired += s.contexts_retired;
         }
         let monitor_of = |r: &UsageRecord| -> MonitorJson { serde_json::from_str(&r.monitor).unwrap_or_default() };
         let mut recent: Vec<&UsageRecord> = records.iter().filter(|r| is_proxy_mode(&r.mode)).collect();
@@ -1939,9 +2142,14 @@ impl Daemon {
                 } else {
                     0.0
                 };
+                let requests = requests.max(m.requests);
                 json!({
                     "id": r.session_id, "task": r.task, "model": r.model, "repo": repo, "mode": r.mode,
-                    "requests": requests.max(m.requests),
+                    "background": m.background,
+                    "requests": requests,
+                    "mean_input_tokens": mean_input(r, requests),
+                    "packs_added": m.packs_added, "packs_known": m.packs_known,
+                    "packs_over_budget": m.packs_over_budget, "packs_retired": m.packs_retired,
                     "started_at": r.started_at, "finished_at": r.finished_at,
                     "input_tokens": r.input_tokens, "cached_input_tokens": r.cached_input_tokens,
                     "output_tokens": r.output_tokens, "reasoning_tokens": r.reasoning_tokens,
@@ -2033,8 +2241,28 @@ impl Daemon {
             .collect();
         let (removed, added): (i64, i64) = records
             .iter()
-            .filter(|r| r.mode == "proxy")
+            .filter(|r| r.mode == "proxy" || r.mode == BACKGROUND_MODE)
             .fold((0, 0), |(a, b), r| (a + r.removed_tokens_sent, b + r.added_tokens_sent));
+        // Packs over the sessions that get them (not the held-out ones, whose
+        // packs are decided and never added): what was added and why others
+        // were not. What the held-out sessions would have added, apart.
+        let mut packs = [0u64; 4];
+        let mut would_add = 0u64;
+        for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
+            let m = monitor_of(r);
+            if r.mode == "proxy-holdout" {
+                would_add += m.contexts_would_add;
+                continue;
+            }
+            for (slot, n) in packs
+                .iter_mut()
+                .zip([m.packs_added, m.packs_known, m.packs_over_budget, m.packs_retired])
+            {
+                *slot += n;
+            }
+        }
+        let background = background_totals(&records);
+        let long_sessions = long_sessions(&sessions);
 
         json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -2063,6 +2291,9 @@ impl Daemon {
             "ghost_tools": ghost_tools,
             "monitor": { "raw_retries": raw_retries, "cold_restarts": cold_restarts, "cold_tokens": cold_tokens, "lge_breaks": lge_breaks, "client_breaks": client_breaks },
             "annuity": { "removed_tokens_sent": removed, "added_tokens_sent": added, "net_tokens": removed - added },
+            "packs": { "added": packs[0], "known": packs[1], "over_budget": packs[2], "retired": packs[3], "tokens_sent": added, "holdout_would_add": would_add },
+            "background": background,
+            "long_sessions": long_sessions,
         })
     }
 
@@ -2073,8 +2304,11 @@ impl Daemon {
     }
 
     /// Token counts of sessions the agent recorded itself, as the baseline.
-    /// Sessions the proxy already measured are not counted twice. Only counts,
-    /// ids and the model are read; no conversation text is stored.
+    /// Sessions the proxy already measured are not counted twice, and threads
+    /// Codex ran in the background (an approval review, a review, a memory
+    /// consolidation; see [`lge_usage::background_session`]) are left out, as
+    /// they are on the proxy's side. Only counts, ids and the model are read;
+    /// no conversation text is stored.
     fn import_history(&self) -> Result<Value> {
         let home = self
             .cfg
@@ -2082,7 +2316,7 @@ impl Daemon {
             .clone()
             .ok_or_else(|| anyhow!("no agent home folder is configured (mount ~/.codex and set LGE_CODEX_HOME)"))?;
         let known: std::collections::HashSet<String> = self.usage.list_usage(0)?.into_iter().map(|r| r.id).collect();
-        let (mut imported, mut skipped, mut failed) = (0, 0, 0);
+        let (mut imported, mut skipped, mut failed, mut background) = (0, 0, 0, 0);
         let mut stack = vec![home.join("sessions")];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -2100,6 +2334,10 @@ impl Daemon {
                     failed += 1;
                     continue;
                 };
+                if session.background.is_some() {
+                    background += 1;
+                    continue;
+                }
                 let id = stable_id(&["session", &session.session_id]);
                 if session.session_id.is_empty() || known.contains(&id) || session.usage.total() == 0 {
                     skipped += 1;
@@ -2134,7 +2372,7 @@ impl Daemon {
                 imported += 1;
             }
         }
-        Ok(json!({ "imported": imported, "skipped": skipped, "unreadable": failed }))
+        Ok(json!({ "imported": imported, "skipped": skipped, "unreadable": failed, "background": background }))
     }
 
     fn api(self: &Arc<Self>, mut request: Request) {
@@ -2624,6 +2862,8 @@ mod tests {
             requests: 0,
             routed: false,
             holdout: false,
+            background: None,
+            background_requests: BTreeMap::new(),
             carried: Carried::default(),
             raw_retries: 0,
             cold_restarts: 0,
