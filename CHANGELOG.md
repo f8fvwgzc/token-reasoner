@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.0.4 (2026-11-18)
+
+The router's recommendation can now lower the reasoning effort, if you switch it on.
+Off by default: lge still never changes the model, the system prompt, tool definitions,
+reasoning items, tool calls, patches or diffs, and never edits Codex's configuration.
+No saving or quality effect is measured yet.
+
+### The router can lower the reasoning effort (opt-in)
+
+- New setting `router_apply` (page: "Lower the reasoning effort when the router
+  recommends it"; `daemon.json`): `off` (default), `low-only` or `low-and-medium`.
+  `low-only` sends a conversation at `low` effort when the change impact of its first
+  typed message stays in one file; `low-and-medium` also sends `medium` when it stays in
+  one service.
+- Only ever lowers `reasoning.effort`. A request already at or below the target, one
+  without an effort, or one with an effort this version does not know is left alone.
+- Decided once, on the conversation's first request, and kept for every request of the
+  conversation: a later change of the setting or a daemon restart does not change it,
+  so the prompt cache is never broken by it. A restored conversation is not routed
+  again.
+- Held-out conversations, Codex's background requests and background sessions are never
+  changed, so the holdout arm measures the effect.
+- When the provider refuses the first request (400, 413, 422), it is sent again with the
+  client's effort, and the conversation keeps it.
+- The page marks applied sessions ("router: low (applied)"), the status has
+  `applied_level` per session, the usage record's `level` is the applied level, and
+  `serve.log` has a `router applied` line.
+
+### Tests
+
+- The A/B preflight test accepts dash's wording (`not found`) for a missing command as
+  well as bash's (`command not found`), so it passes where `/bin/sh` is dash.
+- The test of a copy folder that cannot be removed is skipped when the user can delete
+  read-only folders (root, as in many CI containers).
+
+### Not verified
+
+- What lowering the effort saves, and what it costs in task success, is unmeasured. Run
+  `lge ab` or a holdout share with `router_apply` on before relying on it.
+- Whether every model accepts `low` and `medium` is not checked; a refusal falls back to
+  the client's effort for that conversation.
+
 ## v0.0.3 (2026-11-17)
 
 Packs cost less in long conversations, and Codex's background requests no longer get

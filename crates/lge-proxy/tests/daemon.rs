@@ -2166,3 +2166,158 @@ fn the_request_for_a_compactions_summary_gets_no_new_pack_and_is_counted_apart()
         .collect();
     assert_eq!(compaction, [(0, 1)], "{}", status["background"]);
 }
+
+// ---- router: lowering the reasoning effort --------------------------------------
+
+fn with_effort(mut body: Value, effort: &str) -> Value {
+    body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+    body
+}
+
+fn effort_sent(r: &Running) -> String {
+    let sent: Value = serde_json::from_slice(&r.last().3).unwrap();
+    sent["reasoning"]["effort"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn the_router_lowers_the_effort_only_when_asked_and_never_raises_it() {
+    let r = start();
+    // A function nothing calls: a change to it stays in one file.
+    std::fs::write(
+        r.repo.join("orders_api/strings.py"),
+        "def shout_text(text):\n    \"\"\"Upper-case a line of text.\"\"\"\n    return text.upper()\n",
+    )
+    .unwrap();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    let one_file = "shout_text should trim whitespace";
+    let one_service = "audit log format";
+
+    // Off by default: the recommendation is logged, the effort kept.
+    assert_eq!(r.json("/lge/api/status")["settings"]["router_apply"], "off");
+    r.send(&with_effort(request_body(&cwd, "conv-r0", one_file), "high"));
+    assert_eq!(effort_sent(&r), "high");
+    let row = session_row(&r.json("/lge/api/status"), "conv-r0");
+    assert_eq!(
+        (row["recommended_level"].as_str(), row["applied_level"].as_str()),
+        (Some("low"), Some("")),
+        "{row}"
+    );
+
+    // low-only: a one-file task is sent at low effort, on every request.
+    assert_eq!(
+        r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }))["router_apply"],
+        "low-only"
+    );
+    let mut first = with_effort(request_body(&cwd, "conv-r1", one_file), "high");
+    r.send(&first);
+    assert_eq!(effort_sent(&r), "low");
+    let row = session_row(&r.json("/lge/api/status"), "conv-r1");
+    assert_eq!(row["applied_level"], "low", "{row}");
+    // A task in one service with several files keeps its effort.
+    r.send(&with_effort(request_body(&cwd, "conv-r2", one_service), "high"));
+    assert_eq!(effort_sent(&r), "high");
+
+    // low-and-medium: the one-service task is sent at medium.
+    r.api("/lge/api/settings", &json!({ "router_apply": "low-and-medium" }));
+    r.send(&with_effort(request_body(&cwd, "conv-r3", one_service), "high"));
+    assert_eq!(effort_sent(&r), "medium");
+    // Never raised: a client already at low stays at low, and nothing is applied.
+    r.send(&with_effort(request_body(&cwd, "conv-r4", one_service), "low"));
+    assert_eq!(effort_sent(&r), "low");
+    let row = session_row(&r.json("/lge/api/status"), "conv-r4");
+    assert_eq!(row["applied_level"], "", "{row}");
+    // A request that names no effort is left alone.
+    r.send(&request_body(&cwd, "conv-r5", one_file));
+    let sent: Value = serde_json::from_slice(&r.last().3).unwrap();
+    assert!(sent.get("reasoning").is_none(), "{sent}");
+
+    // Switched off later: a conversation keeps the effort it started with,
+    // and a new one keeps the client's.
+    r.api("/lge/api/settings", &json!({ "router_apply": "off" }));
+    first["input"].as_array_mut().unwrap().push(user("ok, do it"));
+    r.send(&first);
+    assert_eq!(effort_sent(&r), "low", "the same effort for the whole conversation");
+    r.send(&with_effort(request_body(&cwd, "conv-r6", one_file), "high"));
+    assert_eq!(effort_sent(&r), "high");
+
+    // Held out: the client's bytes, whatever the setting.
+    r.api(
+        "/lge/api/settings",
+        &json!({ "router_apply": "low-only", "holdout_share": 1.0 }),
+    );
+    let held = with_effort(request_body(&cwd, "conv-r7", one_file), "high");
+    let raw = serde_json::to_vec(&held).unwrap();
+    r.post("/v1/responses", &raw, &[("authorization", "Bearer k")]);
+    assert_eq!(r.last().3, raw, "byte-identical");
+
+    // An unknown value is refused and changes nothing.
+    let (status, _, _) = r.post(
+        "/lge/api/settings",
+        br#"{"router_apply":"always"}"#,
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 400);
+    assert_eq!(r.json("/lge/api/status")["settings"]["router_apply"], "low-only");
+}
+
+#[test]
+fn an_applied_effort_holds_after_a_restart() {
+    let (port, received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("work/shop");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/polyglot"),
+        &repo,
+    );
+    std::fs::write(
+        repo.join("orders_api/strings.py"),
+        "def shout_text(text):\n    \"\"\"Upper-case a line of text.\"\"\"\n    return text.upper()\n",
+    )
+    .unwrap();
+    let repo = repo.canonicalize().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let cfg = config(dir.path(), &repo, port);
+    let agent = plain_agent();
+    let mut body = with_effort(
+        request_body(&repo.join("orders_api"), "conv-ra", "shout_text should trim whitespace"),
+        "high",
+    );
+    let effort_of_last = || -> String {
+        let last = received.lock().unwrap().last().cloned().unwrap();
+        let sent: Value = serde_json::from_slice(&last.3).unwrap();
+        sent["reasoning"]["effort"].as_str().unwrap_or("").to_string()
+    };
+
+    let _slot = Slot::take();
+    {
+        let first = Serving::start(Daemon::open(cfg.clone()).unwrap());
+        let post = |path: &str, v: &Value| {
+            let response = agent
+                .post(format!("http://{}{path}", first.addr))
+                .header("content-type", "application/json")
+                .send(v.to_string())
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+        };
+        post("/lge/api/repos", &json!({ "path": repo.to_string_lossy() }));
+        post("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while status_of(&agent, first.addr)["repos"][0]["state"] != "ready" {
+            assert!(Instant::now() < deadline, "repository not ready");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        send_to(&agent, first.addr, &body);
+        assert_eq!(effort_of_last(), "low");
+    }
+    // A new daemon: the conversation keeps its effort even with the setting
+    // switched off in between, before its graph is ready again.
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("data/daemon.json")).unwrap()).unwrap();
+    state["settings"]["router_apply"] = json!("off");
+    std::fs::write(dir.path().join("data/daemon.json"), state.to_string()).unwrap();
+    let second = Serving::start(Daemon::open(cfg).unwrap());
+    body["input"].as_array_mut().unwrap().push(user("ok, do it"));
+    send_to(&agent, second.addr, &body);
+    assert_eq!(effort_of_last(), "low", "the same effort for the whole conversation");
+}
