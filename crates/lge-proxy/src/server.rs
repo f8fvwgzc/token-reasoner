@@ -11,7 +11,8 @@
 //!   request is sent once more without the rewrites first made in it.
 //! * Nothing of a conversation is stored except token counts, rule counts, the
 //!   first typed message cut to 200 characters, and the decisions needed to
-//!   repeat a rewrite (in memory).
+//!   repeat a rewrite (the packs lge added among them, which are lge's own
+//!   text).
 
 use crate::responses::{
     background_label, compaction_request, inspect, transform, OutputFact, Seen, Usage, UsageScanner, SUBAGENT_HEADER,
@@ -123,14 +124,21 @@ pub struct Settings {
     /// Which of the router's recommendations lower a conversation's reasoning
     /// effort. Off by default: the effort stays what the client asked for.
     pub router_apply: RouterApply,
+    /// The arm of an `lge ab` run new conversations belong to (`on` or
+    /// `off`), or "" outside one. Set by `lge ab` while it runs; never read
+    /// from `daemon.json`, so a restart ends it. Such conversations are kept
+    /// out of the cards, the holdout comparison and before and after.
+    pub ab_arm: String,
 }
 
 /// Which router recommendations are applied to the reasoning effort.
 ///
 /// An applied recommendation only ever lowers the effort the client asked for,
-/// never raises it, and is decided once, on a conversation's first request, so
-/// every request of the conversation has the same effort. Held-out and
-/// background conversations are never changed.
+/// never raises it, and is decided once, on a conversation's genuine first
+/// request (one without an earlier turn), so every request of the
+/// conversation, the request for a compaction's summary included, has the
+/// same effort. Held-out conversations and Codex's background requests are
+/// never changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouterApply {
@@ -203,6 +211,7 @@ impl Default for Settings {
             demoted: BTreeMap::new(),
             rule_since: BTreeMap::new(),
             router_apply: RouterApply::Off,
+            ab_arm: String::new(),
         }
     }
 }
@@ -222,6 +231,8 @@ struct SettingsPatch {
     demoted: Option<BTreeMap<String, String>>,
     rule_since: Option<BTreeMap<String, i64>>,
     router_apply: Option<RouterApply>,
+    /// Request only: the arm of an `lge ab` run, `on`, `off`, or "" to end it.
+    ab_arm: Option<String>,
     /// Request only: lift the demotion of this rule.
     clear_demotion: Option<String>,
 }
@@ -334,6 +345,12 @@ impl Settings {
         }
         if let Some(v) = p.router_apply {
             self.router_apply = v;
+        }
+        if let Some(v) = p.ab_arm {
+            if !matches!(v.as_str(), "" | "on" | "off") {
+                bail!("ab_arm: expected \"on\", \"off\" or \"\", got {v:?}");
+            }
+            self.ab_arm = v;
         }
         if let Some(id) = p.clear_demotion {
             let rule = RuleId::parse(&id).ok_or_else(|| anyhow!("no rule `{id}`"))?;
@@ -481,11 +498,22 @@ struct MonitorJson {
     /// Background requests by label, in this session.
     background_requests: BTreeMap<String, u64>,
     /// Packs added; follow-ups skipped as already known; packs skipped for
-    /// the conversation budget; packs retired after a compaction.
+    /// the conversation budget; packs retired after the history was rewritten.
     packs_added: u64,
     packs_known: u64,
     packs_over_budget: u64,
     packs_retired: u64,
+    /// Follow-ups skipped as larger than a follow-up may be (counted under
+    /// `packs_over_budget` before this field existed).
+    packs_too_large: u64,
+    /// Placed in an arm at random: new while the holdout share was above 0,
+    /// and not a background session. Only such sessions are compared.
+    randomized: bool,
+    /// The arm of the `lge ab` run the conversation started in, if any.
+    ab_arm: Option<String>,
+    /// Input tokens of the background requests (and requests for a
+    /// compaction's summary) by label, in this session.
+    background_input: BTreeMap<String, i64>,
 }
 
 /// What a conversation's stored record had counted before this daemon
@@ -592,6 +620,11 @@ struct Conv {
     background: Option<String>,
     /// Background requests by label.
     background_requests: BTreeMap<String, u64>,
+    /// Their input tokens by label.
+    background_input: BTreeMap<String, i64>,
+    /// The request waited for the graph to send a pack decided before a
+    /// restart again (once per conversation).
+    waited_for_graph: bool,
     carried: Carried,
     raw_retries: u64,
     cold_restarts: u64,
@@ -627,6 +660,10 @@ impl Conv {
             packs_known: base.packs_known + saved.contexts_known as u64,
             packs_over_budget: base.packs_over_budget + saved.contexts_over_budget as u64,
             packs_retired: base.packs_retired + saved.contexts_retired as u64,
+            packs_too_large: base.packs_too_large + saved.contexts_too_large as u64,
+            randomized: base.randomized,
+            ab_arm: base.ab_arm.clone(),
+            background_input: self.background_input.clone(),
         }
     }
 
@@ -663,10 +700,15 @@ struct Rewritten {
     changed: bool,
     /// Items first decided in this request that changed what is sent.
     new_changes: usize,
-    /// The label of a background request of Codex, for the log line.
+    /// The label of a background request of Codex, or of the request for a
+    /// compaction's summary, for the log line and the counts by label.
     background: Option<String>,
-    /// The conversation's reasoning effort was first lowered in this request.
-    effort_decided: bool,
+    /// The request's reasoning effort was lowered (in this request or an
+    /// earlier one): a refusal falls back to the client's effort.
+    effort_changed: bool,
+    /// The conversation's record when this request decided its effort, to
+    /// store at once: a restart before the first usage keeps the decision.
+    decided_record: Option<UsageRecord>,
     conv: Arc<Mutex<Conv>>,
     /// The trace of this request, completed with the response's numbers. It
     /// travels with the request: Codex may send the next request of the same
@@ -1071,15 +1113,58 @@ fn mean_input(r: &UsageRecord, requests: u64) -> i64 {
     }
 }
 
+/// Labels that are counted per request and never form a session of their
+/// own: the request for a compaction's summary belongs to its conversation.
+const REQUEST_ONLY_LABELS: [&str; 1] = [COMPACTION_LABEL];
+
+/// Stored sessions of Codex's background requests that a version before
+/// v0.0.3 recorded as ordinary ones (mode `proxy` or `proxy-holdout`, no
+/// label), told by what the record keeps ([`lge_usage::background_record`]),
+/// get mode [`BACKGROUND_MODE`] and their label here, in memory only, and
+/// count their stored requests under that label. Nothing is written: the
+/// same records always give the same page. The monitor JSON is patched as
+/// JSON, so a key it lacks (a request count, the pack counts) stays missing.
+fn classify_stored(records: &mut [UsageRecord]) {
+    for r in records
+        .iter_mut()
+        .filter(|r| r.mode == "proxy" || r.mode == "proxy-holdout")
+    {
+        let mut m: Value = serde_json::from_str(&r.monitor).unwrap_or_else(|_| json!({}));
+        if !m.is_object() {
+            m = json!({});
+        }
+        if m.get("background").is_some_and(|b| !b.is_null()) {
+            continue;
+        }
+        let counted = m
+            .get("background_requests")
+            .and_then(Value::as_object)
+            .is_some_and(|o| !o.is_empty());
+        let Some(label) = lge_usage::background_record(&r.model, &r.task, counted) else {
+            continue;
+        };
+        r.mode = BACKGROUND_MODE.to_string();
+        m["background"] = json!(label);
+        if !counted {
+            if let Some(n) = m.get("requests").and_then(Value::as_u64) {
+                m["background_requests"] = json!({ label: n });
+            }
+        }
+        r.monitor = m.to_string();
+    }
+}
+
 /// Codex's background requests by label: the sessions that were background
-/// sessions (their tokens included), and every background request, in such
-/// sessions or in others.
+/// sessions (their tokens included), every background request, in such
+/// sessions or in others, and the input tokens of those requests. A label
+/// that never forms a session (a compaction's summary) has `sessions` null.
 fn background_totals(records: &[UsageRecord]) -> Vec<Value> {
-    // label -> (sessions, requests, input tokens)
-    let mut by_label: BTreeMap<String, (u64, u64, i64)> = BTreeMap::new();
+    // label -> (sessions, requests, input tokens of its sessions, input tokens of its requests)
+    let mut by_label: BTreeMap<String, (u64, u64, i64, i64)> = BTreeMap::new();
     for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
         let m: MonitorJson = serde_json::from_str(&r.monitor).unwrap_or_default();
-        if let (Some(label), true) = (&m.background, r.mode == BACKGROUND_MODE) {
+        let session_label = m.background.as_ref().filter(|_| r.mode == BACKGROUND_MODE);
+        if let Some(label) = session_label {
             let slot = by_label.entry(label.clone()).or_default();
             slot.0 += 1;
             slot.2 += r.input_tokens;
@@ -1087,33 +1172,48 @@ fn background_totals(records: &[UsageRecord]) -> Vec<Value> {
         for (label, n) in &m.background_requests {
             by_label.entry(label.clone()).or_default().1 += n;
         }
+        // Input of the requests by label: counted per request since this
+        // version; a background session recorded before has its own input.
+        let mut by_request = m.background_input.clone();
+        if let Some(label) = session_label.filter(|l| !by_request.contains_key(*l)) {
+            by_request.insert(label.clone(), r.input_tokens);
+        }
+        for (label, input) in by_request {
+            by_label.entry(label).or_default().3 += input;
+        }
     }
     by_label
         .into_iter()
-        .map(|(label, (sessions, requests, input))| {
-            json!({ "label": label, "sessions": sessions, "requests": requests, "input_tokens": input })
+        .map(|(label, (sessions, requests, input, request_input))| {
+            let sessions = (!REQUEST_ONLY_LABELS.contains(&label.as_str())).then_some(sessions);
+            json!({ "label": label, "sessions": sessions, "requests": requests, "input_tokens": input,
+                    "request_input_tokens": request_input })
         })
         .collect()
 }
 
 /// The rows of the page's session table (`rows`, as the status gives them)
-/// that are not background sessions and re-send more than
-/// [`LONG_SESSION_MEAN_INPUT`] input tokens per request on average over at
-/// least [`LONG_SESSION_REQUESTS`] requests, with the note the page shows
-/// under the table. Read from the rows, so the note and the table give the
-/// same counts. A report only: lge never changes Codex's configuration.
+/// that are not background sessions or sessions of an `lge ab` run and
+/// re-send more than [`LONG_SESSION_MEAN_INPUT`] input tokens per request on
+/// average over at least [`LONG_SESSION_REQUESTS`] requests, with the note
+/// the page shows under the table, the most recent first, each with when it
+/// started and when its last request was recorded. Read from the rows, so the
+/// note and the table give the same counts. A report only: lge never changes
+/// Codex's configuration.
 fn long_sessions(rows: &[Value]) -> Value {
-    let sessions: Vec<Value> = rows
+    let mut sessions: Vec<Value> = rows
         .iter()
-        .filter(|row| row["mode"] != BACKGROUND_MODE)
+        .filter(|row| row["mode"] != BACKGROUND_MODE && row["ab_arm"].is_null())
         .filter_map(|row| {
             let requests = row["requests"].as_u64().unwrap_or(0);
             let mean = row["mean_input_tokens"].as_i64().unwrap_or(0);
-            (requests >= LONG_SESSION_REQUESTS && mean > LONG_SESSION_MEAN_INPUT).then(
-                || json!({ "id": row["id"], "task": row["task"], "requests": requests, "mean_input_tokens": mean }),
-            )
+            (requests >= LONG_SESSION_REQUESTS && mean > LONG_SESSION_MEAN_INPUT).then(|| {
+                json!({ "id": row["id"], "task": row["task"], "requests": requests, "mean_input_tokens": mean,
+                        "started_at": row["started_at"], "finished_at": row["finished_at"] })
+            })
         })
         .collect();
+    sessions.sort_by_key(|s| std::cmp::Reverse(s["finished_at"].as_i64().unwrap_or(0)));
     // Plain text: the page shows it as text.
     let note = (!sessions.is_empty()).then(|| {
         "Every request of these sessions re-sends that many input tokens. A new session per task, or a lower \
@@ -1176,11 +1276,42 @@ impl Daemon {
             clock_offset: AtomicI64::new(0),
             started: Instant::now(),
         });
+        // A folder that went away, or one lge no longer indexes (a folder
+        // Codex keeps for itself), is dropped from the list, not an error.
+        let mut left_out = false;
         for path in saved.repos {
-            // A folder that went away is dropped from the list, not an error.
-            let _ = daemon.add_repo(Path::new(&path));
+            if let Err(e) = daemon.add_repo(Path::new(&path)) {
+                eprintln!("lge: left out {path}: {e:#}");
+                left_out = true;
+            }
+        }
+        if left_out {
+            daemon.save();
         }
         Ok(daemon)
+    }
+
+    /// The agent's home: the configured one, or `$CODEX_HOME` or `~/.codex`.
+    fn codex_home(&self) -> PathBuf {
+        self.cfg.codex_home.clone().unwrap_or_else(lge_usage::codex_home)
+    }
+
+    /// True for a git folder Codex keeps for itself, never the user's
+    /// repository: one whose `.git` carries Codex's baseline marker
+    /// (`codex-baseline-version`, written each time Codex resets its memory
+    /// folder's baseline), or Codex's memory folder itself
+    /// (`<CODEX_HOME>/memories` or `memories_v2`), which a reset that was
+    /// cut short may have left without the marker.
+    fn codex_internal(&self, dir: &Path) -> bool {
+        if dir.join(".git").join("codex-baseline-version").is_file() {
+            return true;
+        }
+        let home = self.codex_home();
+        let home = home.canonicalize().unwrap_or(home);
+        ["memories", "memories_v2"].iter().any(|name| {
+            let memory = home.join(name);
+            dir == memory || memory.canonicalize().is_ok_and(|m| dir == m)
+        })
     }
 
     /// Unix seconds, as this daemon counts them.
@@ -1264,6 +1395,12 @@ impl Daemon {
         if !self.allowed(&root) {
             bail!("{} is outside the folders this daemon may index", root.display());
         }
+        if self.codex_internal(&root) {
+            bail!(
+                "{} is a folder Codex keeps for itself (its memory baseline); it is not indexed",
+                root.display()
+            );
+        }
         let repo = Arc::new(Repo {
             root: root.clone(),
             state: Mutex::new(RepoState::Indexing),
@@ -1337,10 +1474,11 @@ impl Daemon {
         Ok(server)
     }
 
-    /// The registered repository that holds `cwd`. With auto-indexing on, a
-    /// git repository seen for the first time is registered and `None` is
-    /// returned until its index is ready.
-    fn repo_for(self: &Arc<Self>, cwd: &Path) -> Option<Arc<Repo>> {
+    /// The registered repository that holds `cwd`. With auto-indexing on and
+    /// `register` (a request of a conversation someone works in, not one of
+    /// Codex's background requests), a git repository seen for the first
+    /// time is registered and `None` is returned until its index is ready.
+    fn repo_for(self: &Arc<Self>, cwd: &Path, register: bool) -> Option<Arc<Repo>> {
         let found = lock(&self.repos)
             .iter()
             .filter(|(root, _)| cwd.starts_with(root))
@@ -1349,7 +1487,7 @@ impl Daemon {
         if found.is_some() {
             return found;
         }
-        if lock(&self.settings).auto_index {
+        if register && lock(&self.settings).auto_index {
             let mut dir = Some(cwd);
             while let Some(d) = dir {
                 if d.join(".git").exists() {
@@ -1398,8 +1536,14 @@ impl Daemon {
             return c.clone();
         }
         let id = stable_id(&["session", key]);
-        let stored = self.usage.get_usage(&id).ok().flatten();
-        let share = lock(&self.settings).holdout_share;
+        let stored = self.usage.get_usage(&id).unwrap_or_else(|e| {
+            eprintln!("lge: the stored record of a conversation could not be read; it starts anew: {e:#}");
+            None
+        });
+        let (share, ab_arm) = {
+            let settings = lock(&self.settings);
+            (settings.holdout_share, settings.ab_arm.clone())
+        };
         let bucket_key = seen.conversation.as_deref().unwrap_or(key);
         let now = self.now();
         let mut session = Session::default();
@@ -1408,18 +1552,41 @@ impl Daemon {
                 let mut monitor: MonitorJson = serde_json::from_str(&record.monitor).unwrap_or_default();
                 // A session of Codex's background requests that started before
                 // lge told them apart (no label stored) becomes a background
-                // session when it never had a pack: no pack, never held out,
-                // and out of the comparisons from now on. Its items decided
-                // before keep their bytes; one with packs keeps its arm.
+                // session: no pack, never held out, and out of the
+                // comparisons from now on. Its items decided before keep their
+                // bytes (packs decided before are sent again). Told by its
+                // own first message, whatever it had; told only by this
+                // request (its headers, its model), when it never had a pack
+                // (one with packs keeps its arm). The model stored is the last
+                // request's, which may have gone to the reviewer in a session
+                // someone works in: it decides only on the page, until this
+                // request replaces it.
                 let had_pack = monitor.ledger.contexts.values().any(|added| *added) || record.pack_tokens > 0;
-                if let (Some(label), None, false) = (background, &monitor.background, had_pack) {
+                let label = match (lge_usage::background_task(&record.task), background) {
+                    (Some(label), _) => Some(label),
+                    (None, Some(label)) if !had_pack => Some(label),
+                    _ => None,
+                };
+                if let (Some(label), None) = (label, &monitor.background) {
                     if record.mode != BACKGROUND_MODE {
                         record.mode = BACKGROUND_MODE.to_string();
                     }
                     monitor.background = Some(label.to_string());
+                    // Its stored requests count under its label, as the page
+                    // counted them before this request.
+                    if monitor.background_requests.is_empty() && monitor.requests > 0 {
+                        monitor.background_requests.insert(label.to_string(), monitor.requests);
+                    }
+                }
+                // A background session recorded before input was counted by
+                // label: the input of its requests is its own, as the page
+                // counted it before this request.
+                if let Some(label) = monitor.background.clone().filter(|_| record.mode == BACKGROUND_MODE) {
+                    monitor.background_input.entry(label).or_insert(record.input_tokens);
                 }
                 // The items decided before the restart keep their bytes and are not counted again.
                 session.restore(std::mem::take(&mut monitor.ledger));
+                session.restore_would_add(monitor.contexts_would_add as usize);
                 let carried = Carried {
                     rules: serde_json::from_str(&record.rule_stats).unwrap_or_default(),
                     monitor,
@@ -1452,6 +1619,9 @@ impl Daemon {
                 let carried = Carried {
                     monitor: MonitorJson {
                         background: background.map(str::to_string),
+                        // Placed in an arm at random only while a share is held out.
+                        randomized: background.is_none() && share > 0.0,
+                        ab_arm: (background.is_none() && !ab_arm.is_empty()).then_some(ab_arm),
                         ..MonitorJson::default()
                     },
                     ..Carried::default()
@@ -1472,6 +1642,8 @@ impl Daemon {
             holdout,
             background: carried.monitor.background.clone(),
             background_requests: carried.monitor.background_requests.clone(),
+            background_input: carried.monitor.background_input.clone(),
+            waited_for_graph: false,
             carried,
             last_response_at: None,
             last_input_tokens: 0,
@@ -1513,11 +1685,42 @@ impl Daemon {
             let settings = lock(&self.settings);
             (settings.options(), settings.router_apply)
         };
-        let repo = seen.cwd.as_deref().and_then(|cwd| self.repo_for(Path::new(cwd)));
+        // One of Codex's background requests, or a request of a background
+        // session (a compaction's summary is not: it belongs to the
+        // conversation). It never adds a folder to the graph, refreshes an
+        // index or changes the folder the graph tools answer for; the graph
+        // of a folder already added is read as for any request.
+        let codex_background = background.is_some() || lock(&conv).background.is_some();
+        let repo = seen
+            .cwd
+            .as_deref()
+            .and_then(|cwd| self.repo_for(Path::new(cwd), !codex_background));
+        // A pack decided before a restart whose text the ledger does not keep
+        // (an older version) can only be sent again from the graph: the first
+        // request after the restart waits for a folder still being indexed,
+        // once, rather than sending the conversation without it. A background
+        // request waits too (a session an older version recorded as an
+        // ordinary one had packs): waiting only reads a folder already added.
+        if let Some(repo) = repo.as_ref().filter(|_| !again) {
+            let wait = {
+                let mut c = lock(&conv);
+                let due = !c.waited_for_graph
+                    && c.session.needs_graph_to_replay()
+                    && matches!(*lock(&repo.state), RepoState::Indexing);
+                c.waited_for_graph |= due;
+                due
+            };
+            if wait {
+                let _ = self.wait_ready(&repo.root, FIRST_INDEX_WAIT);
+            }
+        }
         let fixed_instructions = instructions_text(&value);
         let fixed_tools = tools_hash(&value);
         let now = self.now();
         let first = seen.first_user_message.clone();
+        // The router reads the whole first message (up to ROUTED_CHARS).
+        let first_text = seen.first_user_text.clone();
+        let has_history = seen.has_history;
         let model = seen.model.clone();
         let seen;
         let mut new_changes;
@@ -1525,6 +1728,7 @@ impl Daemon {
         let label;
         let mut effort_decided = false;
         let mut effort_changed = false;
+        let mut decided_record = None;
         {
             let mut guard = lock(&conv);
             let c = &mut *guard;
@@ -1533,6 +1737,7 @@ impl Daemon {
             // and the request for a compaction's summary, never get a new
             // pack; their outputs are shortened as usual and packs decided
             // before are sent again.
+            let is_background = background.is_some() || c.background.is_some();
             let background = background
                 .or_else(|| c.background.clone())
                 .or_else(|| compaction.then(|| COMPACTION_LABEL.to_string()));
@@ -1556,12 +1761,14 @@ impl Daemon {
             c.session.begin_request();
             match &repo {
                 Some(repo) => {
-                    *lock(&self.last_repo) = Some(repo.root.clone());
+                    if !is_background {
+                        *lock(&self.last_repo) = Some(repo.root.clone());
+                    }
                     c.repo = Some(repo.root.clone());
                     let mut state = lock(&repo.state);
                     match &mut *state {
                         RepoState::Ready(server) => {
-                            if !again {
+                            if !again && !is_background {
                                 let _ = server.freshen();
                                 // New commits since the last request (Codex may have committed, a PR may have been merged).
                                 let _ = lge_memory::ingest_repo_history(
@@ -1580,19 +1787,30 @@ impl Daemon {
                             if !c.routed && !first.is_empty() && c.background.is_none() {
                                 c.routed = true;
                                 if c.record.recommended_level.is_empty() {
-                                    if let Ok(route) =
-                                        lge_router::route(graph.store, &first, &lge_router::RouterConfig::default())
-                                    {
+                                    if let Ok(route) = lge_router::route(
+                                        graph.store,
+                                        &first_text,
+                                        &lge_router::RouterConfig::default(),
+                                    ) {
                                         c.record.recommended_level = route.level.as_str().to_string();
                                         c.record.reason = route.reason;
                                         c.record.files = route.files;
                                         c.record.services = route.services;
-                                        // Applied only from a conversation's first
-                                        // request: a later start would change the
-                                        // effort in the middle of it.
-                                        if c.requests == 1 && !c.holdout && router_apply.allows(route.level) {
-                                            c.record.level = route.level.as_str().to_string();
-                                            effort_decided = true;
+                                        // Applied only from a conversation's genuine
+                                        // first request: one lge meets midway (a
+                                        // resumed or forked thread, a lost record,
+                                        // a compaction's summary first) already
+                                        // went out at the client's effort, and a
+                                        // later start would change it mid-way.
+                                        if !c.holdout && router_apply.allows(route.level) {
+                                            if c.requests == 1 && !has_history && label.is_none() {
+                                                c.record.level = route.level.as_str().to_string();
+                                                effort_decided = true;
+                                            } else if c.requests == 1 {
+                                                c.record.reason.push_str(
+                                                    "; not applied: the conversation was already under way when lge first saw it",
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1610,8 +1828,10 @@ impl Daemon {
             }
             new_changes = c.session.new_changes();
             // The router's level, once applied, holds for every request of
-            // the conversation except Codex's background ones.
-            if label.is_none() && !c.holdout {
+            // the conversation, the request for a compaction's summary
+            // included (only its effort changes, never its input), except
+            // Codex's background ones.
+            if !is_background && !c.holdout {
                 if let Some(level) = Level::parse(&c.record.level) {
                     if let Some((asked, sent)) = lower_effort(&mut value, level) {
                         effort_changed = true;
@@ -1640,6 +1860,9 @@ impl Daemon {
             c.record.added_tokens_sent += seen.added_present;
             c.last_sent = (seen.removed_present, seen.added_present);
             c.sync_record();
+            if effort_decided {
+                decided_record = Some(c.record.clone());
+            }
             trace = Trace {
                 request: c.requests,
                 lge_added_tokens: seen.added_present,
@@ -1693,18 +1916,32 @@ impl Daemon {
             changed,
             new_changes,
             background: label,
-            effort_decided,
+            effort_changed,
+            decided_record,
             conv,
             trace,
         })
     }
 
-    /// Add a response's usage to its conversation and store the record. Every
-    /// [`CHECK_EVERY`] records, the rules' recovery rates are checked.
-    fn record_usage(&self, conv: &Arc<Mutex<Conv>>, usage: Usage) {
+    /// Store a conversation's record now, before any usage: a decision a
+    /// restart must keep. A failed write is logged; the request goes on.
+    fn store_record(&self, record: &UsageRecord) {
+        if let Err(e) = self.usage.put_usage(record) {
+            eprintln!("lge: the record of a conversation could not be stored: {e:#}");
+        }
+    }
+
+    /// Add a response's usage to its conversation and store the record.
+    /// `label`: the request's background label (or `compaction`), whose
+    /// input tokens are counted by label. Every [`CHECK_EVERY`] records, the
+    /// rules' recovery rates are checked.
+    fn record_usage(&self, conv: &Arc<Mutex<Conv>>, usage: Usage, label: Option<&str>) {
         let now = self.now();
         let record = {
             let mut c = lock(conv);
+            if let Some(label) = label {
+                *c.background_input.entry(label.to_string()).or_default() += usage.input_tokens;
+            }
             c.observe_response(now, &usage);
             c.record.input_tokens += usage.input_tokens;
             c.record.cached_input_tokens += usage.cached_input_tokens;
@@ -1878,6 +2115,11 @@ impl Daemon {
                 }
             );
             if let Some(r) = &rewritten {
+                // The effort decided now is stored at once, so a restart
+                // before the first usage keeps it.
+                if let Some(record) = &r.decided_record {
+                    self.store_record(record);
+                }
                 note.push_str(&format!(" -> {}B", r.body.len()));
                 if let Some(label) = &r.background {
                     note.push_str(&format!(" (background: {label})"));
@@ -1910,13 +2152,14 @@ impl Daemon {
 
         // The provider refused a body lge changed, before anything was
         // relayed: send it once more without the rewrites first made in this
-        // request. Older decisions stay, so the cached prefix survives, and
-        // the reverted items stay as the client sent them from now on.
+        // request, and with the client's reasoning effort when lge lowered
+        // it. Older decisions stay, so the cached prefix survives, and the
+        // reverted items stay as the client sent them from now on.
         let mut retried = false;
         let first_status = response.status().as_u16();
-        let due = rewritten
-            .as_ref()
-            .is_some_and(|r| RETRY_STATUSES.contains(&first_status) && r.changed && r.new_changes > 0);
+        let due = rewritten.as_ref().is_some_and(|r| {
+            RETRY_STATUSES.contains(&first_status) && r.changed && (r.new_changes > 0 || r.effort_changed)
+        });
         let refused = if due && plain.is_some() { rewritten.take() } else { None };
         if let (Some(r), Some(plain)) = (refused, &plain) {
             {
@@ -1928,17 +2171,24 @@ impl Daemon {
                     .read_to_end(&mut error);
                 // Codex sends a conversation's requests one at a time, so the
                 // request's new decisions are still the session's latest.
-                {
+                let reset = {
                     let mut c = lock(&r.conv);
                     c.session.revert_new();
-                    // The provider may have refused the lowered effort: the
-                    // conversation keeps the client's effort from now on.
-                    if r.effort_decided {
+                    // The provider may have refused the lowered effort (on
+                    // any request: the thread may have moved to a model that
+                    // does not take it): the conversation keeps the client's
+                    // effort from now on, stored at once.
+                    (r.effort_changed && Level::parse(&c.record.level) != Some(Level::Top)).then(|| {
                         c.record.level = Level::Top.as_str().to_string();
                         c.record
                             .reason
                             .push_str("; not applied: the provider refused the request");
-                    }
+                        c.sync_record();
+                        c.record.clone()
+                    })
+                };
+                if let Some(record) = &reset {
+                    self.store_record(record);
                 }
                 let again = self.rewrite_safely(plain, thread.as_deref(), &origin, true);
                 // Unchanged now: the client's own bytes and headers, as they came.
@@ -1963,9 +2213,14 @@ impl Daemon {
                     c.sync_record();
                 }
                 eprintln!(
-                    "lge: the provider refused a rewritten request with {first_status} ({}); sent again without its {} new rewrites: {}",
+                    "lge: the provider refused a rewritten request with {first_status} ({}); sent again without its {} new rewrites{}: {}",
                     error_kind(&error),
                     r.new_changes,
+                    if r.effort_changed {
+                        " and with the client's reasoning effort"
+                    } else {
+                        ""
+                    },
                     response.status().as_u16()
                 );
                 rewritten = Some(again.unwrap_or(r));
@@ -2052,7 +2307,7 @@ impl Daemon {
         // the numbers right after the answer ends sees them.
         if let Some(r) = &rewritten {
             if let Some(usage) = usage {
-                self.record_usage(&r.conv, usage);
+                self.record_usage(&r.conv, usage, r.background.as_deref());
             }
             self.trace(&r.conv, r.trace.clone(), status.as_u16(), retried, usage);
         }
@@ -2186,7 +2441,7 @@ impl Daemon {
         let bulky: Vec<Value> = lock(&repo.bulky)
             .iter()
             .map(|d| {
-                let file = repo.root.join(lge_index::ignore_file(&repo.root));
+                let file = repo.root.join(lge_index::ignore_file(&repo.root, &d.path));
                 json!({ "path": d.path, "bytes": d.bytes, "files": d.files, "reason": d.reason, "ignore_line": d.ignore_line(), "ignore_file": file.to_string_lossy() })
             })
             .collect();
@@ -2205,17 +2460,27 @@ impl Daemon {
 
     fn status(&self) -> Value {
         let repos: Vec<Value> = lock(&self.repos).values().map(|r| self.repo_json(r)).collect();
-        let records = self.usage.list_usage(0).unwrap_or_else(|e| {
+        let mut records = self.usage.list_usage(0).unwrap_or_else(|e| {
             eprintln!("lge: the usage log could not be read: {e:#}");
             Vec::new()
         });
+        // Every number below reads the same records, with Codex's background
+        // sessions of older versions told apart.
+        classify_stored(&mut records);
+        let monitor_of = |r: &UsageRecord| -> MonitorJson { serde_json::from_str(&r.monitor).unwrap_or_default() };
+        // Sessions of an `lge ab` run: listed, and kept out of the cards, before
+        // and after and the long-session note (the holdout comparison never
+        // has them: an ab run holds nobody out).
+        let ab_run = |r: &UsageRecord| monitor_of(r).ab_arm.is_some();
         let now = self.now();
         let window: Vec<UsageRecord> = records
             .iter()
             .filter(|r| r.started_at >= now - WINDOW_SECONDS)
             .cloned()
             .collect();
-        let live: HashMap<String, (u64, Saved, Option<String>)> = lock(&self.convs)
+        // Live conversations: requests, what they saved, folder, and whether
+        // they belong to an `lge ab` run.
+        let live: HashMap<String, (u64, Saved, Option<String>, bool)> = lock(&self.convs)
             .values()
             .map(|c| {
                 let c = lock(c);
@@ -2225,6 +2490,7 @@ impl Daemon {
                         c.requests,
                         c.session.saved.clone(),
                         c.repo.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        c.carried.monitor.ab_arm.is_some(),
                     ),
                 )
             })
@@ -2233,13 +2499,14 @@ impl Daemon {
         let mut by_mode: BTreeMap<String, [i64; 5]> = BTreeMap::new();
         // Codex's background requests are not sessions anyone worked in.
         for r in records.iter().filter(|r| r.mode != BACKGROUND_MODE) {
-            let t = by_mode
-                .entry(if r.mode.is_empty() {
-                    "other".to_string()
-                } else {
-                    r.mode.clone()
-                })
-                .or_insert([0; 5]);
+            let mode = if is_proxy_mode(&r.mode) && ab_run(r) {
+                "ab".to_string()
+            } else if r.mode.is_empty() {
+                "other".to_string()
+            } else {
+                r.mode.clone()
+            };
+            let t = by_mode.entry(mode).or_insert([0; 5]);
             t[0] += 1;
             t[1] += r.input_tokens;
             t[2] += r.cached_input_tokens;
@@ -2250,8 +2517,10 @@ impl Daemon {
             .iter()
             .map(|(mode, t)| json!({ "mode": mode, "sessions": t[0], "input_tokens": t[1], "cached_input_tokens": t[2], "output_tokens": t[3], "reasoning_tokens": t[4] }))
             .collect();
+        // The cards of tool output and packs, since the daemon started:
+        // sessions of an `lge ab` run are left out, as from the others.
         let mut saved = Saved::default();
-        for (_, s, _) in live.values() {
+        for (_, s, _, _) in live.values().filter(|(_, _, _, ab)| !ab) {
             saved.outputs_shortened += s.outputs_shortened;
             saved.tokens_before += s.tokens_before;
             saved.tokens_after += s.tokens_after;
@@ -2259,16 +2528,27 @@ impl Daemon {
             saved.context_tokens += s.context_tokens;
             saved.contexts_known += s.contexts_known;
             saved.contexts_over_budget += s.contexts_over_budget;
+            saved.contexts_too_large += s.contexts_too_large;
             saved.contexts_retired += s.contexts_retired;
         }
-        let monitor_of = |r: &UsageRecord| -> MonitorJson { serde_json::from_str(&r.monitor).unwrap_or_default() };
+        // Packs a conversation added, from its ledger as well: a session of
+        // v0.0.2 had no pack counts, and a pack restored after a restart is
+        // not counted again, while its retirement is.
+        let packs_added_of = |m: &MonitorJson| -> u64 {
+            m.packs_added
+                .max(m.ledger.contexts.values().filter(|added| **added).count() as u64)
+        };
         let mut recent: Vec<&UsageRecord> = records.iter().filter(|r| is_proxy_mode(&r.mode)).collect();
         recent.sort_by_key(|r| std::cmp::Reverse(r.finished_at));
         let sessions: Vec<Value> = recent
             .iter()
             .take(50)
             .map(|r| {
-                let (requests, s, repo) = live.get(&r.id).cloned().unwrap_or_default();
+                let current = live.get(&r.id).cloned();
+                let (s, repo) = current
+                    .as_ref()
+                    .map(|(_, s, repo, _)| (s.clone(), repo.clone()))
+                    .unwrap_or_default();
                 let m = monitor_of(r);
                 let net = r.removed_tokens_sent - r.added_tokens_sent;
                 let share = if r.input_tokens + net > 0 {
@@ -2276,14 +2556,22 @@ impl Daemon {
                 } else {
                     0.0
                 };
-                let requests = requests.max(m.requests);
+                // A session recorded before v0.0.2 stored no request count:
+                // unknown (null), not 0, unless it is live in this daemon.
+                let stored = lge_usage::stored_requests(r);
+                let requests = match (current.as_ref().map(|(n, _, _, _)| *n), stored) {
+                    (None, None) => None,
+                    (live, stored) => Some(live.unwrap_or(0).max(stored.unwrap_or(0))),
+                };
                 json!({
                     "id": r.session_id, "task": r.task, "model": r.model, "repo": repo, "mode": r.mode,
                     "background": m.background,
+                    "ab_arm": m.ab_arm,
                     "requests": requests,
-                    "mean_input_tokens": mean_input(r, requests),
-                    "packs_added": m.packs_added, "packs_known": m.packs_known,
-                    "packs_over_budget": m.packs_over_budget, "packs_retired": m.packs_retired,
+                    "mean_input_tokens": requests.map(|n| mean_input(r, n)),
+                    "packs_added": packs_added_of(&m), "packs_known": m.packs_known,
+                    "packs_over_budget": m.packs_over_budget, "packs_too_large": m.packs_too_large,
+                    "packs_retired": m.packs_retired,
                     "started_at": r.started_at, "finished_at": r.finished_at,
                     "input_tokens": r.input_tokens, "cached_input_tokens": r.cached_input_tokens,
                     "output_tokens": r.output_tokens, "reasoning_tokens": r.reasoning_tokens,
@@ -2374,14 +2662,43 @@ impl Daemon {
                         "first_lge_break_item": m.prefix.first_lge_break_item, "cold_restarts": m.cold_restarts })
             })
             .collect();
-        let (removed, added): (i64, i64) = records
+        let counted: Vec<&UsageRecord> = records
             .iter()
             .filter(|r| r.mode == "proxy" || r.mode == BACKGROUND_MODE)
+            .collect();
+        let (removed, added): (i64, i64) = counted
+            .iter()
             .fold((0, 0), |(a, b), r| (a + r.removed_tokens_sent, b + r.added_tokens_sent));
+        // The tokens of packs sent, over the same sessions as the counts: of
+        // them, those of sessions whose packs no count covers (no
+        // `packs_added` in their raw monitor JSON and no pack in their ledger:
+        // recorded before v0.0.2; one such session continued since moves to
+        // the counted part), and those of Codex's background sessions; and
+        // since when. A session of v0.0.2 has its packs counted as added, from
+        // its ledger.
+        let has_pack_counts = |r: &UsageRecord| {
+            serde_json::from_str::<Value>(&r.monitor).ok().is_some_and(|m| {
+                m.get("packs_added").is_some()
+                    || m.pointer("/ledger/contexts")
+                        .and_then(Value::as_object)
+                        .is_some_and(|c| c.values().any(|added| added.as_bool() == Some(true)))
+            })
+        };
+        let tokens_uncounted: i64 = counted
+            .iter()
+            .filter(|r| !has_pack_counts(r))
+            .map(|r| r.added_tokens_sent)
+            .sum();
+        let tokens_background: i64 = counted
+            .iter()
+            .filter(|r| r.mode == BACKGROUND_MODE)
+            .map(|r| r.added_tokens_sent)
+            .sum();
+        let packs_since = counted.iter().map(|r| r.started_at).min();
         // Packs over the sessions that get them (not the held-out ones, whose
         // packs are decided and never added): what was added and why others
         // were not. What the held-out sessions would have added, apart.
-        let mut packs = [0u64; 4];
+        let mut packs = [0u64; 5];
         let mut would_add = 0u64;
         for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
             let m = monitor_of(r);
@@ -2389,10 +2706,13 @@ impl Daemon {
                 would_add += m.contexts_would_add;
                 continue;
             }
-            for (slot, n) in packs
-                .iter_mut()
-                .zip([m.packs_added, m.packs_known, m.packs_over_budget, m.packs_retired])
-            {
+            for (slot, n) in packs.iter_mut().zip([
+                packs_added_of(&m),
+                m.packs_known,
+                m.packs_over_budget,
+                m.packs_retired,
+                m.packs_too_large,
+            ]) {
                 *slot += n;
             }
         }
@@ -2426,7 +2746,12 @@ impl Daemon {
             "ghost_tools": ghost_tools,
             "monitor": { "raw_retries": raw_retries, "cold_restarts": cold_restarts, "cold_tokens": cold_tokens, "lge_breaks": lge_breaks, "client_breaks": client_breaks },
             "annuity": { "removed_tokens_sent": removed, "added_tokens_sent": added, "net_tokens": removed - added },
-            "packs": { "added": packs[0], "known": packs[1], "over_budget": packs[2], "retired": packs[3], "tokens_sent": added, "holdout_would_add": would_add },
+            "packs": {
+                "added": packs[0], "known": packs[1], "over_budget": packs[2], "retired": packs[3], "too_large": packs[4],
+                "tokens_sent": added, "tokens_sent_uncounted": tokens_uncounted,
+                "tokens_sent_background": tokens_background, "since": packs_since,
+                "holdout_would_add": would_add,
+            },
             "background": background,
             "long_sessions": long_sessions,
         })
@@ -3037,6 +3362,8 @@ mod tests {
             holdout: false,
             background: None,
             background_requests: BTreeMap::new(),
+            background_input: BTreeMap::new(),
+            waited_for_graph: false,
             carried: Carried::default(),
             raw_retries: 0,
             cold_restarts: 0,

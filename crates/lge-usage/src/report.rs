@@ -455,10 +455,38 @@ pub struct ArmComparison {
     /// `not enough sessions` while either arm is below the minimum.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Sessions of either arm's mode left out of the comparison: recorded
+    /// before v0.0.2 (no request count), or not assigned to an arm at random
+    /// (started while the holdout share was 0, or before lge recorded that).
+    pub left_out: usize,
+    /// Why they were left out, for the page; `None` when none was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_out_note: Option<String>,
 }
 
-/// The value of one measure for one session. `requests` is read from the
-/// monitor JSON the proxy writes; a record without it counts 0.
+/// The model requests a proxy session's record stored, from the monitor JSON
+/// the proxy writes (`requests`, since v0.0.2). `None` when the record has
+/// no such count: one written before v0.0.2, or not by the proxy. Read from
+/// the raw JSON, so a missing key is told from a stored 0.
+pub fn stored_requests(rec: &UsageRecord) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(&rec.monitor)
+        .ok()?
+        .get("requests")?
+        .as_u64()
+}
+
+/// True when the proxy placed the session in an arm at random: it was new
+/// while the holdout share was above 0 (`randomized` in the monitor JSON).
+fn randomized(rec: &UsageRecord) -> bool {
+    serde_json::from_str::<serde_json::Value>(&rec.monitor)
+        .ok()
+        .and_then(|m| m.get("randomized").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// The value of one measure for one session. Only sessions with a stored
+/// request count ([`stored_requests`]) are compared, so `requests` is never
+/// a missing count read as 0.
 fn metric(rec: &UsageRecord, name: &str) -> f64 {
     let u = TokenUsage::of(rec);
     match name {
@@ -467,10 +495,7 @@ fn metric(rec: &UsageRecord, name: &str) -> f64 {
         "uncached_input_tokens" => u.uncached_input_tokens() as f64,
         "output_tokens" => u.output_tokens as f64,
         "reasoning_tokens" => u.reasoning_tokens as f64,
-        "requests" => serde_json::from_str::<serde_json::Value>(&rec.monitor)
-            .ok()
-            .and_then(|m| m.get("requests").and_then(serde_json::Value::as_f64))
-            .unwrap_or(0.0),
+        "requests" => stored_requests(rec).unwrap_or(0) as f64,
         "removed_tokens_sent" => rec.removed_tokens_sent.max(0) as f64,
         _ => 0.0,
     }
@@ -479,9 +504,40 @@ fn metric(rec: &UsageRecord, name: &str) -> f64 {
 /// Compare the sessions of the two proxy arms, told apart by `mode`
 /// ([`PROXY_ARM`], [`HOLDOUT_ARM`]); other records are ignored. Differences
 /// are proxy less holdout, so a negative input difference is a saving.
+///
+/// Only sessions placed in an arm at random are compared: a session that
+/// started while the holdout share was 0 (or was stored before lge recorded
+/// that) would compare one period or version against another. A session
+/// recorded before v0.0.2 has no request count and is left out too. How many
+/// were left out, and why, is in `left_out` and `left_out_note`.
 pub fn compare_arms(records: &[UsageRecord]) -> ArmComparison {
-    let arm = |mode: &str| -> Vec<&UsageRecord> { records.iter().filter(|r| r.mode == mode).collect() };
+    let in_arms: Vec<&UsageRecord> = records
+        .iter()
+        .filter(|r| r.mode == PROXY_ARM || r.mode == HOLDOUT_ARM)
+        .collect();
+    let no_count = in_arms.iter().filter(|r| stored_requests(r).is_none()).count();
+    let not_random = in_arms
+        .iter()
+        .filter(|r| stored_requests(r).is_some() && !randomized(r))
+        .count();
+    let compared: Vec<&UsageRecord> = in_arms
+        .iter()
+        .copied()
+        .filter(|r| stored_requests(r).is_some() && randomized(r))
+        .collect();
+    let arm = |mode: &str| -> Vec<&UsageRecord> { compared.iter().copied().filter(|r| r.mode == mode).collect() };
     let (proxy, holdout) = (arm(PROXY_ARM), arm(HOLDOUT_ARM));
+    let mut reasons = Vec::new();
+    if no_count > 0 {
+        reasons.push(format!(
+            "{no_count} sessions recorded before v0.0.2 have no request count and are left out"
+        ));
+    }
+    if not_random > 0 {
+        reasons.push(format!(
+            "{not_random} sessions that started while the holdout share was 0 (or before lge recorded it) are left out"
+        ));
+    }
     let stats = |name: &str, recs: &[&UsageRecord]| ArmStats {
         arm: name.to_string(),
         sessions: recs.len(),
@@ -498,6 +554,8 @@ pub fn compare_arms(records: &[UsageRecord]) -> ArmComparison {
         holdout: stats(HOLDOUT_ARM, &holdout),
         differences: Vec::new(),
         note: None,
+        left_out: no_count + not_random,
+        left_out_note: (!reasons.is_empty()).then(|| reasons.join("; ")),
     };
     if proxy.len() < MIN_ARM_SESSIONS || holdout.len() < MIN_ARM_SESSIONS {
         out.note = Some("not enough sessions".to_string());
@@ -1354,7 +1412,7 @@ retry: tokens of attempts that were followed by an escalation
             output_tokens: 1000,
             reasoning_tokens: 400,
             removed_tokens_sent: if mode == PROXY_ARM { 5000 } else { 0 },
-            monitor: format!("{{\"requests\":{requests},\"raw_retries\":0}}"),
+            monitor: format!("{{\"requests\":{requests},\"raw_retries\":0,\"randomized\":true}}"),
             ..UsageRecord::default()
         }
     }
@@ -1432,5 +1490,51 @@ retry: tokens of attempts that were followed by an escalation
         assert!(few.differences.is_empty());
         let none = compare_arms(&[]);
         assert_eq!(none.proxy.medians["input_tokens"], 0.0);
+        assert_eq!((none.left_out, none.left_out_note), (0, None));
+    }
+
+    #[test]
+    fn sessions_without_a_stored_request_count_are_left_out_of_the_arms() {
+        let older = |i: usize| UsageRecord {
+            id: format!("older-{i}"),
+            mode: PROXY_ARM.to_string(),
+            input_tokens: 9_000_000,
+            monitor: String::new(),
+            ..UsageRecord::default()
+        };
+        let records: Vec<UsageRecord> = (0..41)
+            .map(older)
+            .chain((0..40).map(|i| arm_record(i, PROXY_ARM, 80_000, 20)))
+            .chain((0..30).map(|i| arm_record(i, HOLDOUT_ARM, 100_000, 20)))
+            .collect();
+        assert_eq!(stored_requests(&records[0]), None);
+        assert_eq!(stored_requests(&records[41]), Some(20));
+        let c = compare_arms(&records);
+        assert_eq!(c.proxy.sessions, 40);
+        assert_eq!(c.proxy.medians["requests"], 20.0, "a missing count is not read as 0");
+        assert_eq!(c.proxy.medians["input_tokens"], 80_000.0);
+        assert_eq!(c.left_out, 41);
+        assert_eq!(
+            c.left_out_note.as_deref(),
+            Some("41 sessions recorded before v0.0.2 have no request count and are left out")
+        );
+    }
+
+    #[test]
+    fn only_sessions_placed_in_an_arm_at_random_are_compared() {
+        let unassigned = |i: usize| UsageRecord {
+            monitor: "{\"requests\":3}".to_string(),
+            ..arm_record(i, PROXY_ARM, 9_000_000, 3)
+        };
+        let records: Vec<UsageRecord> = (0..5)
+            .map(unassigned)
+            .chain((0..2).map(|i| arm_record(i, PROXY_ARM, 80_000, 20)))
+            .chain((0..2).map(|i| arm_record(i, HOLDOUT_ARM, 100_000, 25)))
+            .collect();
+        let c = compare_arms(&records);
+        assert_eq!((c.proxy.sessions, c.holdout.sessions), (2, 2));
+        assert_eq!(c.proxy.medians["input_tokens"], 80_000.0);
+        assert_eq!(c.left_out, 5);
+        assert!(c.left_out_note.unwrap().contains("holdout share was 0"));
     }
 }

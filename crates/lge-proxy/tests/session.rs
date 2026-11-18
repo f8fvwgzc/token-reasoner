@@ -2,8 +2,8 @@
 use lge_proxy::responses::{transform, Seen};
 use lge_proxy::rules::{Mode, RuleModes};
 use lge_proxy::session::{
-    pack_budget, Graph, Options, PrefixStats, Session, CONTEXT_CLOSE, CONTEXT_OPEN, FOLLOW_UP_PACK_TOKENS,
-    LOCAL_CONTEXT_BUDGET, MIN_PACK_ROOM,
+    pack_budget, Graph, Ledger, Options, PrefixStats, Session, CONTEXT_CLOSE, CONTEXT_OPEN, FOLLOW_UP_PACK_TOKENS,
+    LOCAL_CONTEXT_BUDGET, MIN_PACK_ROOM, PACK_HEADER,
 };
 use lge_retrieve::{budget::count, index_repo, IndexOptions};
 use lge_store::Store;
@@ -195,6 +195,7 @@ fn a_question_about_one_file_that_nothing_else_uses_gets_a_small_pack() {
         shared,
         &lge_retrieve::PackOptions {
             budget: opts.context_budget,
+            header: Some(PACK_HEADER.to_string()),
             ..lge_retrieve::PackOptions::default()
         },
     )
@@ -1042,4 +1043,303 @@ fn a_copy_of_a_message_gets_no_second_pack() {
     let (old, _) = turn(&mut restarted, &graph, &items, &opts);
     assert_eq!(old[..first.len()], first[..]);
     assert_eq!(packs(&old).len(), 2, "the copy replays the pack");
+}
+
+// ------------------------------------------------- pack sizes, stored packs, restarts
+
+/// A module of four functions whose signatures are `params` long arguments:
+/// each starting point's heading, which a pack never cuts, is large.
+fn settlement_module(params: usize) -> String {
+    let mut text = String::from("\"\"\"Settlement batches.\"\"\"\n\n");
+    for name in SETTLEMENT {
+        let args: Vec<String> = (0..params).map(|i| format!("{name}_argument_{i}")).collect();
+        text.push_str(&format!(
+            "def {name}({}):\n    \"\"\"Do the {name} step.\"\"\"\n    return None\n\n\n",
+            args.join(", ")
+        ));
+    }
+    text
+}
+
+const SETTLEMENT: [&str; 4] = [
+    "reconcile_settlement_batch",
+    "normalise_gateway_records",
+    "allocate_partial_refunds",
+    "publish_settlement_report",
+];
+
+/// The repository with the settlement module (signatures of `params`
+/// arguments) indexed in a folder nothing else names, `depth` folders of
+/// long names below `orders_api`.
+fn settlement_repo(params: usize, depth: usize) -> (tempfile::TempDir, PathBuf, Store) {
+    let (dir, root, store) = repo();
+    let mut folder = root.join("orders_api/settlement/reconciliation");
+    for level in 0..depth {
+        folder = folder.join(format!(
+            "batch_processing_layer_for_the_legacy_payment_gateway_adapters_and_their_ledgers_{level}"
+        ));
+    }
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("batch_settlement.py"), settlement_module(params)).unwrap();
+    index_repo(&store, &root, &IndexOptions::default()).unwrap();
+    (dir, root, store)
+}
+
+/// A follow-up that names the four settlement functions.
+fn about_settlement() -> String {
+    format!("{} must round every amount to whole cents", SETTLEMENT.join(", "))
+}
+
+#[test]
+fn a_follow_up_about_a_new_file_gets_a_small_pack_in_a_large_workspace() {
+    let (_dir, root, store) = settlement_repo(10, 0);
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    // With all four starting points, the headings alone make a pack larger
+    // than a follow-up may be.
+    let mut alone = Session::default();
+    let four = alone
+        .context_for(&graph, &about_settlement(), &opts)
+        .expect("names symbols");
+    assert!(count(&four) > FOLLOW_UP_PACK_TOKENS, "{}", count(&four));
+
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    items.push(message(&about_settlement()));
+    let (second, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(second[..first.len()], first[..], "the cached prefix must not change");
+    let follow = pack_text(second.last().unwrap()).expect("a follow-up pack, with fewer starting points");
+    assert!(count(follow) <= FOLLOW_UP_PACK_TOKENS, "{}", count(follow));
+    assert!(follow.contains("batch_settlement.py"), "{follow}");
+    assert_eq!(
+        (
+            session.saved.contexts_added,
+            session.saved.contexts_over_budget,
+            session.saved.contexts_too_large
+        ),
+        (2, 0, 0)
+    );
+    // The ledger keeps how many starting points it was built with, so a
+    // restart without its text builds the same pack.
+    let mut ledger = session.ledger().clone();
+    assert_eq!(ledger.pack_seeds.len(), 1, "{:?}", ledger.pack_seeds);
+    ledger.pack_texts.clear();
+    let mut restarted = Session::default();
+    restarted.restore(ledger);
+    let (again, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, second);
+}
+
+#[test]
+fn a_follow_up_too_large_for_its_size_is_not_counted_as_over_the_conversation_budget() {
+    // One starting point alone, its path and name repeated in the pack's
+    // conclusions and its heading, is larger than a follow-up may be.
+    let (_dir, root, store) = settlement_repo(10, 6);
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, seen) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    assert!(
+        opts.pack_conversation_budget - seen.added_present as usize > FOLLOW_UP_PACK_TOKENS,
+        "the budget has room: {}",
+        seen.added_present
+    );
+    items.push(message(&format!("{} must round to whole cents", SETTLEMENT[0])));
+    let (second, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&second).len(), 1, "no follow-up pack");
+    assert_eq!(
+        (session.saved.contexts_over_budget, session.saved.contexts_too_large),
+        (0, 1)
+    );
+}
+
+#[test]
+fn after_a_restart_a_pack_keeps_its_bytes_though_its_file_changed() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    let items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    // The agent edits create_order, and the graph follows.
+    let routes = root.join("orders_api/routes.py");
+    let text = std::fs::read_to_string(&routes).unwrap();
+    let edited = text.replacen(
+        "def create_order",
+        "# checked first\n# then stored\ndef create_order",
+        1,
+    );
+    assert_ne!(edited, text);
+    std::fs::write(&routes, edited).unwrap();
+    index_repo(&store, &root, &IndexOptions::default()).unwrap();
+    // A pack built now differs, but a restarted daemon sends the pack as it was.
+    assert_ne!(
+        Session::default().context_for(&graph, ABOUT_ROUTES, &opts).as_deref(),
+        pack_text(&first[2])
+    );
+    let mut restarted = Session::default();
+    restarted.restore(session.ledger().clone());
+    let (again, seen) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, first);
+    assert_eq!(restarted.saved, Default::default(), "counted once");
+    assert_eq!(seen.lge_break_item, None);
+    // A retired pack's text is not kept.
+    let mut compacted_items = compacted(&root, &[ABOUT_ROUTES, "ok, go on"]);
+    compacted_items.push(message("thanks"));
+    turn(&mut restarted, &graph, &compacted_items, &opts);
+    assert!(
+        restarted.ledger().pack_texts.is_empty(),
+        "{:?}",
+        restarted.ledger().retired
+    );
+}
+
+#[test]
+fn a_pack_does_not_repeat_the_message_it_follows() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let detail = "Each payload field arrives as text from the browser form and the handler trusts it today. ";
+    let long = format!("create_order must validate the payload. {}", detail.repeat(55));
+    assert!(count(&long) > 900 && long.len() < 8000, "{}", count(&long));
+    let items = vec![environment(&root), message(&long)];
+    let mut session = Session::default();
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    let pack = pack_text(&first[2]).expect("names create_order");
+    assert!(!pack.contains(detail.trim()), "{pack}");
+    assert!(pack.contains(PACK_HEADER), "{pack}");
+    let frame = count(CONTEXT_OPEN) + count(CONTEXT_CLOSE) + 2;
+    assert!(count(pack) <= opts.context_budget + frame + 300, "{}", count(pack));
+
+    // A conversation of an older version keeps its packs' heading: one
+    // whose ledger keeps no text is built again with the message in it,
+    // byte for byte as that version built it.
+    let mut older = Session::default();
+    older.restore(serde_json::from_value::<Ledger>(json!({})).unwrap());
+    assert_eq!(
+        older.ledger().pack_format,
+        0,
+        "a ledger written before the field existed"
+    );
+    let (old_first, _) = turn(&mut older, &graph, &items, &opts);
+    let old_pack = pack_text(&old_first[2]).expect("names create_order");
+    assert!(
+        old_pack.contains(&format!("# Context for: {}", long.trim())),
+        "{old_pack}"
+    );
+    let mut stored = serde_json::to_value(older.ledger()).unwrap();
+    let fields = stored.as_object_mut().unwrap();
+    fields.remove("pack_texts");
+    fields.remove("pack_format");
+    fields.remove("pack_seeds");
+    let mut restarted = Session::default();
+    restarted.restore(serde_json::from_value(stored).unwrap());
+    let (again, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, old_first);
+}
+
+#[test]
+fn a_pack_decided_before_a_restart_comes_back_once_the_graph_is_ready() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let mut session = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    let (first, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&first).len(), 1);
+    let send = |s: &mut Session, items: &[Value], graph: Option<&Graph>| {
+        let mut body = json!({ "input": items });
+        transform(&mut body, s, graph, &opts);
+        body["input"].as_array().unwrap().clone()
+    };
+    items.push(message("go on"));
+
+    // A ledger of an older version keeps no text: without the graph the
+    // pack is left out, and it comes back as soon as the graph is ready.
+    let mut older = session.ledger().clone();
+    older.pack_texts.clear();
+    let mut restarted = Session::default();
+    restarted.restore(older);
+    let without = send(&mut restarted, &items[..2], None);
+    assert!(packs(&without).is_empty());
+    let with = send(&mut restarted, &items, Some(&graph));
+    assert_eq!(
+        with[..first.len()],
+        first[..],
+        "the pack decided before, the same bytes"
+    );
+
+    // A ledger that keeps the text sends it with or without the graph.
+    let mut restarted = Session::default();
+    restarted.restore(session.ledger().clone());
+    let without = send(&mut restarted, &items, None);
+    assert_eq!(without[..first.len()], first[..]);
+}
+
+#[test]
+fn a_restart_keeps_the_limit_of_packs_per_conversation() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options {
+        max_contexts: 2,
+        pack_conversation_budget: 100_000,
+        ..Options::default()
+    };
+    let mut session = Session::default();
+    two_turns(&mut session, &graph, &root, &opts);
+    // A compaction keeps only the newest message; then a message about a third file.
+    let mut items = compacted(&root, &[ABOUT_AUDIT]);
+    turn(&mut session, &graph, &items, &opts);
+    let ledger = session.ledger().clone();
+    items.push(message(ABOUT_MAILER));
+    let (kept, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&kept).len(), 1, "the conversation had its packs");
+    let mut restarted = Session::default();
+    restarted.restore(ledger);
+    let (after, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(after, kept, "the same with or without a restart");
+
+    // A held-out conversation: its next would-be pack is a follow-up after a restart too.
+    let held = Options {
+        holdout: true,
+        ..Options::default()
+    };
+    let mut first = Session::default();
+    let mut items = vec![environment(&root), message(ABOUT_ROUTES)];
+    turn(&mut first, &graph, &items, &held);
+    assert_eq!(first.saved.contexts_would_add, 1);
+    items.push(message(ABOUT_AUDIT));
+    let mut restarted = Session::default();
+    restarted.restore(first.ledger().clone());
+    restarted.restore_would_add(first.saved.contexts_would_add);
+    turn(&mut restarted, &graph, &items, &held);
+    assert_eq!(restarted.saved.contexts_would_add, 1, "counted once");
+    assert!(
+        restarted.saved.context_tokens_would_add <= FOLLOW_UP_PACK_TOKENS,
+        "{}",
+        restarted.saved.context_tokens_would_add
+    );
 }

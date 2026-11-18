@@ -104,10 +104,15 @@ nothing whatever the file says. The report says which note was used.
    | Rule modes (`rules`, the skeleton's included) | as you set them, but switched off by the line above | as you set them on the page |
    | Holdout share (`holdout_share`) | 0 | 0 |
    | Index on first use (`auto_index`) | off | off |
+   | The run's arm (`ab_arm`) | `off` | `on` |
 
    That is the default variant, `features`. For `--variant terse` and `--variant batch`
-   both arms keep your settings as they are, except holdout 0 and indexing on first use
-   off; what differs is `AGENTS.md` (see "Variants"). Every other setting stays as it is.
+   both arms keep your settings as they are, except holdout 0, indexing on first use off
+   and the arm's name; what differs is `AGENTS.md` (see "Variants"). Every other setting
+   stays as it is, `router_apply` included, so with it on both arms of `features` differ
+   in the effort too. `ab_arm` tags the sessions of the run: the daemon lists them, and
+   keeps them out of its cards, its long-session note and the proxy's row of "Before and
+   after"; a daemon that restarts forgets it.
    For an arm whose settings use the graph (graph context or the rules on), the copy is
    added to the daemon and indexed before the session starts, so the first message already
    gets its context; it is removed from the daemon afterwards. The holdout is 0 in both

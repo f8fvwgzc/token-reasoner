@@ -1643,7 +1643,12 @@ fn a_variant_run_writes_the_variants_text_into_one_arm_only() {
             assert!(s.registered, "{s:?}");
         }
         assert!(!off_text.contains(BATCH_LINE.trim_end()));
-        let sets = daemon.state().sets[sets_before..].to_vec();
+        let mut sets = daemon.state().sets[sets_before..].to_vec();
+        // Each arm is named, so the daemon keeps the run's sessions apart.
+        for set in &mut sets[..4] {
+            assert!(matches!(set["ab_arm"].as_str(), Some("on" | "off")), "{set}");
+            set["ab_arm"] = Value::Null;
+        }
         assert!(
             sets[..4].windows(2).all(|w| w[0] == w[1]),
             "both arms get the same settings"

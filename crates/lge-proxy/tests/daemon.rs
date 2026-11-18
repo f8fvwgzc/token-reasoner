@@ -1196,7 +1196,9 @@ fn the_status_reports_rules_holdout_prefix_ghost_tools_monitor_and_annuity() {
         .any(|x| x["id"] == "rerun_delta" && x["kind"] == "measure_only"));
     assert_eq!(status["thresholds"]["min_judged"], 200);
     assert!(status["cohorts"].is_array());
-    assert_eq!(status["holdout"]["proxy"]["sessions"], 1);
+    // Started while nobody was held out: not placed in an arm at random.
+    assert_eq!(status["holdout"]["proxy"]["sessions"], 0);
+    assert_eq!(status["holdout"]["left_out"], 1);
     assert_eq!(status["holdout"]["note"], "not enough sessions");
 
     let prefix = &status["prefix"];
@@ -1725,8 +1727,11 @@ fn codex_background_requests_get_no_pack_and_are_counted_by_label() {
         status["background"]
     );
     // Left out of the holdout comparison and the before-and-after numbers.
-    assert_eq!(status["holdout"]["proxy"]["sessions"], 1);
+    // The spawned agent's session started with no share held out: it is
+    // left out of the arms too, and counted as such.
+    assert_eq!(status["holdout"]["proxy"]["sessions"], 0);
     assert_eq!(status["holdout"]["holdout"]["sessions"], 0);
+    assert_eq!(status["holdout"]["left_out"], 1, "{}", status["holdout"]);
     let modes: Vec<&str> = status["modes"]
         .as_array()
         .unwrap()
@@ -2157,17 +2162,43 @@ fn the_request_for_a_compactions_summary_gets_no_new_pack_and_is_counted_apart()
         (row["mode"].as_str(), row["background"].as_str()),
         (Some("proxy"), None)
     );
-    let compaction: Vec<(u64, u64)> = status["background"]
+    let compaction: Vec<(Option<u64>, u64)> = status["background"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|b| b["label"] == "compaction")
-        .map(|b| (b["sessions"].as_u64().unwrap(), b["requests"].as_u64().unwrap()))
+        .map(|b| (b["sessions"].as_u64(), b["requests"].as_u64().unwrap()))
         .collect();
-    assert_eq!(compaction, [(0, 1)], "{}", status["background"]);
+    assert_eq!(compaction, [(None, 1)], "{}", status["background"]);
 }
 
 // ---- router: lowering the reasoning effort --------------------------------------
+
+/// A conversation's genuine first request: Codex's environment context and
+/// one typed message, nothing of an earlier turn.
+fn first_request(cwd: &Path, conversation: &str, typed: &str) -> Value {
+    json!({
+        "model": "gpt-test",
+        "prompt_cache_key": conversation,
+        "instructions": "You are a coding agent.",
+        "input": [
+            user(&format!("<environment_context>\n  <cwd>{}</cwd>\n</environment_context>", cwd.display())),
+            user(typed),
+        ],
+        "stream": true,
+    })
+}
+
+/// A function nothing calls: a change to it stays in one file.
+fn add_one_file_function(repo: &Path) {
+    std::fs::write(
+        repo.join("orders_api/strings.py"),
+        "def shout_text(text):\n    \"\"\"Upper-case a line of text.\"\"\"\n    return text.upper()\n",
+    )
+    .unwrap();
+}
+
+const ONE_FILE: &str = "shout_text should trim whitespace";
 
 fn with_effort(mut body: Value, effort: &str) -> Value {
     body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
@@ -2195,7 +2226,7 @@ fn the_router_lowers_the_effort_only_when_asked_and_never_raises_it() {
 
     // Off by default: the recommendation is logged, the effort kept.
     assert_eq!(r.json("/lge/api/status")["settings"]["router_apply"], "off");
-    r.send(&with_effort(request_body(&cwd, "conv-r0", one_file), "high"));
+    r.send(&with_effort(first_request(&cwd, "conv-r0", one_file), "high"));
     assert_eq!(effort_sent(&r), "high");
     let row = session_row(&r.json("/lge/api/status"), "conv-r0");
     assert_eq!(
@@ -2209,26 +2240,26 @@ fn the_router_lowers_the_effort_only_when_asked_and_never_raises_it() {
         r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }))["router_apply"],
         "low-only"
     );
-    let mut first = with_effort(request_body(&cwd, "conv-r1", one_file), "high");
+    let mut first = with_effort(first_request(&cwd, "conv-r1", one_file), "high");
     r.send(&first);
     assert_eq!(effort_sent(&r), "low");
     let row = session_row(&r.json("/lge/api/status"), "conv-r1");
     assert_eq!(row["applied_level"], "low", "{row}");
     // A task in one service with several files keeps its effort.
-    r.send(&with_effort(request_body(&cwd, "conv-r2", one_service), "high"));
+    r.send(&with_effort(first_request(&cwd, "conv-r2", one_service), "high"));
     assert_eq!(effort_sent(&r), "high");
 
     // low-and-medium: the one-service task is sent at medium.
     r.api("/lge/api/settings", &json!({ "router_apply": "low-and-medium" }));
-    r.send(&with_effort(request_body(&cwd, "conv-r3", one_service), "high"));
+    r.send(&with_effort(first_request(&cwd, "conv-r3", one_service), "high"));
     assert_eq!(effort_sent(&r), "medium");
     // Never raised: a client already at low stays at low, and nothing is applied.
-    r.send(&with_effort(request_body(&cwd, "conv-r4", one_service), "low"));
+    r.send(&with_effort(first_request(&cwd, "conv-r4", one_service), "low"));
     assert_eq!(effort_sent(&r), "low");
     let row = session_row(&r.json("/lge/api/status"), "conv-r4");
     assert_eq!(row["applied_level"], "", "{row}");
     // A request that names no effort is left alone.
-    r.send(&request_body(&cwd, "conv-r5", one_file));
+    r.send(&first_request(&cwd, "conv-r5", one_file));
     let sent: Value = serde_json::from_slice(&r.last().3).unwrap();
     assert!(sent.get("reasoning").is_none(), "{sent}");
 
@@ -2238,7 +2269,7 @@ fn the_router_lowers_the_effort_only_when_asked_and_never_raises_it() {
     first["input"].as_array_mut().unwrap().push(user("ok, do it"));
     r.send(&first);
     assert_eq!(effort_sent(&r), "low", "the same effort for the whole conversation");
-    r.send(&with_effort(request_body(&cwd, "conv-r6", one_file), "high"));
+    r.send(&with_effort(first_request(&cwd, "conv-r6", one_file), "high"));
     assert_eq!(effort_sent(&r), "high");
 
     // Held out: the client's bytes, whatever the setting.
@@ -2246,7 +2277,7 @@ fn the_router_lowers_the_effort_only_when_asked_and_never_raises_it() {
         "/lge/api/settings",
         &json!({ "router_apply": "low-only", "holdout_share": 1.0 }),
     );
-    let held = with_effort(request_body(&cwd, "conv-r7", one_file), "high");
+    let held = with_effort(first_request(&cwd, "conv-r7", one_file), "high");
     let raw = serde_json::to_vec(&held).unwrap();
     r.post("/v1/responses", &raw, &[("authorization", "Bearer k")]);
     assert_eq!(r.last().3, raw, "byte-identical");
@@ -2280,7 +2311,7 @@ fn an_applied_effort_holds_after_a_restart() {
     let cfg = config(dir.path(), &repo, port);
     let agent = plain_agent();
     let mut body = with_effort(
-        request_body(&repo.join("orders_api"), "conv-ra", "shout_text should trim whitespace"),
+        first_request(&repo.join("orders_api"), "conv-ra", "shout_text should trim whitespace"),
         "high",
     );
     let effort_of_last = || -> String {
@@ -2320,4 +2351,1136 @@ fn an_applied_effort_holds_after_a_restart() {
     body["input"].as_array_mut().unwrap().push(user("ok, do it"));
     send_to(&agent, second.addr, &body);
     assert_eq!(effort_of_last(), "low", "the same effort for the whole conversation");
+}
+
+#[test]
+fn a_conversation_lge_first_sees_midway_keeps_its_effort() {
+    let r = start();
+    add_one_file_function(&r.repo);
+    r.add_repo();
+    r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+    let cwd = r.repo.join("orders_api");
+
+    // A thread lge has no record of, already under way (resumed, forked, or
+    // started before lge was connected): its earlier requests went out at high.
+    let mut midway = with_effort(first_request(&cwd, "conv-midway", ONE_FILE), "high");
+    let items = midway["input"].as_array_mut().unwrap();
+    items.push(
+        json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Looking." }] }),
+    );
+    items.push(json!({ "type": "function_call", "name": "shell", "call_id": "c1", "arguments": json!({ "command": ["bash", "-lc", "git status"] }).to_string() }));
+    items.push(json!({ "type": "function_call_output", "call_id": "c1", "output": "On branch main\n" }));
+    r.send(&midway);
+    assert_eq!(effort_sent(&r), "high");
+    midway["input"].as_array_mut().unwrap().push(user("ok, do it"));
+    r.send(&midway);
+    assert_eq!(effort_sent(&r), "high", "the same effort for the whole conversation");
+    let row = session_row(&r.json("/lge/api/status"), "conv-midway");
+    assert_eq!(
+        (row["recommended_level"].as_str(), row["applied_level"].as_str()),
+        (Some("low"), Some("")),
+        "{row}"
+    );
+
+    // The first request lge sees asks for a compaction's summary.
+    let mut summary_first = with_effort(first_request(&cwd, "conv-summary-first", ONE_FILE), "high");
+    summary_first["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"request_kind":"compaction"}"# });
+    r.send(&summary_first);
+    assert_eq!(effort_sent(&r), "high");
+    summary_first.as_object_mut().unwrap().remove("client_metadata");
+    summary_first["input"].as_array_mut().unwrap().push(user("go on"));
+    r.send(&summary_first);
+    assert_eq!(effort_sent(&r), "high");
+    let row = session_row(&r.json("/lge/api/status"), "conv-summary-first");
+    assert_eq!(row["applied_level"], "", "{row}");
+}
+
+#[test]
+fn a_refused_lowered_effort_on_a_later_request_falls_back_to_the_clients_effort() {
+    // Another model that takes no low effort.
+    let refusing = provider_with(Box::new(|_, body, _| {
+        let sent: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if sent["model"] == "gpt-other" && sent["reasoning"]["effort"] == "low" {
+            let error = r#"{"error":{"message":"Unsupported value: 'low'.","type":"invalid_request_error","code":"unsupported_value"}}"#;
+            (400, error.to_string())
+        } else {
+            (200, STREAM.to_string())
+        }
+    }));
+    let r = start_with(refusing, |_| {});
+    add_one_file_function(&r.repo);
+    r.add_repo();
+    r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+    let mut body = with_effort(
+        first_request(&r.repo.join("orders_api"), "conv-refused", ONE_FILE),
+        "high",
+    );
+    r.send(&body);
+    assert_eq!(effort_sent(&r), "low");
+
+    // The thread moves to the other model.
+    body["model"] = json!("gpt-other");
+    body["input"].as_array_mut().unwrap().push(user("go on"));
+    let (status, _) = r.send(&body);
+    assert_eq!(status, 200, "sent again at the client's effort");
+    assert_eq!(r.sent().len(), 3, "the first request, the refused one and its retry");
+    assert_eq!(effort_sent(&r), "high");
+    body["input"].as_array_mut().unwrap().push(user("and the rest"));
+    let (status, _) = r.send(&body);
+    assert_eq!(status, 200);
+    assert_eq!(effort_sent(&r), "high", "the client's effort from now on");
+    assert_eq!(r.sent().len(), 4);
+    let row = session_row(&r.json("/lge/api/status"), "conv-refused");
+    assert_eq!(
+        (row["applied_level"].as_str(), row["raw_retries"].as_u64()),
+        (Some(""), Some(1)),
+        "{row}"
+    );
+}
+
+#[test]
+fn the_router_reads_the_whole_first_message() {
+    let r = start();
+    add_one_file_function(&r.repo);
+    r.add_repo();
+    r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+    // The first 200 characters are about the one-file function; the rest
+    // names code in another service.
+    let filler = "Please keep the wording as it is and the tone as it was before. ".repeat(4);
+    let task = format!("{ONE_FILE}. {filler}Then also change sendEmail in the notifier to match.");
+    assert!(task.find("sendEmail").unwrap() > 200);
+    r.send(&with_effort(
+        first_request(&r.repo.join("orders_api"), "conv-whole", &task),
+        "high",
+    ));
+    assert_eq!(effort_sent(&r), "high");
+    let row = session_row(&r.json("/lge/api/status"), "conv-whole");
+    assert_ne!(row["recommended_level"], "low", "{row}");
+    assert_eq!(row["applied_level"], "", "{row}");
+}
+
+#[test]
+fn the_compaction_request_of_an_applied_conversation_keeps_its_effort() {
+    let r = start();
+    add_one_file_function(&r.repo);
+    r.add_repo();
+    r.api("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+    let mut body = with_effort(
+        first_request(&r.repo.join("orders_api"), "conv-applied", ONE_FILE),
+        "high",
+    );
+    r.send(&body);
+    assert_eq!(effort_sent(&r), "low");
+    let before: Value = serde_json::from_slice(&r.last().3).unwrap();
+    // Codex asks for the summary within the conversation, with the turn's settings.
+    body["input"].as_array_mut().unwrap().push(user("ok, do it"));
+    body["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"request_kind":"compaction"}"# });
+    r.send(&body);
+    assert_eq!(effort_sent(&r), "low", "the conversation's effort");
+    let summary: Value = serde_json::from_slice(&r.last().3).unwrap();
+    let (old, new) = (
+        before["input"].as_array().unwrap(),
+        summary["input"].as_array().unwrap(),
+    );
+    assert_eq!(new[..old.len()], old[..], "the cached prefix must not change");
+}
+
+#[test]
+fn an_applied_effort_holds_after_a_restart_before_any_usage() {
+    // The first answer is cut before its usage (the user interrupted it).
+    let cut = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+    let (port, received) = provider_with(Box::new(move |_, _, n| {
+        (200, if n == 0 { cut.to_string() } else { STREAM.to_string() })
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("work/shop");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/polyglot"),
+        &repo,
+    );
+    add_one_file_function(&repo);
+    let repo = repo.canonicalize().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let cfg = config(dir.path(), &repo, port);
+    let agent = plain_agent();
+    let mut body = with_effort(first_request(&repo.join("orders_api"), "conv-cut", ONE_FILE), "high");
+    let effort_of_last = || -> String {
+        let last = received.lock().unwrap().last().cloned().unwrap();
+        let sent: Value = serde_json::from_slice(&last.3).unwrap();
+        sent["reasoning"]["effort"].as_str().unwrap_or("").to_string()
+    };
+    let _slot = Slot::take();
+    {
+        let first = Serving::start(Daemon::open(cfg.clone()).unwrap());
+        let post = |path: &str, v: &Value| {
+            let response = agent
+                .post(format!("http://{}{path}", first.addr))
+                .header("content-type", "application/json")
+                .send(v.to_string())
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+        };
+        post("/lge/api/repos", &json!({ "path": repo.to_string_lossy() }));
+        post("/lge/api/settings", &json!({ "router_apply": "low-only" }));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while status_of(&agent, first.addr)["repos"][0]["state"] != "ready" {
+            assert!(Instant::now() < deadline, "repository not ready");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        send_to(&agent, first.addr, &body);
+        assert_eq!(effort_of_last(), "low");
+    }
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("data/daemon.json")).unwrap()).unwrap();
+    state["settings"]["router_apply"] = json!("off");
+    std::fs::write(dir.path().join("data/daemon.json"), state.to_string()).unwrap();
+    let second = Serving::start(Daemon::open(cfg).unwrap());
+    body["input"].as_array_mut().unwrap().push(user("ok, do it"));
+    send_to(&agent, second.addr, &body);
+    assert_eq!(effort_of_last(), "low", "the same effort for the whole conversation");
+}
+
+// ---- stored records of older versions, and what the page counts ------------------
+
+/// A stored proxy record of the conversation `key`.
+fn stored(key: &str, mode: &str, task: &str, monitor: Value) -> UsageRecord {
+    let now = lge_retrieve::unix_now();
+    UsageRecord {
+        id: lge_core::stable_id(&["session", key]),
+        task_id: key.to_string(),
+        session_id: key.to_string(),
+        task: task.to_string(),
+        model: "gpt-test".to_string(),
+        mode: mode.to_string(),
+        started_at: now - 3600,
+        finished_at: now - 600,
+        input_tokens: 60 * 200_000,
+        monitor: if monitor.is_null() {
+            String::new()
+        } else {
+            monitor.to_string()
+        },
+        ..UsageRecord::default()
+    }
+}
+
+/// What a usage record keeps of a typed message: trimmed, 200 characters.
+fn kept(text: &str) -> String {
+    text.trim().chars().take(200).collect()
+}
+
+#[test]
+fn stored_sessions_of_codexs_own_prompts_are_background_without_a_new_request() {
+    let long = json!({ "requests": 60, "randomized": true });
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let transcript = format!("{}\n\n{}", lge_usage::GUARDIAN_PROMPT, "the transcript ".repeat(30));
+        let mut guardian = stored("old-guardian", "proxy", &kept(&transcript), long.clone());
+        guardian.model = "codex-auto-review".to_string();
+        guardian.added_tokens_sent = 400_000;
+        let title = stored(
+            "old-title",
+            "proxy",
+            &kept(&title_prompt("rename the settings page")),
+            long.clone(),
+        );
+        let memory = stored(
+            "old-memory",
+            "proxy-holdout",
+            &kept(&format!("{}\n\nSummaries follow.", lge_usage::MEMORY_PROMPT)),
+            long.clone(),
+        );
+        let mut reviewer = stored("old-reviewer", "proxy", "is this command safe", long.clone());
+        reviewer.model = "codex-auto-review".to_string();
+        // A session someone worked in whose last request went to the reviewer
+        // under a version that counted it.
+        let mut worked = stored(
+            "worked",
+            "proxy",
+            "fix the login form",
+            json!({ "requests": 60, "randomized": true, "background_requests": { "guardian": 1 } }),
+        );
+        worked.model = "codex-auto-review".to_string();
+        let work = stored("work", "proxy", "fix the order form", long.clone());
+        for rec in [guardian, title, memory, reviewer, worked, work] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    for (id, label) in [
+        ("old-guardian", "guardian"),
+        ("old-title", "title"),
+        ("old-memory", "memory_consolidation"),
+        ("old-reviewer", "guardian"),
+    ] {
+        let row = session_row(&status, id);
+        assert_eq!(
+            (row["mode"].as_str(), row["background"].as_str()),
+            (Some("proxy-background"), Some(label)),
+            "{row}"
+        );
+    }
+    for id in ["worked", "work"] {
+        assert_eq!(session_row(&status, id)["mode"], "proxy", "{id}");
+    }
+    let proxy = status["modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["mode"] == "proxy")
+        .cloned();
+    assert_eq!(
+        proxy.map(|m| m["sessions"].clone()),
+        Some(json!(2)),
+        "{}",
+        status["modes"]
+    );
+    assert_eq!(status["holdout"]["proxy"]["sessions"], 2);
+    assert_eq!(status["holdout"]["holdout"]["sessions"], 0);
+    let by_label: Vec<(&str, u64, u64)> = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["label"].as_str().unwrap(),
+                b["sessions"].as_u64().unwrap(),
+                b["requests"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_label,
+        [("guardian", 2, 121), ("memory_consolidation", 1, 60), ("title", 1, 60)],
+        "{}",
+        status["background"]
+    );
+    let named: Vec<&str> = status["long_sessions"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(named.contains(&"worked") && named.contains(&"work"), "{named:?}");
+    assert_eq!(status["packs"]["tokens_sent_background"], 400_000);
+
+    // Nothing was written: the stored records keep their mode.
+    let Running { serving, dir, .. } = r;
+    drop(serving);
+    let store = Store::open(&dir.path().join("data/usage.lbug")).unwrap();
+    let old = store
+        .get_usage(&lge_core::stable_id(&["session", "old-guardian"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.mode, "proxy");
+}
+
+#[test]
+fn a_restored_session_of_the_reviewers_prompt_with_packs_becomes_background_and_keeps_its_bytes() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("work/shop");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/polyglot"),
+        &repo,
+    );
+    let repo = repo.canonicalize().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let cfg = config(dir.path(), &repo, port);
+    let agent = plain_agent();
+    let cwd = repo.join("orders_api");
+    let mut body = request_body(&cwd, "old-review", ABOUT_ROUTES);
+    let _slot = Slot::take();
+    // A version that did not tell the reviewer's requests apart gave its
+    // conversation a pack.
+    let first = {
+        let first = Serving::start(Daemon::open(cfg.clone()).unwrap());
+        let response = agent
+            .post(format!("http://{}/lge/api/repos", first.addr))
+            .header("content-type", "application/json")
+            .send(json!({ "path": repo.to_string_lossy() }).to_string())
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while status_of(&agent, first.addr)["repos"][0]["state"] != "ready" {
+            assert!(Instant::now() < deadline, "repository not ready");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (url, _) = (format!("http://{}/v1/responses", first.addr), ());
+        let sent = agent
+            .post(url)
+            .header("authorization", "Bearer k")
+            .send(serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        assert_eq!(sent.status().as_u16(), 200);
+        sent.into_body().read_to_vec().unwrap();
+        let status = status_of(&agent, first.addr);
+        assert_eq!(session_row(&status, "old-review")["packs_added"], 1);
+        status
+    };
+    let forwarded: Value = {
+        let r = _received.lock().unwrap();
+        serde_json::from_slice(&r.last().unwrap().3).unwrap()
+    };
+    assert!(has_context(&forwarded["input"][2]), "{forwarded}");
+    drop(first);
+    // As that version stored it: the reviewer's prompt was its first message.
+    {
+        let store = Store::open(&dir.path().join("data/usage.lbug")).unwrap();
+        let id = lge_core::stable_id(&["session", "old-review"]);
+        let mut rec = store.get_usage(&id).unwrap().unwrap();
+        rec.task = kept(&format!("{}\n\nThe transcript.", lge_usage::GUARDIAN_PROMPT));
+        store.put_usage(&rec).unwrap();
+    }
+    let second = Serving::start(Daemon::open(cfg).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while status_of(&agent, second.addr)["repos"][0]["state"] != "ready" {
+        assert!(Instant::now() < deadline, "repository not ready");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last_sent = || -> Value {
+        let r = _received.lock().unwrap();
+        serde_json::from_slice(&r.last().unwrap().3).unwrap()
+    };
+    // A message an ordinary conversation gets a follow-up pack for.
+    let mut control = request_body(&cwd, "control", ABOUT_ROUTES);
+    send_to(&agent, second.addr, &control);
+    control["input"].as_array_mut().unwrap().push(user(ABOUT_MAILER));
+    send_to(&agent, second.addr, &control);
+    let control = last_sent();
+    assert!(
+        has_context(control["input"].as_array().unwrap().last().unwrap()),
+        "an ordinary conversation gets a pack: {control}"
+    );
+    body["input"].as_array_mut().unwrap().push(user(ABOUT_MAILER));
+    send_to(&agent, second.addr, &body);
+    let sent = last_sent();
+    let (old, new) = (
+        forwarded["input"].as_array().unwrap(),
+        sent["input"].as_array().unwrap(),
+    );
+    assert_eq!(new[..old.len()], old[..], "the cached prefix must not change");
+    assert_eq!(new.len(), old.len() + 1, "no new pack: {sent}");
+    let row = session_row(&status_of(&agent, second.addr), "old-review");
+    assert_eq!(
+        (row["mode"].as_str(), row["background"].as_str()),
+        (Some("proxy-background"), Some("guardian")),
+        "{row}"
+    );
+    // Stored so by its request: the page alone never writes.
+    drop(second);
+    let store = Store::open(&dir.path().join("data/usage.lbug")).unwrap();
+    let rec = store
+        .get_usage(&lge_core::stable_id(&["session", "old-review"]))
+        .unwrap()
+        .unwrap();
+    let monitor: Value = serde_json::from_str(&rec.monitor).unwrap();
+    assert_eq!(
+        (rec.mode.as_str(), monitor["background"].as_str()),
+        ("proxy-background", Some("guardian")),
+        "{monitor}"
+    );
+}
+
+/// A pack sent before a restart by a version whose ledger kept no pack text,
+/// and the conversation's next request sent at once after the restart, while
+/// the folder is indexed again. With `task`, the stored session's first typed
+/// message as that version kept it. Returns (the prefix sent before the
+/// restart, what was sent after it, the status after it).
+fn the_next_request_while_the_folder_is_indexed_again(task: Option<&str>) -> (Vec<Value>, Vec<Value>, Value) {
+    let (port, received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("work/shop");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/polyglot"),
+        &repo,
+    );
+    // Enough files that indexing again takes a while.
+    let generated = repo.join("generated");
+    std::fs::create_dir_all(&generated).unwrap();
+    for i in 0..1500 {
+        std::fs::write(
+            generated.join(format!("helper_{i}.py")),
+            format!("def helper_{i}(value):\n    return value + {i}\n"),
+        )
+        .unwrap();
+    }
+    let repo = repo.canonicalize().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let cfg = config(dir.path(), &repo, port);
+    let agent = plain_agent();
+    let cwd = repo.join("orders_api");
+    let mut body = request_body(&cwd, "conv-restart", ABOUT_ROUTES);
+    let _slot = Slot::take();
+    let last_sent = || -> Vec<Value> {
+        let r = received.lock().unwrap();
+        let sent: Value = serde_json::from_slice(&r.last().unwrap().3).unwrap();
+        sent["input"].as_array().unwrap().clone()
+    };
+    {
+        let first = Serving::start(Daemon::open(cfg.clone()).unwrap());
+        let response = agent
+            .post(format!("http://{}/lge/api/repos", first.addr))
+            .header("content-type", "application/json")
+            .send(json!({ "path": repo.to_string_lossy() }).to_string())
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while status_of(&agent, first.addr)["repos"][0]["state"] != "ready" {
+            assert!(Instant::now() < deadline, "repository not ready");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        send_to(&agent, first.addr, &body);
+    }
+    let before = last_sent();
+    assert!(has_context(&before[2]), "a pack: {before:?}");
+    // As an older version stored it: no pack text.
+    {
+        let store = Store::open(&dir.path().join("data/usage.lbug")).unwrap();
+        let id = lge_core::stable_id(&["session", "conv-restart"]);
+        let mut rec = store.get_usage(&id).unwrap().unwrap();
+        let mut monitor: Value = serde_json::from_str(&rec.monitor).unwrap();
+        monitor["ledger"].as_object_mut().unwrap().remove("pack_texts");
+        rec.monitor = monitor.to_string();
+        if let Some(task) = task {
+            rec.task = kept(task);
+        }
+        store.put_usage(&rec).unwrap();
+    }
+    // The folder is in daemon.json: the restarted daemon indexes it again.
+    let second = Serving::start(Daemon::open(cfg).unwrap());
+    assert_eq!(
+        status_of(&agent, second.addr)["repos"][0]["state"],
+        "indexing",
+        "the folder is still being indexed when the request comes"
+    );
+    body["input"].as_array_mut().unwrap().push(user("go on"));
+    send_to(&agent, second.addr, &body);
+    let after = last_sent();
+    let status = status_of(&agent, second.addr);
+    drop(second);
+    (before, after, status)
+}
+
+#[test]
+fn the_first_request_after_a_restart_waits_for_the_graph_to_send_an_older_pack_again() {
+    let (before, after, status) = the_next_request_while_the_folder_is_indexed_again(None);
+    assert_eq!(after[..before.len()], before[..], "the cached prefix must not change");
+    assert_eq!(session_row(&status, "conv-restart")["mode"], "proxy");
+}
+
+#[test]
+fn a_restored_background_session_waits_for_the_graph_to_send_an_older_pack_again() {
+    let task = format!("{}\n\nThe transcript.", lge_usage::GUARDIAN_PROMPT);
+    let (before, after, status) = the_next_request_while_the_folder_is_indexed_again(Some(&task));
+    assert_eq!(after[..before.len()], before[..], "the cached prefix must not change");
+    let row = session_row(&status, "conv-restart");
+    assert_eq!(
+        (row["mode"].as_str(), row["background"].as_str()),
+        (Some("proxy-background"), Some("guardian")),
+        "{row}"
+    );
+}
+
+#[test]
+fn one_more_request_of_a_stored_background_session_keeps_its_earlier_requests_and_input() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        // Recorded before v0.0.3: no label, no request counted by label.
+        let transcript = format!("{}\n\n{}", lge_usage::GUARDIAN_PROMPT, "the transcript ".repeat(30));
+        let old = stored(
+            "old-guardian",
+            "proxy",
+            &kept(&transcript),
+            json!({ "requests": 60, "randomized": true }),
+        );
+        // Recorded by v0.0.3: a label and its requests, no input by label.
+        let v3 = stored(
+            "v3-title",
+            "proxy-background",
+            "name the task",
+            json!({ "requests": 60, "background": "title", "background_requests": { "title": 60 } }),
+        );
+        for rec in [old, v3] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let label_row = |status: &Value, label: &str| -> (u64, u64, i64, i64) {
+        let row = status["background"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["label"] == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {label}: {}", status["background"]));
+        (
+            row["sessions"].as_u64().unwrap(),
+            row["requests"].as_u64().unwrap(),
+            row["input_tokens"].as_i64().unwrap(),
+            row["request_input_tokens"].as_i64().unwrap(),
+        )
+    };
+    let status = r.json("/lge/api/status");
+    assert_eq!(label_row(&status, "guardian"), (1, 60, 12_000_000, 12_000_000));
+    assert_eq!(label_row(&status, "title"), (1, 60, 12_000_000, 12_000_000));
+
+    let cwd = Path::new("/somewhere/else");
+    let transcript = format!("{}\n\n{}", lge_usage::GUARDIAN_PROMPT, "the transcript ".repeat(30));
+    r.send(&request_body(cwd, "old-guardian", &transcript));
+    r.send(&request_body(cwd, "v3-title", "name the task"));
+    let status = r.json("/lge/api/status");
+    assert_eq!(label_row(&status, "guardian"), (1, 61, 12_001_200, 12_001_200));
+    assert_eq!(label_row(&status, "title"), (1, 61, 12_001_200, 12_001_200));
+}
+
+#[test]
+fn a_stored_session_told_only_by_the_reviewers_model_stays_a_work_session_after_a_typed_request() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        // Recorded before v0.0.3, its last request to the reviewer.
+        for key in ["typed-next", "reviewer-next"] {
+            let mut rec = stored(key, "proxy", "fix the login form", json!({ "requests": 60 }));
+            rec.model = "codex-auto-review".to_string();
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    for key in ["typed-next", "reviewer-next"] {
+        assert_eq!(
+            session_row(&status, key)["background"],
+            "guardian",
+            "the page cannot tell it from the reviewer's"
+        );
+    }
+    let cwd = Path::new("/somewhere/else");
+    r.send(&request_body(cwd, "typed-next", "fix the login form"));
+    let mut reviewer = request_body(cwd, "reviewer-next", "fix the login form");
+    reviewer["model"] = json!("codex-auto-review");
+    r.send(&reviewer);
+    let status = r.json("/lge/api/status");
+    let typed = session_row(&status, "typed-next");
+    assert_eq!(
+        (typed["mode"].as_str(), typed["background"].as_str()),
+        (Some("proxy"), None),
+        "{typed}"
+    );
+    let review = session_row(&status, "reviewer-next");
+    assert_eq!(
+        (review["mode"].as_str(), review["background"].as_str()),
+        (Some("proxy-background"), Some("guardian")),
+        "{review}"
+    );
+}
+
+#[test]
+fn the_pack_line_leaves_sessions_of_v002_out_of_the_tokens_no_count_covers() {
+    let key = |text: &str| {
+        let mut bytes = b"context\0".to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+        lge_core::content_hash(&bytes)[..12].to_string()
+    };
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        // v0.0.2: no pack counts, two packs in its ledger.
+        let ledger = json!({ "contexts": { key(ABOUT_ROUTES): true, key(ABOUT_AUDIT): true } });
+        let mut v2 = stored(
+            "packs-v2",
+            "proxy",
+            "a task",
+            json!({ "requests": 9, "ledger": ledger }),
+        );
+        v2.added_tokens_sent = 1000;
+        // Before v0.0.2: nothing but its tokens.
+        let mut v1 = stored("packs-v1", "proxy", "an older task", Value::Null);
+        v1.added_tokens_sent = 300;
+        for rec in [v2, v1] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let packs = r.json("/lge/api/status")["packs"].clone();
+    assert_eq!(
+        (
+            packs["added"].as_u64(),
+            packs["tokens_sent"].as_i64(),
+            packs["tokens_sent_uncounted"].as_i64()
+        ),
+        (Some(2), Some(1300), Some(300)),
+        "{packs}"
+    );
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("in sessions whose records count no pack"));
+    assert!(page.contains("count their packs as added (from their ledger)"));
+}
+
+#[test]
+fn the_tool_output_and_pack_cards_leave_out_sessions_of_an_ab_run() {
+    let r = start();
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    r.send(&request_body(&cwd, "work-session", ABOUT_ROUTES));
+    r.api("/lge/api/settings", &json!({ "ab_arm": "on" }));
+    r.send(&request_body(&cwd, "ab-session", ABOUT_ROUTES));
+    r.api("/lge/api/settings", &json!({ "ab_arm": "" }));
+    let status = r.json("/lge/api/status");
+    let ab = session_row(&status, "ab-session");
+    assert!(ab["removed_tokens_sent"].as_i64().unwrap() > 0, "shortened: {ab}");
+    assert!(ab["added_tokens_sent"].as_i64().unwrap() > 0, "a pack: {ab}");
+    let work = session_row(&status, "work-session");
+    let saved = &status["saved"];
+    assert_eq!(
+        (
+            saved["outputs_shortened"].as_u64(),
+            saved["contexts_added"].as_u64(),
+            saved["tokens_before"].as_i64().unwrap() - saved["tokens_after"].as_i64().unwrap()
+        ),
+        (Some(1), Some(1), work["removed_tokens_sent"].as_i64().unwrap()),
+        "{saved}"
+    );
+}
+
+#[test]
+fn the_folder_note_reads_only_a_status_requested_after_the_folder_was_sent() {
+    let r = start();
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    // A status requested before the POST cannot clear the note.
+    assert!(page.contains("if (pending && seq > pendingAfter)"));
+    assert!(page.contains("function watch(root) { pending = root; pendingAfter = statusSeq; }"));
+    assert!(page.contains("watch(a.root)"));
+    // Re-index: watched once the daemon has the folder indexing.
+    assert!(page.contains("await api('repos', 'POST', { path: b.dataset.reindex }); watch(b.dataset.reindex);"));
+    // An answer older than the one shown is dropped.
+    assert!(page.contains("if (seq < shownSeq) return;"));
+}
+
+#[test]
+fn a_session_recorded_before_request_counts_shows_no_requests_instead_of_zero() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        store
+            .put_usage(&stored("before-counts", "proxy", "an old task", Value::Null))
+            .unwrap();
+        store
+            .put_usage(&stored("counted", "proxy", "a newer task", json!({ "requests": 4 })))
+            .unwrap();
+    });
+    let status = r.json("/lge/api/status");
+    let old = session_row(&status, "before-counts");
+    assert_eq!(
+        (old["requests"].clone(), old["mean_input_tokens"].clone()),
+        (Value::Null, Value::Null),
+        "{old}"
+    );
+    let counted = session_row(&status, "counted");
+    assert_eq!(counted["requests"], 4);
+    assert_eq!(status["holdout"]["left_out"], 2);
+    assert!(
+        status["holdout"]["left_out_note"]
+            .as_str()
+            .unwrap()
+            .contains("1 sessions recorded before v0.0.2 have no request count"),
+        "{}",
+        status["holdout"]
+    );
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("nn(x.requests)") && page.contains("left_out_note"));
+}
+
+#[test]
+fn only_sessions_assigned_while_the_holdout_share_was_above_zero_are_compared() {
+    let r = start();
+    let cwd = Path::new("/somewhere/else");
+    r.send(&request_body(cwd, "before-share", "run the tests"));
+    r.api("/lge/api/settings", &json!({ "holdout_share": 1.0 }));
+    r.send(&request_body(cwd, "held", "run the tests"));
+    // A share so small that nobody new is held out, but every new conversation is placed at random.
+    r.api("/lge/api/settings", &json!({ "holdout_share": 1e-12 }));
+    r.send(&request_body(cwd, "after-share", "run the tests"));
+    let status = r.json("/lge/api/status");
+    let modes: Vec<(&str, String)> = ["before-share", "held", "after-share"]
+        .iter()
+        .map(|id| (*id, session_row(&status, id)["mode"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            ("before-share", "proxy".to_string()),
+            ("held", "proxy-holdout".to_string()),
+            ("after-share", "proxy".to_string())
+        ]
+    );
+    let h = &status["holdout"];
+    assert_eq!(
+        (
+            h["proxy"]["sessions"].as_u64(),
+            h["holdout"]["sessions"].as_u64(),
+            h["left_out"].as_u64()
+        ),
+        (Some(1), Some(1), Some(1)),
+        "{h}"
+    );
+}
+
+#[test]
+fn sessions_of_an_ab_run_are_kept_out_of_the_cards_but_still_listed_with_their_requests() {
+    // A daemon stopped in the middle of a run starts without its arm.
+    let r = start_with(provider(), |data| {
+        std::fs::write(data.join("daemon.json"), r#"{"repos":[],"settings":{"ab_arm":"on"}}"#).unwrap();
+    });
+    assert_eq!(r.json("/lge/api/status")["settings"]["ab_arm"], "");
+    let cwd = Path::new("/somewhere/else");
+    assert_eq!(r.api("/lge/api/settings", &json!({ "ab_arm": "on" }))["ab_arm"], "on");
+    r.send(&request_body(cwd, "ab-session", "run the tests"));
+    r.api("/lge/api/settings", &json!({ "ab_arm": "" }));
+    r.send(&request_body(cwd, "work-session", "run the tests"));
+    let (status, _, _) = r.post(
+        "/lge/api/settings",
+        br#"{"ab_arm":"maybe"}"#,
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 400);
+
+    let status = r.json("/lge/api/status");
+    let modes: Vec<(&str, u64)> = status["modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["mode"].as_str().unwrap(), m["sessions"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(modes, [("ab", 1), ("proxy", 1)], "{}", status["modes"]);
+    let ab = session_row(&status, "ab-session");
+    assert_eq!(
+        (ab["mode"].as_str(), ab["ab_arm"].as_str(), ab["requests"].as_u64()),
+        (Some("proxy"), Some("on"), Some(1)),
+        "lge ab counts its requests from this row: {ab}"
+    );
+    assert_eq!(session_row(&status, "work-session")["ab_arm"], Value::Null);
+}
+
+#[test]
+fn the_pack_line_separates_tokens_of_sessions_recorded_before_pack_counts() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let mut older = stored("packs-v2", "proxy", "an older task", json!({ "requests": 5 }));
+        older.added_tokens_sent = 1000;
+        older.started_at -= 86_400;
+        let mut newer = stored(
+            "packs-v3",
+            "proxy",
+            "a newer task",
+            json!({ "requests": 5, "packs_added": 1 }),
+        );
+        newer.added_tokens_sent = 500;
+        for rec in [older, newer] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    let packs = &status["packs"];
+    assert_eq!(
+        (
+            packs["tokens_sent"].as_i64(),
+            packs["tokens_sent_uncounted"].as_i64(),
+            packs["tokens_sent_background"].as_i64()
+        ),
+        (Some(1500), Some(1000), Some(0)),
+        "{packs}"
+    );
+    let since = packs["since"].as_i64().expect("since when");
+    assert_eq!(since, session_row(&status, "packs-v2")["started_at"].as_i64().unwrap());
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("tokens_sent_uncounted") && page.contains("pk.since"));
+}
+
+#[test]
+fn compaction_requests_are_counted_with_their_input_tokens_not_as_sessions() {
+    let r = start();
+    let mut body = request_body(Path::new("/somewhere/else"), "conv-compacting", "run the tests");
+    r.send(&body);
+    body["input"].as_array_mut().unwrap().push(user("go on"));
+    body["client_metadata"] = json!({ "x-codex-turn-metadata": r#"{"request_kind":"compaction"}"# });
+    r.send(&body);
+    let status = r.json("/lge/api/status");
+    let row = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["label"] == "compaction")
+        .cloned()
+        .unwrap_or_else(|| panic!("{}", status["background"]));
+    assert_eq!(
+        (
+            row["sessions"].clone(),
+            row["requests"].as_u64(),
+            row["request_input_tokens"].as_i64()
+        ),
+        (Value::Null, Some(1), Some(1200)),
+        "{row}"
+    );
+    let session = session_row(&status, "conv-compacting");
+    assert_eq!(
+        (session["mode"].as_str(), session["input_tokens"].as_i64()),
+        (Some("proxy"), Some(2400))
+    );
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("Input tokens of these requests"));
+}
+
+#[test]
+fn the_long_session_note_says_when_each_session_last_ran() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let now = lge_retrieve::unix_now();
+        let mut older = stored("long-before", "proxy", "a task two days ago", json!({ "requests": 60 }));
+        older.started_at = now - 3 * 86_400;
+        older.finished_at = now - 2 * 86_400;
+        let mut newer = stored("long-now", "proxy", "a task today", json!({ "requests": 60 }));
+        newer.finished_at = now - 60;
+        for rec in [older, newer] {
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    let named: Vec<(&str, i64)> = status["long_sessions"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap(), s["finished_at"].as_i64().expect("when")))
+        .collect();
+    assert_eq!(named.len(), 2, "{}", status["long_sessions"]);
+    assert_eq!(
+        (named[0].0, named[1].0),
+        ("long-now", "long-before"),
+        "the latest first"
+    );
+    assert!(named[0].1 > named[1].1);
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("last request ${esc(when(l.finished_at))}"));
+}
+
+#[test]
+fn the_pack_line_counts_packs_of_older_versions_as_added() {
+    // A conversation of v0.0.2: its ledger had three packs, no pack counts.
+    let messages = [ABOUT_ROUTES, ABOUT_AUDIT, ABOUT_MAILER];
+    let key = |text: &str| {
+        let mut bytes = b"context\0".to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+        lge_core::content_hash(&bytes)[..12].to_string()
+    };
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let contexts: serde_json::Map<String, Value> = messages.iter().map(|m| (key(m), json!(true))).collect();
+        // Anchored to a history the conversation no longer has.
+        let anchors: serde_json::Map<String, Value> = messages.iter().map(|m| (key(m), json!(1))).collect();
+        let monitor = json!({ "requests": 9, "ledger": { "contexts": contexts, "anchors": anchors } });
+        store
+            .put_usage(&stored("older-packs", "proxy", ABOUT_ROUTES, monitor))
+            .unwrap();
+    });
+    r.add_repo();
+    let cwd = r.repo.join("orders_api");
+    // The history Codex sends after a compaction: the messages, the context, a summary, a new message.
+    let mut items: Vec<Value> = messages.iter().map(|m| user(m)).collect();
+    items.push(user(&format!(
+        "<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
+        cwd.display()
+    )));
+    items.push(user("Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary:\nhalf done."));
+    items.push(user("ok, do it"));
+    let body = json!({ "model": "gpt-test", "prompt_cache_key": "older-packs", "input": items, "stream": true });
+    r.send_with(&body, &[]);
+    let status = r.json("/lge/api/status");
+    let packs = &status["packs"];
+    assert_eq!(
+        (packs["added"].as_u64(), packs["retired"].as_u64()),
+        (Some(3), Some(3)),
+        "{packs}"
+    );
+    let row = session_row(&status, "older-packs");
+    assert_eq!(
+        (row["packs_added"].as_u64(), row["packs_retired"].as_u64()),
+        (Some(3), Some(3))
+    );
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("retired after the history was rewritten"));
+}
+
+// ---- folders: Codex's own requests and folders --------------------------------------
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+/// A git folder with one commit of `file`.
+fn git_folder(dir: &Path, file: &str, text: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(file), text).unwrap();
+    git(dir, &["init", "-q"]);
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "first"]);
+}
+
+fn saved_repos(r: &Running) -> Vec<String> {
+    std::fs::read_to_string(r.dir.path().join("data/daemon.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| serde_json::from_value(v["repos"].clone()).ok())
+        .unwrap_or_default()
+}
+
+#[test]
+fn codex_background_requests_never_add_a_folder_to_the_graph() {
+    let r = start();
+    let notes = r.repo.parent().unwrap().join("notes");
+    git_folder(&notes, "summary.py", "def summarise_notes(text):\n    return text\n");
+    let notes = notes.canonicalize().unwrap();
+    r.send_with(
+        &request_body(&notes, "bg-consolidation", "summarise_notes should keep headings"),
+        &[("x-openai-subagent", "memory_consolidation")],
+    );
+    let mut reviewer = request_body(&notes, "bg-reviewer", "summarise_notes should keep headings");
+    reviewer["model"] = json!("codex-auto-review");
+    r.send_with(&reviewer, &[]);
+    r.send_with(&request_body(&notes, "bg-title", &title_prompt("keep headings")), &[]);
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["repos"], json!([]), "{}", status["repos"]);
+    assert!(saved_repos(&r).is_empty());
+    // A conversation someone works in still adds it.
+    r.send_with(&request_body(&notes, "fg", "summarise_notes should keep headings"), &[]);
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["repos"][0]["name"], "notes", "{}", status["repos"]);
+    assert_eq!(saved_repos(&r), [notes.to_string_lossy().to_string()]);
+}
+
+#[test]
+fn codex_own_memory_folders_are_never_indexed() {
+    let r = start();
+    let workspace = r.repo.parent().unwrap().to_path_buf();
+    // Codex's memory baseline: a one-commit repository with its marker.
+    let memory = workspace.join("agent-home/memories_v2");
+    git_folder(&memory, "memory_summary.md", "# Summary\n");
+    std::fs::write(memory.join(".git/codex-baseline-version"), "1\n").unwrap();
+    r.send_with(&request_body(&memory, "in-memory", "summarise the notes"), &[]);
+    assert_eq!(r.json("/lge/api/status")["repos"], json!([]));
+    let (status, _, answer) = r.post(
+        "/lge/api/repos",
+        json!({ "path": memory.to_string_lossy() }).to_string().as_bytes(),
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 400);
+    assert!(String::from_utf8_lossy(&answer).contains("Codex keeps for itself"));
+    // A plain git folder beside it is added as before.
+    let plain = workspace.join("plain");
+    git_folder(&plain, "tool.py", "def run_tool():\n    return 1\n");
+    r.send_with(&request_body(&plain, "in-plain", "run_tool should return two"), &[]);
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["repos"][0]["name"], "plain", "{}", status["repos"]);
+}
+
+#[test]
+fn a_saved_codex_memory_folder_is_left_out_when_the_daemon_starts() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let home = work.join("agent-home");
+    let marked = home.join("memories_v2");
+    git_folder(&marked, "memory_summary.md", "# Summary\n");
+    std::fs::write(marked.join(".git/codex-baseline-version"), "1\n").unwrap();
+    // A reset cut short: no marker, but Codex's memory folder by its place.
+    let unmarked = home.join("memories");
+    git_folder(&unmarked, "memory_summary.md", "# Summary\n");
+    let plain = work.join("plain");
+    git_folder(&plain, "tool.py", "def run_tool():\n    return 1\n");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let listed = [&marked, &unmarked, &plain].map(|p| p.to_string_lossy().to_string());
+    std::fs::write(data.join("daemon.json"), json!({ "repos": listed }).to_string()).unwrap();
+    let mut cfg = config(dir.path(), &work.join("shop"), port);
+    cfg.codex_home = Some(home);
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let status = status_of(&plain_agent(), s.addr);
+    let roots: Vec<&str> = status["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["root"].as_str().unwrap())
+        .collect();
+    assert_eq!(roots, [plain.to_string_lossy()], "{}", status["repos"]);
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(data.join("daemon.json")).unwrap()).unwrap();
+    assert_eq!(file["repos"], json!([plain.to_string_lossy()]));
+}
+
+#[test]
+fn a_background_request_does_not_change_the_folder_the_graph_tools_answer_for() {
+    let r = start();
+    let other = r.repo.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("helper.py"), "def other_helper():\n    return 1\n").unwrap();
+    let other = other.canonicalize().unwrap();
+    r.api("/lge/api/repos", &json!({ "path": r.repo.to_string_lossy() }));
+    r.api("/lge/api/repos", &json!({ "path": other.to_string_lossy() }));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = r.json("/lge/api/status");
+        let repos = status["repos"].as_array().unwrap();
+        if repos.len() == 2 && repos.iter().all(|x| x["state"] == "ready") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not ready: {status}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    r.send_with(&request_body(&r.repo.join("orders_api"), "fg-shop", ABOUT_ROUTES), &[]);
+    r.send_with(
+        &request_body(&other, "bg-other", "is this command safe"),
+        &[("x-openai-subagent", "guardian")],
+    );
+    let (status, _, body) = r.post(
+        "/mcp",
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "search_code_context", "arguments": { "question": "where is create_order" } } })
+            .to_string()
+            .as_bytes(),
+        &[
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+        ],
+    );
+    assert_eq!(status, 200);
+    let answer: Value = serde_json::from_slice(&body).unwrap();
+    let text = answer["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("orders_api"), "{answer}");
+}
+
+#[test]
+fn the_page_says_when_a_folder_is_indexed_and_shows_a_setting_it_could_not_save() {
+    let r = start();
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(
+        page.contains("is indexed: ${n(r.files)} files"),
+        "the indexing note is replaced when done"
+    );
+    assert!(page.contains("watch(a.root)"));
+    assert!(
+        page.contains("e.target.value = (state && state.settings && state.settings.router_apply) || 'off'"),
+        "a select that was not saved shows the daemon's value again"
+    );
 }

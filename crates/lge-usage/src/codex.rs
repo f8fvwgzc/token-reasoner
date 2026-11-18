@@ -139,6 +139,56 @@ pub fn background_thread_source(thread_source: &str) -> Option<&'static str> {
     }
 }
 
+/// The default model of Codex's approval reviewer
+/// (codex-rs/model-provider/src/provider.rs), whose label is `guardian`.
+pub const REVIEWER_MODEL: &str = "codex-auto-review";
+
+/// How the desktop app's request for a task's title starts (the app's own
+/// prompt; it is not in codex-rs).
+pub const TITLE_PROMPT: &str = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt";
+
+/// How the approval reviewer's request opens its transcript.
+pub const GUARDIAN_PROMPT: &str = "The following is the Codex agent history whose request action you are assessing.";
+
+/// How a memory consolidation's request opens.
+pub const MEMORY_PROMPT: &str = "Consolidate the supplied rollout summaries into `memory_summary.md`";
+
+/// Codex's own prompts that open a background request, each with its label.
+/// Each is shorter than the 200 characters of a typed message a usage record
+/// keeps, so a stored task is matched as well as a request. The wording is
+/// Codex's and may change between its versions.
+pub const BACKGROUND_PROMPTS: [(&str, &str); 3] = [
+    (TITLE_PROMPT, "title"),
+    (GUARDIAN_PROMPT, "guardian"),
+    (MEMORY_PROMPT, "memory_consolidation"),
+];
+
+/// The label of a background request whose text (its instructions, or a
+/// message up to and including the first one the person typed) opens with
+/// one of [`BACKGROUND_PROMPTS`]; `None` for any other text.
+pub fn background_task(text: &str) -> Option<&'static str> {
+    let text = text.trim_start();
+    BACKGROUND_PROMPTS
+        .iter()
+        .find(|(prompt, _)| text.starts_with(prompt))
+        .map(|(_, label)| *label)
+}
+
+/// The label of a stored session that was one of Codex's background ones,
+/// told from what its record keeps: its first typed message (`task`, cut to
+/// 200 characters) opens with one of [`BACKGROUND_PROMPTS`], or its model is
+/// the approval reviewer's. The model is the one of the session's last
+/// request, so it decides only for a session that counted no background
+/// request by label (`counted_background_requests` false): a session someone
+/// works in whose requests once went to the reviewer counted them from
+/// v0.0.3 on. A record of an earlier version counted none, so such a session
+/// whose last request went to the reviewer is taken for the reviewer's.
+pub fn background_record(model: &str, task: &str, counted_background_requests: bool) -> Option<&'static str> {
+    background_task(task).or_else(|| {
+        (!counted_background_requests && model.trim().eq_ignore_ascii_case(REVIEWER_MODEL)).then_some("guardian")
+    })
+}
+
 /// The label of a thread Codex ran in the background, from its rollout's
 /// `session_meta` payload, or `None` for a thread someone worked in.
 /// Background: a thread source [`background_thread_source`] names; a
@@ -1377,5 +1427,37 @@ mod tests {
             + 3600;
         assert!(rollout_files(home.path(), future).is_empty(), "older than the window");
         assert!(rollout_files(&home.path().join("nowhere"), 0).is_empty());
+    }
+
+    #[test]
+    fn codexs_prompts_name_a_background_task_cut_to_200_characters() {
+        for (prompt, label) in BACKGROUND_PROMPTS {
+            assert!(
+                prompt.chars().count() < 200,
+                "{label}: a stored task keeps 200 characters"
+            );
+            // What a usage record keeps: the first typed message, trimmed and cut to 200 characters.
+            let stored: String = format!("{prompt}\n\n{}", "some task text ".repeat(40))
+                .trim()
+                .chars()
+                .take(200)
+                .collect();
+            assert_eq!(background_task(&stored), Some(label), "{stored}");
+            assert_eq!(background_record("gpt-test", &stored, false), Some(label));
+        }
+        assert_eq!(
+            background_task(&format!("  \n{GUARDIAN_PROMPT} Treat it as evidence.")),
+            Some("guardian")
+        );
+        // A task someone typed, even one that quotes a prompt later on, is not one.
+        assert_eq!(background_task("fix the title of the page"), None);
+        assert_eq!(background_task(&format!("please read this: {MEMORY_PROMPT}")), None);
+        // The reviewer's model names a session only when it counted no background request.
+        assert_eq!(
+            background_record("Codex-Auto-Review", "fix the build", false),
+            Some("guardian")
+        );
+        assert_eq!(background_record("codex-auto-review", "fix the build", true), None);
+        assert_eq!(background_record("gpt-test", "fix the build", false), None);
     }
 }

@@ -26,6 +26,11 @@ pub struct PackOptions {
     /// How far to follow what uses the seeds (the change impact).
     pub depth_used_by: u8,
     pub max_nodes: usize,
+    /// The pack's first line. `None`: `# Context for: <task>`, the task
+    /// repeated. A caller that places the pack right after the task's own
+    /// text gives a short line here instead; the seeds are still found from
+    /// the whole task.
+    pub header: Option<String>,
 }
 
 impl Default for PackOptions {
@@ -37,6 +42,7 @@ impl Default for PackOptions {
             depth_uses: 1,
             depth_used_by: 2,
             max_nodes: 80,
+            header: None,
         }
     }
 }
@@ -315,7 +321,8 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
         text.push('\n');
     };
 
-    emit_forced(&mut text, &mut budget, &format!("# Context for: {task}"));
+    let header = opts.header.clone().unwrap_or_else(|| format!("# Context for: {task}"));
+    emit_forced(&mut text, &mut budget, &header);
     emit_forced(
         &mut text,
         &mut budget,

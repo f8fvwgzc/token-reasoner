@@ -228,9 +228,11 @@ pub fn arm_order(pair: usize) -> [Arm; 2] {
 }
 
 /// The daemon's settings for an arm: the original ones, with no holdout in
-/// either arm (a held-out conversation would run every rule in shadow) and
+/// either arm (a held-out conversation would run every rule in shadow),
 /// indexing on first use off (the runner registers the copy itself when the
-/// arm needs a graph, and waits for its index before the session starts).
+/// arm needs a graph, and waits for its index before the session starts), and
+/// the arm named (`ab_arm`), so the daemon keeps the run's sessions out of its
+/// cards and comparisons; the original settings, put back afterwards, end it.
 ///
 /// For [`Variant::Features`], graph context and output shortening are
 /// switched on or off: the arm with them off has both master switches off,
@@ -248,6 +250,7 @@ pub fn arm_settings(original: &Value, arm: Arm, variant: Variant) -> Value {
         }
         map.insert("holdout_share".to_string(), Value::from(0.0));
         map.insert("auto_index".to_string(), Value::Bool(false));
+        map.insert("ab_arm".to_string(), Value::from(arm.to_string()));
     }
     s
 }
@@ -1236,7 +1239,8 @@ mod tests {
             on,
             json!({
                 "inject_context": true, "shorten_outputs": true, "shorten_reads": true, "context_budget": 900,
-                "auto_index": false, "holdout_share": 0.0, "rules": { "skeleton": "on", "check": "shadow" }, "future": "kept"
+                "auto_index": false, "holdout_share": 0.0, "rules": { "skeleton": "on", "check": "shadow" }, "future": "kept",
+                "ab_arm": "on"
             })
         );
         let off = arm_settings(&original, Arm::Off, Variant::Features);
@@ -1244,7 +1248,8 @@ mod tests {
             off,
             json!({
                 "inject_context": false, "shorten_outputs": false, "shorten_reads": true, "context_budget": 900,
-                "auto_index": false, "holdout_share": 0.0, "rules": { "skeleton": "on", "check": "shadow" }, "future": "kept"
+                "auto_index": false, "holdout_share": 0.0, "rules": { "skeleton": "on", "check": "shadow" }, "future": "kept",
+                "ab_arm": "off"
             }),
             "the master switches cover every rule; the rule modes stay as the user set them"
         );
@@ -1257,8 +1262,11 @@ mod tests {
         );
         // Variants: the user's settings in both arms, with no holdout.
         for variant in [Variant::Terse, Variant::Batch] {
-            let a = arm_settings(&original, Arm::Off, variant);
-            let b = arm_settings(&original, Arm::On, variant);
+            let mut a = arm_settings(&original, Arm::Off, variant);
+            let mut b = arm_settings(&original, Arm::On, variant);
+            assert_eq!((a["ab_arm"].as_str(), b["ab_arm"].as_str()), (Some("off"), Some("on")));
+            a["ab_arm"] = Value::Null;
+            b["ab_arm"] = Value::Null;
             assert_eq!(a, b, "{variant}");
             assert_eq!(
                 (a["inject_context"].clone(), a["shorten_outputs"].clone()),

@@ -33,6 +33,16 @@ pub struct Seen {
     pub model: Option<String>,
     /// The first message the user typed, cut to 200 chars.
     pub first_user_message: String,
+    /// The same message cut to [`ROUTED_CHARS`], for the router: a task whose
+    /// scope is named after its first 200 characters is routed by all of it.
+    pub first_user_text: String,
+    /// The request carries a conversation already under way: an item other
+    /// than a user, developer or system message (reasoning, a tool call or
+    /// its output, a compaction item, an item reference), an assistant
+    /// message, more than one typed message, Codex's compaction summary or a
+    /// turn-aborted notice, or a `previous_response_id`. False only for a
+    /// conversation's genuine first request.
+    pub has_history: bool,
     /// Tool outputs replaced in this request (old and new decisions alike).
     pub outputs_replaced: usize,
     /// Context messages present in this request.
@@ -65,6 +75,10 @@ pub struct Seen {
 
 /// Outputs kept in [`Seen::largest_new_outputs`].
 pub const LARGEST_NEW_OUTPUTS: usize = 3;
+
+/// Characters of the first typed message the router reads: enough for a task
+/// with its scope, while a pasted log does not make the search slow.
+pub const ROUTED_CHARS: usize = 4000;
 
 /// One tool output as a request trace shows it. No output text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -218,6 +232,44 @@ fn mentioned_in(items: &[Value], path: &str) -> bool {
 
 /// How every pack lge adds starts.
 const CONTEXT_OPEN_TAG: &str = "<lge_context>";
+
+/// How Codex's environment context opens, lower-cased.
+const ENVIRONMENT_CONTEXT: &str = "<environment_context>";
+
+/// How the summary Codex writes when it compacts a conversation opens, and its
+/// notice of an interrupted turn, lower-cased: an injected message that only
+/// a conversation already under way carries.
+const HISTORY_STARTS: [&str; 2] = [
+    "another language model started to solve this problem and produced a summary",
+    "<turn_aborted>",
+];
+
+/// The texts of a message item one by one: its `input_text` parts, or its
+/// string content.
+fn message_parts(item: &Value) -> Vec<&str> {
+    match item.get("content") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("input_text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The working folder of Codex's environment context, read only from a part
+/// that is one (Codex sends it as its own part, after AGENTS.md): a `<cwd>`
+/// quoted in a typed message or a pasted log never counts.
+fn environment_cwd(item: &Value) -> Option<String> {
+    message_parts(item).into_iter().find_map(|part| {
+        let trimmed = part.trim_start();
+        let opens = trimmed
+            .get(..ENVIRONMENT_CONTEXT.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(ENVIRONMENT_CONTEXT));
+        opens.then(|| tag(trimmed, "cwd").map(str::to_string)).flatten()
+    })
+}
 
 fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let open = format!("<{name}>");
@@ -1266,12 +1318,6 @@ pub const SUBAGENT_HEADER: &str = "x-openai-subagent";
 /// The sub-agent label of a spawned agent doing real work in its own thread:
 /// its requests are a conversation like any other.
 const SPAWNED_AGENT: &str = "collab_spawn";
-/// The default model of Codex's approval reviewer
-/// (codex-rs/model-provider/src/provider.rs), whose label is `guardian`.
-const REVIEWER_MODEL: &str = "codex-auto-review";
-/// How the desktop app's request for a task's title starts (the app's own
-/// prompt; it is not in codex-rs).
-const TITLE_PROMPT: &str = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt";
 /// Characters of a sub-agent label kept.
 const LABEL_CHARS: usize = 40;
 /// The header (and `client_metadata` key) in which Codex sends a turn's
@@ -1309,9 +1355,10 @@ pub fn compaction_request(turn_metadata: Option<&str>, body: &Value) -> bool {
 /// metadata's `thread_source` is a task title, a recap, an approval review
 /// or a memory consolidation (see [`lge_usage::background_thread_source`]);
 /// the model is the approval reviewer's (label `guardian`); or the
-/// instructions or the first typed message open with the desktop app's
-/// title prompt (label `title`). `subagent` and `turn_metadata` are the
-/// headers' values.
+/// instructions, or a message up to and including the first typed one, open
+/// with one of Codex's own prompts ([`lge_usage::BACKGROUND_PROMPTS`]: the
+/// desktop app's title prompt, the approval reviewer's, a memory
+/// consolidation's). `subagent` and `turn_metadata` are the headers' values.
 pub fn background_label(subagent: Option<&str>, turn_metadata: Option<&str>, body: &Value) -> Option<String> {
     let label = |value: &str| -> Option<String> {
         let value = value.trim();
@@ -1340,16 +1387,16 @@ pub fn background_label(subagent: Option<&str>, turn_metadata: Option<&str>, bod
     if body
         .get("model")
         .and_then(Value::as_str)
-        .is_some_and(|m| m.trim().eq_ignore_ascii_case(REVIEWER_MODEL))
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case(lge_usage::REVIEWER_MODEL))
     {
         return Some("guardian".to_string());
     }
-    let title = |text: &str| text.trim_start().starts_with(TITLE_PROMPT);
-    if body.get("instructions").and_then(Value::as_str).is_some_and(title) {
-        return Some("title".to_string());
+    let prompt = |text: &str| lge_usage::background_task(text).map(str::to_string);
+    if let Some(found) = body.get("instructions").and_then(Value::as_str).and_then(prompt) {
+        return Some(found);
     }
     match body.get("input") {
-        Some(Value::String(text)) if title(text) => return Some("title".to_string()),
+        Some(Value::String(text)) => return prompt(text),
         Some(Value::Array(items)) => {
             // The messages up to the first one the person typed.
             for item in items {
@@ -1357,8 +1404,8 @@ pub fn background_label(subagent: Option<&str>, turn_metadata: Option<&str>, bod
                     continue;
                 }
                 let Some(text) = message_text(item) else { continue };
-                if title(&text) {
-                    return Some("title".to_string());
+                if let Some(found) = prompt(&text) {
+                    return Some(found);
                 }
                 if item.get("role").and_then(Value::as_str) == Some("user") && !is_injected(item, &text) {
                     break;
@@ -1375,20 +1422,44 @@ pub fn inspect(body: &Value) -> Seen {
     let mut seen = Seen {
         conversation: body.get("prompt_cache_key").and_then(Value::as_str).map(str::to_string),
         model: body.get("model").and_then(Value::as_str).map(str::to_string),
+        has_history: body.get("previous_response_id").is_some_and(|v| !v.is_null()),
         ..Seen::default()
     };
+    let mut typed = 0usize;
     for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
-        if item.get("type").and_then(Value::as_str) != Some("message")
-            || item.get("role").and_then(Value::as_str) != Some("user")
-        {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        match (kind, role) {
+            ("message", "user") => {}
+            ("message", "developer" | "system") | ("additional_tools", _) => continue,
+            // Reasoning, a tool call or its output, an assistant message, a
+            // compaction item, an item reference: an earlier turn.
+            _ => {
+                seen.has_history = true;
+                continue;
+            }
+        }
+        if item.get("type").and_then(Value::as_str) != Some("message") {
             continue;
         }
         let Some(text) = message_text(item) else { continue };
         if seen.cwd.is_none() {
-            seen.cwd = tag(&text, "cwd").map(str::to_string);
+            seen.cwd = environment_cwd(item);
         }
-        if seen.first_user_message.is_empty() && !is_injected(item, &text) {
+        if is_injected(item, &text) {
+            let lower = text.trim_start().to_ascii_lowercase();
+            if HISTORY_STARTS.iter().any(|start| lower.starts_with(start)) {
+                seen.has_history = true;
+            }
+            continue;
+        }
+        typed += 1;
+        if typed > 1 {
+            seen.has_history = true;
+        }
+        if seen.first_user_message.is_empty() {
             seen.first_user_message = text.trim().chars().take(200).collect();
+            seen.first_user_text = text.trim().chars().take(ROUTED_CHARS).collect();
         }
     }
     seen
@@ -2527,7 +2598,7 @@ mod tests {
         model["model"] = json!("Codex-Auto-Review");
         assert_eq!(background_label(None, None, &model).as_deref(), Some("guardian"));
         // The desktop app's title prompt, in the instructions or the first typed message.
-        let prompt = format!("{TITLE_PROMPT}.\n\nUser prompt: fix the login bug");
+        let prompt = format!("{}.\n\nUser prompt: fix the login bug", lge_usage::TITLE_PROMPT);
         let mut instructions = plain.clone();
         instructions["instructions"] = json!(prompt);
         assert_eq!(background_label(None, None, &instructions).as_deref(), Some("title"));
@@ -2571,6 +2642,86 @@ mod tests {
         assert!(!compaction_request(Some(r#"{"request_kind":"turn"}"#), &plain));
         assert!(!compaction_request(None, &plain));
         assert_eq!(background_label(None, None, &summary), None, "not a background session");
+    }
+
+    #[test]
+    fn the_reviewer_and_memory_prompts_are_background_only_up_to_the_first_typed_message() {
+        let env = user("<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>");
+        for (prompt, label) in [
+            (lge_usage::GUARDIAN_PROMPT, "guardian"),
+            (lge_usage::MEMORY_PROMPT, "memory_consolidation"),
+            (lge_usage::TITLE_PROMPT, "title"),
+        ] {
+            let text = format!("{prompt}\n\nThe transcript follows.");
+            let first = json!({ "model": "gpt-test", "input": [env.clone(), user(&text)] });
+            assert_eq!(background_label(None, None, &first).as_deref(), Some(label));
+            let instructions = json!({ "model": "gpt-test", "instructions": text, "input": [env.clone(), user("go")] });
+            assert_eq!(background_label(None, None, &instructions).as_deref(), Some(label));
+            // After a typed message, or quoted inside one, it is not one.
+            let later = json!({ "model": "gpt-test", "input": [env.clone(), user("fix the login bug"), user(&text)] });
+            assert_eq!(background_label(None, None, &later), None, "{label}");
+            let quoted = json!({ "model": "gpt-test", "input": [user(&format!("what does this mean: {text}"))] });
+            assert_eq!(background_label(None, None, &quoted), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_working_folder_comes_only_from_codexs_environment_context() {
+        let context = json!({ "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nbe brief\n</INSTRUCTIONS>" },
+            { "type": "input_text", "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>" },
+        ] });
+        let typed = user("look at <cwd>/elsewhere</cwd>");
+        let both = json!({ "input": [typed.clone(), context] });
+        assert_eq!(inspect(&both).cwd.as_deref(), Some("/repo"));
+        let single = json!({ "input": [typed.clone(), user("<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>")] });
+        assert_eq!(inspect(&single).cwd.as_deref(), Some("/repo"));
+        let pasted =
+            json!({ "input": [typed, user("<user_shell_command>\n<cwd>/other</cwd>\n</user_shell_command>")] });
+        assert_eq!(
+            inspect(&pasted).cwd,
+            None,
+            "only the environment context names the folder"
+        );
+    }
+
+    #[test]
+    fn a_genuine_first_request_is_told_from_one_that_carries_history() {
+        let env = user("<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>");
+        let developer =
+            json!({ "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "rules" }] });
+        let tools = json!({ "type": "additional_tools", "tools": [] });
+        let long = format!(
+            "rename shout_text {} then update every caller in the billing service",
+            "x".repeat(300)
+        );
+        let first = json!({ "input": [tools, developer, env.clone(), user(&long)] });
+        let seen = inspect(&first);
+        assert!(!seen.has_history, "{seen:?}");
+        assert_eq!(seen.first_user_message.chars().count(), 200);
+        assert!(
+            seen.first_user_text.ends_with("billing service"),
+            "the router reads it all"
+        );
+        let with = |extra: Value| json!({ "input": [env.clone(), user("fix it"), extra] });
+        for extra in [
+            json!({ "type": "reasoning", "summary": [], "encrypted_content": "x" }),
+            json!({ "type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "c1", "output": "ok" }),
+            json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "done" }] }),
+            json!({ "type": "compaction", "encrypted_content": "x" }),
+            json!({ "type": "item_reference", "id": "msg_1" }),
+            user("and the other one too"),
+            user(
+                "Another language model started to solve this problem and produced a summary of its thinking process.",
+            ),
+            user("<turn_aborted>\nThe user interrupted the previous turn.\n</turn_aborted>"),
+        ] {
+            assert!(inspect(&with(extra.clone())).has_history, "{extra}");
+        }
+        let mut chained = first.clone();
+        chained["previous_response_id"] = json!("resp_1");
+        assert!(inspect(&chained).has_history);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 target/
+# Build folders of other target directories (CARGO_TARGET_DIR=target-...).
+/target-*/
 .lge/
 .DS_Store
 .claude/worktrees/

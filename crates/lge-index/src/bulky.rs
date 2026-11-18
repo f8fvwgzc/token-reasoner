@@ -4,9 +4,12 @@
 //! `rg` and `grep` read every file that `.gitignore` does not exclude, so one
 //! forgotten `artifacts/` folder can fill an agent's search output (and its
 //! tokens) with junk. [`bulky_dirs`] finds such folders, up to two levels below
-//! the root, so the user can add one line to the file [`ignore_file`] names:
-//! `.gitignore` inside a git repository, `.ignore` outside one, where `rg`
-//! does not read `.gitignore` at all.
+//! the root, so the user can add one line to the file [`ignore_file`] names.
+//! `rg` reads `.gitignore` only inside a git repository and only up to the
+//! nearest repository root, while it reads `.ignore` everywhere, parent
+//! folders included: so `.gitignore` for a folder of the root's own
+//! repository, `.ignore` outside a repository and for a folder inside a
+//! repository nested below the root.
 
 use crate::{is_dependency_or_generated, is_generated, lang_of, SKIP_DIRS};
 use std::collections::BTreeMap;
@@ -83,13 +86,20 @@ impl BulkyDir {
     }
 }
 
-/// The file under `root` where an ignore line hides a folder from searches.
-/// `rg` reads `.gitignore` only inside a git repository (the root or a folder
-/// above it has `.git`, a folder or a worktree's file). Outside one it reads
-/// `.ignore` but not `.gitignore`, so a line there would quiet lge's warning
-/// and still leave the folder in every search. lge reads both.
-pub fn ignore_file(root: &Path) -> &'static str {
-    if root.ancestors().any(|dir| dir.join(".git").exists()) {
+/// The file under `root` where an ignore line hides the folder `rel` (a
+/// path relative to `root`, `/`-separated) from searches. `rg` reads
+/// `.gitignore` only inside a git repository (the root or a folder above it
+/// has `.git`, a folder or a worktree's file), and only up to the nearest
+/// repository root: a line in the root's `.gitignore` does not reach into a
+/// repository nested between the root and the folder. It reads `.ignore`
+/// everywhere, parent folders included. So `.ignore` outside a repository
+/// and for a folder inside a nested one, `.gitignore` otherwise; a line in
+/// the wrong one would quiet lge's warning (lge reads both) and still leave
+/// the folder in every search.
+pub fn ignore_file(root: &Path, rel: &str) -> &'static str {
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    let nested = (1..parts.len()).any(|n| root.join(parts[..n].join("/")).join(".git").exists());
+    if !nested && root.ancestors().any(|dir| dir.join(".git").exists()) {
         ".gitignore"
     } else {
         ".ignore"
@@ -583,14 +593,35 @@ mod tests {
         let root = dir.path().join("several repos");
         fs::create_dir_all(root.join("api")).unwrap();
         // Not a git repository: rg ignores .gitignore here.
-        assert_eq!(ignore_file(&root), ".ignore");
+        assert_eq!(ignore_file(&root, "dist"), ".ignore");
         // A repository, or a folder inside one (a worktree has a .git file).
         fs::create_dir_all(root.join("api/.git")).unwrap();
-        assert_eq!(ignore_file(&root.join("api")), ".gitignore");
+        assert_eq!(ignore_file(&root.join("api"), "dist"), ".gitignore");
         fs::create_dir_all(root.join("api/web")).unwrap();
-        assert_eq!(ignore_file(&root.join("api/web")), ".gitignore");
+        assert_eq!(ignore_file(&root.join("api/web"), "dist"), ".gitignore");
         fs::create_dir_all(root.join("wt")).unwrap();
         fs::write(root.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(ignore_file(&root.join("wt")), ".gitignore");
+        assert_eq!(ignore_file(&root.join("wt"), "dist"), ".gitignore");
+    }
+
+    #[test]
+    fn a_folder_inside_a_nested_repository_is_hidden_by_ignore_since_rg_reads_gitignore_only_up_to_that_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("app");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("sub/.git")).unwrap();
+        fs::create_dir_all(root.join("sub/node_modules")).unwrap();
+        fs::write(root.join("sub/node_modules/a.js"), "x").unwrap();
+        fs::create_dir_all(root.join("web/dist")).unwrap();
+        fs::write(root.join("web/dist/a.js"), "x").unwrap();
+        assert_eq!(ignore_file(&root, "sub/node_modules"), ".ignore");
+        assert_eq!(ignore_file(&root, "web/dist"), ".gitignore");
+        // The nested repository itself is matched at its parent, before the boundary.
+        assert_eq!(ignore_file(&root, "sub"), ".gitignore");
+        // A root outside any repository, with a repository in it.
+        let plain = dir.path().join("several");
+        fs::create_dir_all(plain.join("proj/.git")).unwrap();
+        assert_eq!(ignore_file(&plain, "proj/node_modules"), ".ignore");
+        assert_eq!(ignore_file(&plain, "proj"), ".ignore");
     }
 }

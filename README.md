@@ -23,7 +23,27 @@ and two ways of measuring a difference are built in: `lge ab` runs your own task
 off and on, and a holdout share of conversations runs with every rule measured but not
 applied.
 
-What v0.0.4 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+What v0.0.5 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+
+- **Page numbers that compare like with like.** Sessions of Codex's background requests
+  stored by older versions (told by Codex's own prompts) count as background ones; a
+  session recorded before v0.0.2 shows "–" for its requests instead of 0; the holdout
+  comparison takes only sessions placed in an arm at random and says how many it left
+  out; the sessions of an `lge ab` run are listed but kept out of the cards; the packs
+  line tells "no room" from "too large"; compactions are counted with their input
+  tokens; and the long-session note says when each session last ran.
+- **Codex's background requests leave your folders alone.** They never add a folder to
+  the graph, refresh an index or change the folder the graph tools answer for, and the
+  git folders Codex keeps for itself (its memory folders) are never indexed.
+- **Packs.** A pack no longer repeats the message it follows; a follow-up too large with
+  4 starting points is built with fewer; and each pack's text is kept, so a restart sends
+  the same bytes whatever changed in the graph.
+- **Effort lowering fixed** (`router_apply`, off by default): decided only when lge sees a
+  conversation from its start, from the first 4,000 characters of its first message,
+  stored at once, the same for a compaction's request, and back to your effort after a
+  refusal on any request.
+
+What v0.0.4 added:
 
 - **The router can lower the reasoning effort, if you ask.** `router_apply` (on the page:
   "Lower the reasoning effort when the router recommends it") is `off` by default. With
@@ -31,9 +51,9 @@ What v0.0.4 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](do
   effort; with `low-and-medium`, a task in one service is sent at `medium` too. The
   effort is only ever lowered, decided once on a conversation's first request and kept
   for all of it (a restart included), and never changed for held-out or background
-  sessions, so the holdout arm measures what it costs. If the provider refuses the
-  request, the conversation goes back to your effort. No saving or quality effect is
-  measured yet: run `lge ab` or a holdout share before relying on it.
+  sessions. If the provider refuses the request, the conversation goes back to your
+  effort. No saving or quality effect is measured yet; the holdout arm and `lge ab`
+  measure the effort only together with the rest of lge's changes.
 - **Tests that pass on Linux and as root**: the A/B preflight test accepts dash's
   `not found`, and the read-only-folder test is skipped where root can delete it.
 
@@ -270,14 +290,18 @@ The page shows, per session: requests and input tokens per request, input tokens
 share that was cached, output and reasoning tokens, what lge removed from tool output,
 what graph context it added, and the tokens not sent over every request net of lge's own
 packs. Codex's background requests (the approval reviewer, reviews, task titles and
-recaps, memory) are tagged, get no pack and are counted by label. Under the table, a line
-counts the packs (added, already known, over budget, retired), and a note names the
-sessions that re-send a very large input on every request. Below that:
+recaps, memory) are tagged, get no pack and are counted by label with their input
+tokens; sessions of an `lge ab` run are tagged with their arm and kept out of the cards.
+A session recorded before v0.0.2 shows "–" for its requests. Under the table, a line
+counts the packs (added, already known, not added for lack of room or as too large for a
+follow-up, retired after the history was rewritten), and a note names the sessions that
+re-send a very large input on every request, with when each last ran. Below that:
 
 - **Rules**: each rule's switch (off, shadow, on), what it changed or would have changed,
   its recovery rate and whether it is healthy or was demoted (with a Re-enable button),
   and the skeleton counts by language and file size;
-- **Holdout**: the share of new conversations held out, and the comparison of the two arms;
+- **Holdout**: the share of new conversations held out, and the comparison of the two arms
+  over the sessions placed in an arm at random (started while the share was above 0);
 - **Prompt cache**: cache breaks caused by lge (a bug), breaks caused by Codex changing its
   own history, and cold restarts after an idle gap;
 - **Fixed prefix**: what Codex sends at the start of every request, by tool group, and the
@@ -289,9 +313,10 @@ sessions that re-send a very large input on every request. Below that:
   sessions from `~/.codex` (no conversation text), leaving out Codex's background threads.
 
 **Long sessions.** Every request re-sends the whole conversation, so a long session costs
-its input again on every request. The page names the sessions (background ones aside)
-with at least 50 requests and more than 150,000 input tokens per request on average. What
-to do about it is your choice; lge only reports it and never edits Codex's configuration.
+its input again on every request. The page names the sessions (background ones and
+`lge ab` runs aside) with at least 50 requests and more than 150,000 input tokens per
+request on average, the latest first, with when each last ran. What to do about it is
+your choice; lge only reports it and never edits Codex's configuration.
 Two options:
 
 - Start a new session per task.
@@ -309,9 +334,11 @@ build output, dependencies, logs or archives that `.gitignore` does not exclude 
 `artifacts/` or `dist/`, or anything over 50 MB or 5,000 files without source in it),
 with their size and the exact line to add, and to which file: `.gitignore` inside a git
 repository, `.ignore` in a folder that is not one (such as a folder holding several
-repositories), because `rg` reads `.gitignore` only inside a git repository. Nothing is
-wrong when the warning shows: it only points at search output that could be smaller, and
-a folder you need searched should stay as it is. `lge index` prints the same warning.
+repositories) and for a folder inside a repository nested below the folder you added,
+because `rg` reads `.gitignore` only inside a git repository and only up to the nearest
+repository root, while it reads `.ignore` everywhere. Nothing is wrong when the warning
+shows: it only points at search output that could be smaller, and a folder you need
+searched should stay as it is. `lge index` prints the same warning.
 
 Every model request also leaves one line in `~/.lge/serve.log`, without any content:
 
@@ -475,8 +502,11 @@ lge runs on your machine; the daemon forwards requests only to the provider your
 already uses. Per conversation it stores token counts, the model name, the first message
 you typed cut to 200 characters, the router's recommendation, counts per rule and of the
 cache monitor, two token totals, and a ledger of decisions made of hash prefixes, rule
-ids, pack sizes and hashes of the history up to each pack (no content). Settings go to
-`daemon.json`, and `serve.log` gets one line per model request without any content.
+ids, pack sizes, hashes of the history up to each pack, and the text of each pack lge
+added that is still in the conversation (lge's own text from the graph, so a restart
+sends the same bytes; in a conversation started before v0.0.5 it opens with the message
+you typed). No tool output is stored. Settings go to `daemon.json`, and `serve.log` gets
+one line per model request without any content.
 Request traces, the replay of past sessions and the fixed-prefix report stay in memory.
 Credentials pass through and are never stored or logged. `lge usage discover` stores
 nothing unless you add `--retain`, which keeps corrected commands as facts in the
@@ -578,8 +608,8 @@ each, and what was left out on purpose, is in `docs/PRIOR_ART.md`.
 | Apply the rules to tool output | `shorten_outputs` | on | The master switch of every rule below; off, new outputs get no rule, not even in shadow |
 | Rules | `rules` | `check`, `search_cap`, `repeat_pointer`, `inert`, `path_fold`, `json_minify` on; `skeleton`, `line_clip`, `noise`, `lockfile` shadow; `rerun_delta`, `read_delta` measured only | The mode of each rule: off, shadow or on |
 | Holdout | `holdout_share` | 0 | The share of new conversations (0 to 1) that run every rule in shadow, for comparison |
-| Lower the reasoning effort when the router recommends it | `router_apply` | off | `off` logs the recommendation; `low-only` sends a one-file task at `low` effort; `low-and-medium` also sends a one-service task at `medium`. Only ever lowers, decided on a conversation's first request and kept for all of it |
-| Index on first use | `auto_index` | on | A git repository is indexed the first time Codex works in it |
+| Lower the reasoning effort when the router recommends it | `router_apply` | off | `off` logs the recommendation; `low-only` sends a one-file task at `low` effort; `low-and-medium` also sends a one-service task at `medium`. Only ever lowers, decided on a conversation's first request (when lge sees it from its start) and kept for all of it |
+| Index on first use | `auto_index` | on | A git repository is indexed the first time Codex works in it in a conversation someone works in (never for one of Codex's background requests, and never a folder Codex keeps for itself, such as its memory folder) |
 | - | `context_budget` | 1,500 | Tokens of one pack (at most 600 for a question about one file) |
 | Tokens of graph context in one request | `pack_conversation_budget` | 3,000 | The packs present in one request together; a new pack is built to fit in the room left and not added with less than 300 tokens of room. After a conversation's first pack, a pack is at most 600 and only for a file nothing before it named. Packs already sent keep their bytes |
 
@@ -650,9 +680,11 @@ Docker: `docker compose down` (add `-v` to delete the data volume).
   your own numbers, or measure with `lge ab` and the holdout arm. The terse-replies skill
   and the batch line are unmeasured until `lge ab --variant` measures them. The code-mode
   layouts for several commands and JSON exec lines are built from Codex's source, not from
-  a real capture, and so is how Codex's background requests and compacted history are
-  recognised. Both Headroom and RTK report that shrinking tool output by 90% saves far
-  less than 90% of the whole cost, because most of a request is the conversation itself.
+  a real capture, and so is how Codex's background requests, its compacted history and a
+  conversation's first request are recognised; Codex's prompts for approval reviews,
+  titles and memory may change wording. Both Headroom and RTK report that shrinking tool
+  output by 90% saves far less than 90% of the whole cost, because most of a request is
+  the conversation itself.
 - **Edges marked inferred or unresolved are not verified.** lge says so in every answer.
 - **One process owns each database.** While the daemon runs, use its page, API and MCP
   tools rather than `lge index` on the same repository.

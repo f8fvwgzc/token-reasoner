@@ -77,7 +77,7 @@
       <div class="scroll"><table id="sessions"></table></div>
       <div class="warn" id="long_note" style="margin-top:10px" hidden></div>
       <div class="dim" id="packs_line" style="margin-top:10px"></div>
-      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session</h3><div class="scroll"><table id="background"></table></div></div>
+      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session (each re-sends the history: its input is counted per request)</h3><div class="scroll"><table id="background"></table></div></div>
     </div>
   </section>
 
@@ -136,6 +136,7 @@
     <h2>Before and after</h2>
     <div class="card">
       <div class="scroll"><table id="modes"></table></div>
+      <div class="dim" style="margin-top:6px">Over every stored session. Sessions of an <span class="mono">lge ab</span> run are counted apart; runs recorded before lge tagged them cannot be told apart and count as through the proxy.</div>
       <div class="row" style="margin-top:12px">
         <button id="import">Import past Codex sessions</button>
         <span class="dim">Reads token counts from the agent's session files to get a baseline. No conversation text is stored.</span>
@@ -157,13 +158,16 @@
           <option value="low-only">low only (a change in one file)</option>
           <option value="low-and-medium">low and medium (one service)</option>
         </select>
-        <span class="dim">Never raises the effort. Decided on a conversation's first request and kept for all of it. Held-out and background sessions are never changed.</span></span>
+        <span class="dim">Never raises the effort. Decided on a conversation's first request (only when lge sees it from its start) and kept for all of it, the request for a compaction's summary included. Held-out and background sessions are never changed.</span></span>
     </div>
   </section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const n = v => (v || 0).toLocaleString();
+// A count that may be unknown (null): '–', not 0.
+const nn = v => v == null ? '–' : n(v);
+const when = t => t ? new Date(t * 1000).toLocaleString() : '–';
 const pct = (a, b) => b > 0 ? Math.round(100 * a / b) + '%' : '–';
 const size = b => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; b = b || 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; } return (i ? b.toFixed(b < 10 ? 1 : 0) : b) + ' ' + u[i]; };
 // Folders that searches would read: the folder, its size, why, and the line that hides it.
@@ -176,6 +180,13 @@ const bulky = r => {
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, settingsDirty = false;
+// The folder whose indexing the note under the folder list reports, until it is done.
+let pending = null;
+// Status requests are numbered: one started before the folder was added (or
+// sent to be indexed again) cannot tell about it, and an answer older than the
+// one shown is dropped.
+let statusSeq = 0, shownSeq = 0, pendingAfter = 0;
+function watch(root) { pending = root; pendingAfter = statusSeq; }
 const rate = r => r == null ? '–' : (100 * r).toFixed(1) + '%';
 const MODES = ['off', 'shadow', 'on'];
 function table(id, head, rows, empty) {
@@ -191,14 +202,14 @@ async function api(path, method = 'GET', body) {
 }
 function say(text, cls = 'dim') { const m = $('msg'); m.className = cls; m.textContent = text; }
 
-function render(s) {
+function render(s, seq) {
   state = s;
   $('sub').textContent = `v${s.version} · listening on ${s.listen} · up ${Math.floor(s.uptime_seconds / 60)} min`;
   const proxy = (s.modes.find(m => m.mode === 'proxy')) || {};
   const sv = s.saved;
   const removed = sv.tokens_before - sv.tokens_after;
   $('cards').innerHTML = [
-    ['Sessions', n(proxy.sessions), ''],
+    ['Sessions', n(proxy.sessions), 'all stored; background and lge ab runs apart'],
     ['Input tokens', n(proxy.input_tokens), `cached ${pct(proxy.cached_input_tokens, proxy.input_tokens)}`],
     ['Output tokens', n(proxy.output_tokens), `reasoning ${pct(proxy.reasoning_tokens, proxy.output_tokens)}`],
     ['Removed from tool output', n(removed), `${n(sv.outputs_shortened)} outputs, ${pct(removed, sv.tokens_before)} smaller`],
@@ -215,13 +226,23 @@ function render(s) {
       <td class="n">${n(r.files)}</td><td class="n">${n(r.symbols)}</td><td class="n">${n(r.memories)}</td>
       <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')
       : '<tr><td colspan="6" class="dim">No folder yet. Add one below, or start Codex in a git repository.</td></tr>');
+  // The note of a folder being added or re-indexed, once it is done, read
+  // only from a status requested after the folder was sent.
+  if (pending && seq > pendingAfter) {
+    const r = s.repos.find(x => x.root === pending);
+    if (!r) pending = null;
+    else if (r.state !== 'indexing') {
+      pending = null;
+      say(r.state === 'ready' ? `${r.name} is indexed: ${n(r.files)} files, ${n(r.symbols)} symbols.` : `${r.name}: ${r.state}${r.detail ? ' (' + r.detail + ')' : ''}`, r.state === 'ready' ? 'ok' : 'bad');
+    }
+  }
 
   // Packs of a session, when it had any decision about one.
-  const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_retired)
-    ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} over budget, ${n(x.packs_retired)} retired` : '';
+  const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_too_large || x.packs_retired)
+    ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} no room, ${n(x.packs_too_large)} too large, ${n(x.packs_retired)} retired after a rewrite of the history` : '';
   $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input / request</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${packsOf(x)}</div></td>
-      <td class="n">${n(x.requests)}</td><td class="n">${n(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${x.ab_arm ? ' · lge ab arm ' + esc(x.ab_arm) : ''}${packsOf(x)}</div></td>
+      <td class="n">${nn(x.requests)}</td><td class="n">${nn(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
       <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
       : '<tr><td colspan="11" class="dim">No session has gone through the proxy yet.</td></tr>');
@@ -229,11 +250,11 @@ function render(s) {
   const ls = s.long_sessions || {};
   const longList = ls.sessions || [];
   $('long_note').hidden = !longList.length;
-  $('long_note').innerHTML = longList.length ? `${longList.map(l => `<b>${esc(l.task || l.id)}</b> (${n(l.requests)} requests, ${n(l.mean_input_tokens)} input tokens each on average)`).join(', ')}. ${esc(ls.note)}` : '';
+  $('long_note').innerHTML = longList.length ? `${longList.map(l => `<b>${esc(l.task || l.id)}</b> (${n(l.requests)} requests, ${n(l.mean_input_tokens)} input tokens each on average, last request ${esc(when(l.finished_at))})`).join(', ')}. ${esc(ls.note)}` : '';
   const pk = s.packs || {};
-  $('packs_line').textContent = `Packs (sessions not held out): ${n(pk.added)} added, ${n(pk.known)} not added as already known, ${n(pk.over_budget)} not added for the conversation budget, ${n(pk.retired)} retired after a compaction; ${n(pk.tokens_sent)} tokens of packs sent over all requests. Held-out sessions would have added ${n(pk.holdout_would_add)}.`;
-  table('background', ['Label', '#Sessions', '#Requests', '#Input tokens of its sessions'],
-    (s.background || []).map(b => `<tr><td class="mono">${esc(b.label)}</td><td class="n">${n(b.sessions)}</td><td class="n">${n(b.requests)}</td><td class="n">${n(b.input_tokens)}</td></tr>`),
+  $('packs_line').textContent = `Packs (sessions not held out): ${n(pk.added)} added, ${n(pk.known)} not added as already known, ${n(pk.over_budget)} not added: no room left in the conversation budget, ${n(pk.too_large)} not added: larger than a follow-up pack may be (600 tokens), ${n(pk.retired)} retired after the history was rewritten (compaction, edit, rollback). ${n(pk.tokens_sent)} tokens of packs sent over all requests since ${esc(when(pk.since))}, every version; ${n(pk.tokens_sent_uncounted)} of them in sessions whose records count no pack (recorded before v0.0.2: their packs are not counted above), ${n(pk.tokens_sent_background)} in Codex's background sessions. Sessions recorded by v0.0.2 count their packs as added (from their ledger), never as already known, no room or too large. Held-out sessions would have added ${n(pk.holdout_would_add)}.`;
+  table('background', ['Label', '#Sessions', '#Requests', '#Input tokens of these requests', '#Input tokens of its sessions'],
+    (s.background || []).map(b => `<tr><td class="mono">${esc(b.label)}</td><td class="n">${nn(b.sessions)}</td><td class="n">${n(b.requests)}</td><td class="n">${n(b.request_input_tokens)}</td><td class="n">${b.sessions == null ? '–' : n(b.input_tokens)}</td></tr>`),
     'No background request yet.');
 
   const err = $('settings_error');
@@ -266,7 +287,7 @@ function render(s) {
     Object.keys(metric).map(k => { const d = diffs[k];
       return `<tr><td>${metric[k]}</td><td class="n">${n(Math.round(((h.proxy || {}).medians || {})[k] || 0))}</td><td class="n">${n(Math.round(((h.holdout || {}).medians || {})[k] || 0))}</td>
         <td class="n">${d ? `${n(Math.round(d.difference))} (${n(Math.round(d.low))} to ${n(Math.round(d.high))})` : '–'}</td></tr>`; }), '');
-  $('holdout_note').textContent = h.note ? `${h.note}: each arm needs 30 sessions of the last 30 days.` : '';
+  $('holdout_note').textContent = [h.note ? `${h.note}: each arm needs 30 sessions of the last 30 days.` : '', h.left_out_note ? h.left_out_note + '. The arms measure all of lge\'s changes together (rules, packs and, with router_apply on, the effort).' : ''].filter(Boolean).join(' ');
 
   const m = s.monitor || {};
   $('monitor').innerHTML = [
@@ -289,7 +310,7 @@ function render(s) {
     (s.ghost_tools || []).slice(0, 50).map(g => `<tr><td class="mono">${esc(g.name)}</td><td>${esc(g.group)}</td><td class="n">${n(g.tokens)}</td><td class="n">${n(g.requests_seen)}</td><td class="mono">${esc(g.config)}</td></tr>`),
     (fixed.groups || []).length ? 'Every tool in the definitions was called.' : 'No request seen since the daemon started.');
 
-  const label = { history: 'Past sessions (before lge)', proxy: 'Through the proxy', 'proxy-holdout': 'Held out (rules in shadow)' };
+  const label = { history: 'Past sessions (before lge)', proxy: 'Through the proxy', 'proxy-holdout': 'Held out (rules in shadow)', ab: 'lge ab runs (both arms)' };
   $('modes').innerHTML = '<tr><th></th><th class="n">Sessions</th><th class="n">Input / session</th><th class="n">Cached</th><th class="n">Output / session</th><th class="n">Reasoning / session</th></tr>' +
     (s.modes.length ? s.modes.map(m => `<tr><td>${esc(label[m.mode] || m.mode)}</td><td class="n">${n(m.sessions)}</td>
       <td class="n">${n(Math.round(m.input_tokens / Math.max(1, m.sessions)))}</td><td class="n">${pct(m.cached_input_tokens, m.input_tokens)}</td>
@@ -303,12 +324,20 @@ function render(s) {
   if (document.activeElement !== $('router_apply')) $('router_apply').value = s.settings.router_apply || 'off';
 }
 
-async function refresh() { try { render(await api('status')); } catch (e) { $('sub').textContent = 'not reachable: ' + e.message; } }
+async function refresh() {
+  const seq = ++statusSeq;
+  try {
+    const s = await api('status');
+    if (seq < shownSeq) return;
+    shownSeq = seq;
+    render(s, seq);
+  } catch (e) { $('sub').textContent = 'not reachable: ' + e.message; }
+}
 
 async function addRepo(path) {
   if (!path) return say('Type or pick a folder first.', 'warn');
-  try { await api('repos', 'POST', { path }); say('Indexing ' + path + ' …', 'ok'); $('path').value = ''; $('folders').hidden = true; refresh(); }
-  catch (e) { say(e.message, 'bad'); }
+  try { const a = await api('repos', 'POST', { path }); watch(a.root); say('Indexing ' + a.root + ' …', 'ok'); $('path').value = ''; $('folders').hidden = true; refresh(); }
+  catch (e) { pending = null; say(e.message, 'bad'); }
 }
 async function browse(path) {
   try {
@@ -318,9 +347,9 @@ async function browse(path) {
     $('folders').innerHTML = rows.join('') || '<div class="dim">No folders here.</div>';
     $('folders').hidden = false;
     if (b.path) $('path').value = b.path;
-    if (b.error) say(b.error, 'bad');
-    else if (b.note) say(b.note, 'warn');
-  } catch (e) { say(e.message, 'bad'); }
+    if (b.error) { pending = null; say(b.error, 'bad'); }
+    else if (b.note) { pending = null; say(b.note, 'warn'); }
+  } catch (e) { pending = null; say(e.message, 'bad'); }
 }
 
 $('add').onclick = () => addRepo($('path').value.trim());
@@ -329,13 +358,14 @@ $('folders').onclick = e => { const d = e.target.closest('[data-path]'); if (d) 
 $('repos').onclick = async e => {
   const b = e.target.closest('button'); if (!b) return;
   try {
-    if (b.dataset.reindex) { await api('repos', 'POST', { path: b.dataset.reindex }); say('Re-indexing …', 'ok'); }
-    if (b.dataset.remove) { await api('repos?path=' + encodeURIComponent(b.dataset.remove), 'DELETE'); say('Removed from the list. Its graph stays on disk.', 'dim'); }
+    if (b.dataset.reindex) { await api('repos', 'POST', { path: b.dataset.reindex }); watch(b.dataset.reindex); say('Re-indexing …', 'ok'); }
+    if (b.dataset.remove) { pending = null; await api('repos?path=' + encodeURIComponent(b.dataset.remove), 'DELETE'); say('Removed from the list. Its graph stays on disk.', 'dim'); }
     refresh();
-  } catch (err) { say(err.message, 'bad'); }
+  } catch (err) { pending = null; say(err.message, 'bad'); }
 };
 $('import').onclick = async () => {
   $('import').disabled = true;
+  pending = null;
   try { const r = await api('import-history', 'POST', {}); say(`Imported ${r.imported} past sessions (${r.skipped} skipped, ${r.background || 0} of Codex's background threads left out, ${r.unreadable} unreadable).`, 'ok'); refresh(); }
   catch (e) { say(e.message, 'bad'); }
   $('import').disabled = false;
@@ -343,30 +373,35 @@ $('import').onclick = async () => {
 for (const id of ['s_inject', 's_shorten', 's_auto']) $(id).onchange = async () => {
   settingsDirty = true;
   const body = { inject_context: $('s_inject').checked, shorten_outputs: $('s_shorten').checked, auto_index: $('s_auto').checked };
-  try { await api('settings', 'POST', body); } catch (e) { say(e.message, 'bad'); }
+  try { await api('settings', 'POST', body); } catch (e) { pending = null; say(e.message, 'bad'); }
   settingsDirty = false; refresh();
 };
 $('rules').onchange = async e => {
   const sel = e.target.closest('select[data-rule]'); if (!sel) return;
-  try { await api('settings', 'POST', { rules: { [sel.dataset.rule]: sel.value } }); } catch (err) { say(err.message, 'bad'); }
+  try { await api('settings', 'POST', { rules: { [sel.dataset.rule]: sel.value } }); } catch (err) { pending = null; say(err.message, 'bad'); }
   refresh();
 };
 $('rules').onclick = async e => {
   const b = e.target.closest('button[data-enable]'); if (!b) return;
-  try { await api('settings', 'POST', { clear_demotion: b.dataset.enable }); } catch (err) { say(err.message, 'bad'); }
+  try { await api('settings', 'POST', { clear_demotion: b.dataset.enable }); } catch (err) { pending = null; say(err.message, 'bad'); }
   refresh();
 };
 $('pack_budget_save').onclick = async () => {
   const v = Math.max(0, Math.round(Number($('pack_conversation_budget').value) || 0));
-  try { await api('settings', 'POST', { pack_conversation_budget: v }); } catch (err) { say(err.message, 'bad'); }
+  try { await api('settings', 'POST', { pack_conversation_budget: v }); } catch (err) { pending = null; say(err.message, 'bad'); }
   refresh();
 };
 $('router_apply').onchange = async e => {
-  try { await api('settings', 'POST', { router_apply: e.target.value }); } catch (err) { say(err.message, 'bad'); }
+  try { await api('settings', 'POST', { router_apply: e.target.value }); }
+  catch (err) {
+    pending = null; say(err.message, 'bad');
+    // Not saved: show the daemon's value again, focused or not.
+    e.target.value = (state && state.settings && state.settings.router_apply) || 'off';
+  }
   refresh();
 };
 $('holdout_save').onclick = async () => {
-  try { await api('settings', 'POST', { holdout_share: Number($('holdout_share').value) || 0 }); } catch (err) { say(err.message, 'bad'); }
+  try { await api('settings', 'POST', { holdout_share: Number($('holdout_share').value) || 0 }); } catch (err) { pending = null; say(err.message, 'bad'); }
   refresh();
 };
 $('discover').onclick = async () => {

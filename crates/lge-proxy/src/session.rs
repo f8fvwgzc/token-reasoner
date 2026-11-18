@@ -70,6 +70,16 @@ impl Default for Options {
 pub const PACK_CONVERSATION_BUDGET: usize = 3000;
 /// Tokens of a pack after the first one of a conversation at most.
 pub const FOLLOW_UP_PACK_TOKENS: usize = 600;
+/// Starting points a pack is first built with ([`PackOptions::default`]).
+pub const PACK_SEEDS: usize = 4;
+/// Fewer starting points a pack that does not fit is built with again, in
+/// this order: each starting point's heading is never cut, so a pack with
+/// four of them can be larger than a follow-up may be.
+const FEWER_SEEDS: [usize; 2] = [2, 1];
+/// The heading of a pack of a conversation whose ledger has
+/// [`Ledger::pack_format`] 1: the message is the item right before the pack,
+/// so it is not repeated in it.
+pub const PACK_HEADER: &str = "# Context for the message above";
 /// Below this many tokens of room in the conversation budget, no pack is added.
 pub const MIN_PACK_ROOM: usize = 300;
 
@@ -130,6 +140,10 @@ pub struct Saved {
     pub contexts_known: usize,
     /// Packs not added because the conversation budget had no room for them.
     pub contexts_over_budget: usize,
+    /// Follow-up packs not added because even with fewer starting points
+    /// they were larger than a follow-up may be ([`FOLLOW_UP_PACK_TOKENS`]),
+    /// while the conversation budget had room for that much.
+    pub contexts_too_large: usize,
     /// Packs no longer inserted after the client compacted its history.
     pub contexts_retired: usize,
 }
@@ -156,7 +170,9 @@ fn ledger_key(id: &str) -> String {
 /// What each item of a conversation was decided to, by hash: enough for a
 /// daemon that restarted to send the same bytes for the items decided before,
 /// whatever the settings say by then, without counting them again. Kept in the
-/// conversation's usage record; hashes and rule ids only, never content.
+/// conversation's usage record: hashes and rule ids, and the text of each pack
+/// lge added that is still inserted (lge's own text, built from the graph),
+/// never a tool output or a message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Ledger {
@@ -183,6 +199,28 @@ pub struct Ledger {
     /// pack: such a conversation keeps doing so, so its bytes replay.
     #[serde(default)]
     pub no_pack_for_copies: bool,
+    /// The same key -> the starting points the pack was built with, when not
+    /// [`PACK_SEEDS`]; a missing entry (every pack of an older version) is
+    /// [`PACK_SEEDS`].
+    pub pack_seeds: BTreeMap<String, u8>,
+    /// The same key -> the pack exactly as it was sent, for every pack that
+    /// is still inserted, so a restarted daemon sends the same bytes whatever
+    /// changed in the graph since; removed when the pack is retired. Missing
+    /// for packs of older versions, which are built again (and then kept).
+    pub pack_texts: BTreeMap<String, StoredPack>,
+    /// How a pack opens: 0, in a ledger of an older version, with its
+    /// message repeated (`# Context for: <message>`); 1 with [`PACK_HEADER`].
+    #[serde(default)]
+    pub pack_format: u8,
+}
+
+/// A pack as it was sent, and its starting points and files, for a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct StoredPack {
+    pub text: String,
+    pub seeds: Vec<String>,
+    pub files: Vec<String>,
 }
 
 impl Default for Ledger {
@@ -195,6 +233,9 @@ impl Default for Ledger {
             retired: BTreeSet::new(),
             anchors: BTreeMap::new(),
             no_pack_for_copies: true,
+            pack_seeds: BTreeMap::new(),
+            pack_texts: BTreeMap::new(),
+            pack_format: 1,
         }
     }
 }
@@ -292,6 +333,8 @@ struct RequestLog {
     retired_added: Vec<String>,
     /// Ledger keys whose anchor this request set, with the anchor before.
     anchors_before: Vec<(String, Option<u64>)>,
+    /// Stored packs this request retired, to put back on a revert.
+    texts_retired: Vec<(String, StoredPack)>,
     /// Starting points of the packs inserted so far in this request: what the
     /// items before the next message already show.
     present_seeds: BTreeSet<String>,
@@ -328,6 +371,17 @@ struct Built {
     /// Ids and files of its starting points, and the files it names.
     seeds: Vec<String>,
     seed_files: Vec<String>,
+    files: Vec<String>,
+}
+
+/// A pack decided for a message seen for the first time.
+struct Decided {
+    text: String,
+    /// The tokens it was built to fit in.
+    cap: usize,
+    /// The starting points it was built with.
+    max_seeds: usize,
+    seeds: Vec<String>,
     files: Vec<String>,
 }
 
@@ -384,9 +438,14 @@ pub struct Session {
     pub saved: Saved,
     /// Every item's decision by hash, for a restart (see [`Ledger`]).
     ledger: Ledger,
-    /// Packs added again from the ledger after a restart: not counted again,
-    /// but they count towards [`Options::max_contexts`].
+    /// Packs the conversation added before the daemon restarted, from the
+    /// ledger, retired ones included: not counted again, but they count
+    /// towards [`Options::max_contexts`].
     pinned_contexts: usize,
+    /// Packs a held-out conversation would have added before the daemon
+    /// restarted: they count towards [`Options::max_contexts`] and make the
+    /// next one a follow-up, and are not counted again.
+    pinned_would_add: usize,
 }
 
 fn key(parts: &[&str]) -> String {
@@ -786,37 +845,59 @@ impl Session {
         }
         let words: BTreeSet<String> = split_words(user_text).into_iter().collect();
         self.words.extend(words.iter().cloned());
-        // Decided before the daemon restarted: the same answer, built to the
-        // same size, counted once.
+        // Decided before the daemon restarted: the same bytes, counted once.
+        // A pack whose text the ledger keeps is sent as it was; one of an
+        // older version is built again to the same size, and kept from then on.
         if let Some(&had) = self.ledger.contexts.get(lk) {
-            let again = match graph {
-                Some(graph) if had && !self.ledger.retired.contains(lk) => {
-                    let cap = self.ledger.pack_caps.get(lk).copied();
-                    self.rebuild_context(graph, id, user_text, cap, opts)
+            let live = had && !self.ledger.retired.contains(lk);
+            let again = match (self.ledger.pack_texts.get(lk).cloned(), graph) {
+                _ if !live => None,
+                (Some(stored), _) => {
+                    self.pack_seeds.insert(id.to_string(), stored.seeds.clone());
+                    self.relevant_symbols.extend(stored.seeds.iter().cloned());
+                    self.relevant_files.extend(stored.files.iter().cloned());
+                    Some(stored.text)
                 }
-                _ => None,
+                (None, Some(graph)) => {
+                    let cap = self.ledger.pack_caps.get(lk).copied();
+                    let seeds = self.ledger.pack_seeds.get(lk).map_or(PACK_SEEDS, |n| usize::from(*n));
+                    self.rebuild_context(graph, id, lk, user_text, cap, seeds, opts)
+                }
+                // Not decided again without a graph: a later request with
+                // the graph sends the pack again, as it was decided.
+                (None, None) => return None,
             };
             self.contexts.insert(id.to_string(), again.clone());
-            self.pinned_contexts += usize::from(again.is_some());
             return self.keep_or_retire(lk, again?, before, opts);
         }
         let decided = graph.and_then(|graph| self.decide_context(graph, id, user_text, &words, before, opts));
         let kept = match decided {
-            Some((text, _)) if opts.holdout => {
+            Some(d) if opts.holdout => {
                 self.saved.contexts_would_add += 1;
-                self.saved.context_tokens_would_add += count(&text);
+                self.saved.context_tokens_would_add += count(&d.text);
                 None
             }
-            Some((text, cap)) => {
-                let tokens = count(&text);
+            Some(d) => {
+                let tokens = count(&d.text);
                 self.saved.contexts_added += 1;
                 self.saved.context_tokens += tokens;
                 self.request.added_present += tokens as i64;
-                self.ledger.pack_caps.insert(lk.to_string(), cap);
+                self.ledger.pack_caps.insert(lk.to_string(), d.cap);
+                if d.max_seeds != PACK_SEEDS {
+                    self.ledger.pack_seeds.insert(lk.to_string(), d.max_seeds as u8);
+                }
+                self.ledger.pack_texts.insert(
+                    lk.to_string(),
+                    StoredPack {
+                        text: d.text.clone(),
+                        seeds: d.seeds,
+                        files: d.files,
+                    },
+                );
                 if let Some(prefix) = before.prefix {
                     self.ledger.anchors.insert(lk.to_string(), prefix);
                 }
-                Some(text)
+                Some(d.text)
             }
             None => None,
         };
@@ -847,6 +928,10 @@ impl Session {
             self.ledger.retired.insert(lk.to_string());
             self.saved.contexts_retired += 1;
             self.request.retired_added.push(lk.to_string());
+            // Never sent again: its text need not be kept.
+            if let Some(stored) = self.ledger.pack_texts.remove(lk) {
+                self.request.texts_retired.push((lk.to_string(), stored));
+            }
             return None;
         }
         // Inserted with the items before it as they are now.
@@ -867,7 +952,9 @@ impl Session {
     /// the room left, and none with less than [`MIN_PACK_ROOM`]. After the
     /// conversation's first pack, a pack is at most [`FOLLOW_UP_PACK_TOKENS`]
     /// and is added only when one of its starting points is in a file that no
-    /// tool call, tool output or pack before the message named.
+    /// tool call, tool output or pack before the message named. A pack that
+    /// does not fit is built again with fewer starting points
+    /// ([`FEWER_SEEDS`]) before it is given up.
     fn decide_context(
         &mut self,
         graph: &Graph,
@@ -876,8 +963,9 @@ impl Session {
         words: &BTreeSet<String>,
         before: &Before,
         opts: &Options,
-    ) -> Option<(String, usize)> {
-        let packs = self.saved.contexts_added + self.saved.contexts_would_add + self.pinned_contexts;
+    ) -> Option<Decided> {
+        let packs =
+            self.saved.contexts_added + self.saved.contexts_would_add + self.pinned_contexts + self.pinned_would_add;
         if !opts.inject_context || packs >= opts.max_contexts || user_text.len() > 8000 {
             return None;
         }
@@ -907,50 +995,113 @@ impl Session {
             self.saved.contexts_over_budget += 1;
             return None;
         }
-        let follow_up = self.ledger.contexts.values().any(|added| *added) || self.saved.contexts_would_add > 0;
+        let follow_up = self.ledger.contexts.values().any(|added| *added)
+            || self.saved.contexts_would_add > 0
+            || self.pinned_would_add > 0;
         let cap = if follow_up {
             room.min(FOLLOW_UP_PACK_TOKENS)
         } else {
             room
         };
-        let built = self.build_pack(graph, user_text, opts, Some(cap))?;
-        if follow_up && !built.seed_files.iter().any(|f| !f.is_empty() && !(before.mentions)(f)) {
+        let new_file = |built: &Built| built.seed_files.iter().any(|f| !f.is_empty() && !(before.mentions)(f));
+        let built = self.build_pack(graph, user_text, opts, Some(cap), PACK_SEEDS)?;
+        if follow_up && !new_file(&built) {
             self.saved.contexts_known += 1;
             return None;
         }
-        let Some(text) = built.text.clone() else {
-            self.saved.contexts_over_budget += 1;
+        // Starting points the full build found: a build with as many or more gives the same pack.
+        let found = built.seeds.len();
+        let mut kept = built.text.is_some().then_some((built, PACK_SEEDS));
+        // Too large with every starting point: fewer of them. The pack kept
+        // must still start in a file not named before.
+        let mut fitted_but_known = false;
+        for seeds in FEWER_SEEDS {
+            if kept.is_some() {
+                break;
+            }
+            if seeds >= found {
+                continue;
+            }
+            let Some(fewer) = self.build_pack(graph, user_text, opts, Some(cap), seeds) else {
+                break;
+            };
+            if fewer.text.is_none() {
+                continue;
+            }
+            if follow_up && !new_file(&fewer) {
+                fitted_but_known = true;
+                break;
+            }
+            kept = Some((fewer, seeds));
+        }
+        let Some((built, max_seeds)) = kept else {
+            if fitted_but_known {
+                self.saved.contexts_known += 1;
+            } else if follow_up && room > FOLLOW_UP_PACK_TOKENS {
+                // The follow-up size bound the cap, not the room.
+                self.saved.contexts_too_large += 1;
+            } else {
+                self.saved.contexts_over_budget += 1;
+            }
             return None;
         };
         self.remember_pack(id, &built);
-        Some((text, cap))
+        Some(Decided {
+            text: built.text.clone()?,
+            cap,
+            max_seeds,
+            seeds: built.seeds,
+            files: built.files,
+        })
     }
 
-    /// The pack of a message that got one before the daemon restarted, built
-    /// to the size it had then: the switch, the cap and the checks, which it
-    /// passed then, are not asked again.
+    /// The pack of a message that got one before the daemon restarted and
+    /// whose text the ledger does not keep (an older version), built to the
+    /// size and with the starting points it had then: the switch, the cap and
+    /// the checks, which it passed then, are not asked again. Its text is
+    /// kept from then on, so a later restart sends these bytes.
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_context(
         &mut self,
         graph: &Graph,
         id: &str,
+        lk: &str,
         user_text: &str,
         cap: Option<usize>,
+        seeds: usize,
         opts: &Options,
     ) -> Option<String> {
         if user_text.len() > 8000 {
             return None;
         }
-        let built = self.build_pack(graph, user_text, opts, cap)?;
+        let built = self.build_pack(graph, user_text, opts, cap, seeds)?;
         let text = built.text.clone()?;
         self.remember_pack(id, &built);
+        self.ledger.pack_texts.insert(
+            lk.to_string(),
+            StoredPack {
+                text: text.clone(),
+                seeds: built.seeds,
+                files: built.files,
+            },
+        );
         Some(text)
     }
 
-    /// Build the pack for `user_text` in at most `cap` tokens in all, its
-    /// frame and remembered facts included; `None` for no cap (packs of
-    /// older versions). Remembered facts are left out when they do not fit.
-    /// The same graph, facts and cap give the same bytes.
-    fn build_pack(&self, graph: &Graph, user_text: &str, opts: &Options, cap: Option<usize>) -> Option<Built> {
+    /// Build the pack for `user_text` from `max_seeds` starting points in at
+    /// most `cap` tokens in all, its frame and remembered facts included;
+    /// `None` for no cap (packs of older versions). Remembered facts are left
+    /// out when they do not fit. Its heading is [`PACK_HEADER`], or in a
+    /// conversation of an older version the message itself. The same graph,
+    /// facts, cap and starting points give the same bytes.
+    fn build_pack(
+        &self,
+        graph: &Graph,
+        user_text: &str,
+        opts: &Options,
+        cap: Option<usize>,
+        max_seeds: usize,
+    ) -> Option<Built> {
         let frame = count(&format!("{CONTEXT_OPEN}\n{CONTEXT_CLOSE}"));
         let mut budget = pack_budget(graph.store, user_text, opts);
         if let Some(cap) = cap {
@@ -961,6 +1112,8 @@ impl Session {
             user_text,
             &PackOptions {
                 budget,
+                max_seeds,
+                header: (self.ledger.pack_format >= 1).then(|| PACK_HEADER.to_string()),
                 ..PackOptions::default()
             },
         )
@@ -1128,9 +1281,12 @@ impl Session {
         for id in std::mem::take(&mut self.new_this_request) {
             if let Some(context) = self.contexts.get_mut(&id) {
                 *context = None;
-                self.ledger.contexts.insert(ledger_key(&id), false);
-                self.ledger.pack_caps.remove(&ledger_key(&id));
-                self.ledger.anchors.remove(&ledger_key(&id));
+                let lk = ledger_key(&id);
+                self.ledger.contexts.insert(lk.clone(), false);
+                self.ledger.pack_caps.remove(&lk);
+                self.ledger.pack_seeds.remove(&lk);
+                self.ledger.pack_texts.remove(&lk);
+                self.ledger.anchors.remove(&lk);
                 self.pack_seeds.remove(&id);
                 continue;
             }
@@ -1159,6 +1315,9 @@ impl Session {
         // The retry decides them again, the same way.
         for k in &log.retired_added {
             self.ledger.retired.remove(k);
+        }
+        for (k, stored) in &log.texts_retired {
+            self.ledger.pack_texts.insert(k.clone(), stored.clone());
         }
         for (k, anchor) in log.anchors_before.iter().rev() {
             match anchor {
@@ -1720,9 +1879,30 @@ impl Session {
 
     /// Start from the decisions a daemon made before it restarted: an item
     /// they cover is decided again with the rules it got then, and is not
-    /// counted again.
+    /// counted again. Every pack the conversation added, retired ones and
+    /// ones whose message left the history included, counts towards
+    /// [`Options::max_contexts`] as it did before the restart.
     pub fn restore(&mut self, ledger: Ledger) {
+        self.pinned_contexts = ledger.contexts.values().filter(|added| **added).count();
         self.ledger = ledger;
+    }
+
+    /// The packs a held-out conversation would have added before the daemon
+    /// restarted: they count towards [`Options::max_contexts`] and make its
+    /// next would-be pack a follow-up, as if the daemon had kept running. Not
+    /// counted in [`Saved`] again.
+    pub fn restore_would_add(&mut self, packs: usize) {
+        self.pinned_would_add = packs;
+    }
+
+    /// True when a pack decided before a restart is still inserted and the
+    /// ledger does not keep its text (a ledger of an older version): it can
+    /// be sent again only with the graph.
+    pub fn needs_graph_to_replay(&self) -> bool {
+        self.ledger
+            .contexts
+            .iter()
+            .any(|(k, added)| *added && !self.ledger.retired.contains(k) && !self.ledger.pack_texts.contains_key(k))
     }
 
     /// A copy of a message typed earlier in the same request gets no pack
