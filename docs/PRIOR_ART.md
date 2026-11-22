@@ -2,8 +2,11 @@
 
 Studied from shallow clones kept outside this repository (`../references/`): the four
 context and memory projects below on 2026-11-15, Headroom and RTK for the proxy, and
-Caveman and Token Optimizer (with RTK again) for v0.0.2 on 2026-11-16. No code was
-copied from any of them; the mechanisms below are reimplemented in Rust, in lge's own
+Caveman and Token Optimizer (with RTK again) for v0.0.2 on 2026-11-16. On 2026-11-22
+hindsight was read again for the memory techniques listed in the dated sections at the
+end, and one idea (inject nothing when the evidence is weak) is credited to memorilla
+(Apache-2.0), which is not among those clones and was taken as an outcome only. No code
+was copied from any of them; the mechanisms below are reimplemented in Rust, in lge's own
 code and words, on LadybugDB. None of the first four can be used as a dependency: they
 need a Python runtime, PostgreSQL or another storage engine, which the project rules
 exclude.
@@ -59,8 +62,12 @@ Its limits, which lge must not repeat:
 | Memory units of kinds world, experience, decision, convention, observation, with tags and links to the code entities they mention | hindsight | `Memory` nodes, `MENTIONS` edges to Symbol, File, Service |
 | Facts written by the agent itself; no extraction model in the loop | hindsight ("chunks" mode) | `retain` |
 | Supersede, never delete: `valid_at`, `invalid_at`, `expired_at`; a new fact with the same key closes the old one; reads skip expired facts | graphiti | `lge-memory::retain` |
-| Dedup ladder: normalized exact match, entropy gate, MinHash at Jaccard >= 0.9; a repeat raises the proof count | graphiti, hindsight | `lge-memory::dedup` |
-| Recall in parallel arms: keyword, entity overlap `tanh(0.5 x shared entities)`, recent, optional vector; fused by rank | hindsight | `lge-memory::recall` |
+| Dedup ladder: normalized exact match, entropy gate, character-3-gram Jaccard >= 0.9 (exact, no MinHash); a repeat raises the proof count | graphiti, hindsight | `lge-memory::dedup` |
+| Guard before the ladder: facts that differ in a number, an identifier (with its case) or a negation are different facts, whatever the similarity (2026-11-22) | hindsight (the principle; its check is a model call, lge's is a word list) | `lge-memory::dedup::guard_agrees` |
+| Recall in parallel arms: keyword, entity overlap, recent, optional vector; fused by rank | hindsight | `lge-memory::recall` |
+| Entity arm ordered by `shared / sqrt(links)`, so a fact about few things beats one about many (2026-11-22; before, by shared nodes alone, newest first) | hindsight (inverse square root of a node's degree) | `lge-memory::recall::damped` |
+| Recency re-ranks a fact another arm found and never admits one: injected packs withhold a fact only the recent arm returned (2026-11-22) | hindsight (recency is a multiplier), memorilla (outcome only: inject nothing on weak evidence) | `lge-memory::recall`, `RecallOptions::admit_recent_only`, `Recall::recency_only` |
+| A commit that changes more than 200 files is stored without links and tagged `mass-commit`; a fact with more than 200 links is never returned by the keyword, entity or vector arm (2026-11-22) | lge's own | `lge-memory::history`, `lge-memory::recall` (`MASS_FILES`, `MASS_LINKS`) |
 | Boosts: recency `clamp(1 - days/365, 0.1, 1)` and proof count, each a few percent | hindsight | `lge-memory::recall` |
 | Token packing in rank order: an oversized fact is skipped and packing continues; the top fact is always returned | hindsight | shared budget code |
 | Pages: markdown views over tagged facts with a watermark; rebuilt only when a newer in-scope fact exists | hindsight | `Page` nodes, exported to `.lge/pages/*.md` |
@@ -195,6 +202,47 @@ summarise a format lge does not recognise).
   non-text parts, and redaction is a privacy matter, not a token one.
 - Waste coaches, fleet audits, compaction advice, a second memory store: they count
   savings with fixed guesses, or duplicate `lge-memory`.
+
+## 2026-11-22: a guard on the dedup ladder
+
+- **Number, identifier and negation guard** (hindsight, MIT): its consolidation sends a
+  near-duplicate observation to a model that must keep it apart when a number, a
+  negation or an entity differs. lge adopts the principle without a model, in its own
+  words: before the ladder runs, the numbers, identifiers (names
+  with `_`, `/` or an inner dot, camelCase, acronyms, compared with their case) and
+  negations of the two raw texts are compared, and any difference means a different
+  fact. This keeps "timeout 15 seconds" and "timeout 45 seconds" from being folded
+  together, so a fact with the same key supersedes the old one instead. No code was
+  copied; the tokenising rules and the word list are lge's own. No tokens are added.
+
+## 2026-11-22: recency re-ranks, it never admits
+
+- **Recency is a boost, not a way in** (hindsight, MIT): there, recency multiplies the
+  score of a fact that retrieval already found; it is not a retrieval arm. lge kept its
+  recent arm (it still gives rank to a fact another arm returned) but a fact only that
+  arm returned is no longer admitted into an injected pack; explicit recall still lists
+  it. Reimplemented in lge's own code; nothing was copied.
+- **Inject nothing when the evidence is weak** (memorilla, Apache-2.0): taken as an
+  outcome only, not as an algorithm. lge does not add a score threshold: no constant is
+  chosen without data. `Recall::recency_only` counts what the floor withheld so a later
+  benchmark can say whether a keyword floor is needed.
+
+## 2026-11-22: mass commits and hub damping
+
+- **Degree damping on the entity arm** (hindsight, MIT): its entity resolution weights a
+  shared neighbour by the inverse square root of its degree, so hubs do not drown out
+  specific links. lge applies the idea in its own words, on a different object and on
+  what the store exposes cheaply, a fact's own link count: facts that mention the query's code are ordered by
+  `shared / sqrt(links)`, ties by newest then id. A fact about two things that both
+  matter beats one about forty that touches one of them. Damping a node that many facts
+  mention is a separate, later item. No code was copied.
+- **No links for a mass commit, and no admission** (lge's own, after measuring one
+  initial commit that wrote thousands of `MENTIONS` edges): a commit that changes more
+  than 200 files is stored without links and tagged `mass-commit`; the fact text still
+  names eight files and counts the rest. Rows stored earlier are handled at read time:
+  a fact with more than 200 links is never returned by the keyword, entity or vector
+  arm. Nothing is migrated, and no edge is invented or rewritten. No tokens are added;
+  the change removes a fact that matched every query about a file.
 
 ## Deliberately not adopted
 

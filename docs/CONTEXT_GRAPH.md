@@ -122,13 +122,21 @@ Modelled on hindsight and graphiti (see `docs/PRIOR_ART.md`), without an LLM in 
 
 - **retain(text, kind, key, tags, source)**: the agent writes a fact at the end of a
   task. Entity links are found by matching identifiers, qualified names and paths in the
-  text against the graph. Dedup ladder: normalized exact match, entropy gate, MinHash
-  (32 hashes, 3-character shingles) at Jaccard >= 0.9; a repeat raises `proof_count`.
+  text against the graph. Dedup ladder: normalized exact match, entropy gate, character-3-gram
+  Jaccard >= 0.9 (exact, no MinHash), vetoed when the numbers, identifiers, acronym case
+  or negations differ (the idea comes from hindsight's number/identifier guard,
+  reimplemented); a repeat raises `proof_count`.
   A fact with a key supersedes current facts with the same key (`invalid_at = new.valid_at`,
   `expired_at = now`); nothing is deleted.
 - **recall(query, budget)**: four arms, each a ranked id list: keyword (BM25), entity
-  overlap with the code symbols the query hits (`tanh(0.5 x shared)`), recent, and vector
-  when embeddings exist. Fused with `sum 1/(60 + rank)`; rank score `1 - 0.9 x rank/(n-1)`
+  overlap with the code symbols the query hits, recent, and vector when embeddings
+  exist. The entity arm drops mass facts (more than 200 links) and orders the rest by
+  `shared / sqrt(links)`, ties by newest `valid_at`, then id; the keyword and vector arms
+  drop mass facts too, and `Recall::mass_skipped` counts them. The recent arm, at half
+  weight, only re-ranks: a fact that no keyword, entity or vector arm returned is
+  withheld unless `admit_recent_only` is set (explicit recall sets it, injected packs do
+  not), and `Recall::recency_only` counts the withheld facts. Fused with
+  `sum weight/(60 + rank)`; rank score `1 - 0.9 x rank/(n-1)`
   multiplied by `(1 + 0.2 (recency - 0.5))` with `recency = clamp(1 - days/365, 0.1, 1)`
   and `(1 + 0.1 (proof - 0.5))` with `proof = clamp(0.5 + ln(proof_count)/10, 0, 1)`.
   Packed in rank order to the token budget: an oversized fact is skipped, packing

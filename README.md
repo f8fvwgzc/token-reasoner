@@ -594,9 +594,18 @@ files ─► scan ─► parse (tree-sitter) ─► resolve ─► LadybugDB ─
 
 The agent stores facts with `retain_memory` (a decision, a convention, what a task found).
 A repeated fact raises a counter instead of adding a copy; a newer fact with the same key
-closes the older one, which is kept, not deleted. `recall_memory` searches by keyword, by
-the code the facts mention, and by recency, merges the lists by rank, and packs the
-result into a token budget. Facts tagged as decisions, conventions or feature work are
+closes the older one, which is kept, not deleted. Two texts that read alike but differ in
+a number, an identifier (case included) or a negation are not repeats, so a changed value
+is a new fact; give facts that can change a key, since without one the old fact stays live
+next to the new one. `recall_memory` searches by keyword, by the code the facts mention
+(a fact about few things ranks above one about many), and by recency, merges the lists by
+rank, and packs the result into a token budget. Recency only ranks: the memory that lge
+adds to a request on its own holds only facts that the keyword or the code search found,
+so a message that matches nothing gets no memory section. `recall_memory` and
+`lge memory recall` are explicit questions and still list the newest facts when nothing
+matches. A commit that changes more than 200 files is stored without links to files and
+tagged `mass-commit`, and a fact linked to more than 200 nodes is never returned by a
+search. Facts tagged as decisions, conventions or feature work are
 also written as markdown pages under `~/.lge/graphs/<repo>/pages/`. Every git commit, merges (merged pull requests) included, is
 also stored as a fact linked to the files it changed, so asking about code brings its
 recent history along without `git log`. No model is called to store or recall memory.

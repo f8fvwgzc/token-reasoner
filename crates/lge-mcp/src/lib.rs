@@ -520,6 +520,8 @@ impl Server {
             &RecallOptions {
                 budget,
                 now: unix_now(),
+                // An explicit question gets the newest facts when nothing matches.
+                admit_recent_only: true,
                 ..RecallOptions::default()
             },
             None,

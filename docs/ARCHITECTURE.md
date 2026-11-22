@@ -250,6 +250,24 @@ filtered sizes so the saving can be measured. Never drops a failing test.
 - `architecture(store, service) -> Architecture`: services, their dependencies, APIs,
   queues and tables.
 
+## lge-memory
+
+`recall(store, query, opts, embedder) -> Recall` fuses the keyword, entity, recent and
+optional vector arms by rank. The recent arm only re-ranks: a fact that no
+query-dependent arm returned is withheld unless `RecallOptions::admit_recent_only` is set
+(explicit recall by a person or the agent sets it; injected packs do not), and
+`Recall::recency_only` counts those facts in both modes. A fact linked to more than
+`MASS_LINKS` (200) nodes is never returned by the keyword, entity or vector arm
+(`Recall::mass_skipped` counts them), and the entity arm orders facts by
+`shared / sqrt(links)`. `ingest_commits` stores a commit that changes more than
+`MASS_FILES` (200) files with no links and the tag `mass-commit`.
+
+`retain(store, input, now) -> Retained` folds a repeat into the stored fact only when
+`dedup::same_fact` holds: after a guard that compares numbers, identifiers (with their
+case) and negations, the texts normalize equally or reach a character-3-gram Jaccard of
+0.9. The id of a new fact is built from its exact text. Nothing in `lge-memory` calls a
+model.
+
 ## lge-router
 
 `route(store, task, cfg) -> Route`. v1 uses `lge_retrieve::impact` from the BM25 seeds:

@@ -25,6 +25,12 @@ pub struct Commit {
 /// Files named in one fact at most; the rest are counted.
 const MAX_FILES_NAMED: usize = 8;
 
+/// A commit that changes more than this many files under the root is a mass
+/// commit (an initial import, a rename of a tree, a formatter run). It says
+/// nothing about any one file, so it is stored without links and tagged
+/// `mass-commit`; recall also never admits a fact with more links than this.
+pub const MASS_FILES: usize = 200;
+
 /// The key a commit's fact is stored under.
 pub fn commit_key(sha: &str) -> String {
     format!("commit:{}", &sha[..sha.len().min(12)])
@@ -67,12 +73,17 @@ pub fn ingest_commits(store: &dyn GraphStore, commits: &[Commit], now: i64) -> R
         if c.merge {
             tags.push("merge".to_string());
         }
-        let links: Vec<String> = c
-            .files
-            .iter()
-            .filter(|f| indexed.contains(*f))
-            .map(|f| file_id(f))
-            .collect();
+        let mass = c.files.len() > MASS_FILES;
+        let links: Vec<String> = if mass {
+            tags.push("mass-commit".to_string());
+            Vec::new()
+        } else {
+            c.files
+                .iter()
+                .filter(|f| indexed.contains(*f))
+                .map(|f| file_id(f))
+                .collect()
+        };
         store.put_memory(&MemoryRec {
             id: lge_core::stable_id(&["memory", &key]),
             kind: memory_kind::EXPERIENCE.to_string(),

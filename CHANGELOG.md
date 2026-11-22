@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.0.7 (2026-11-22)
+
+Three changes to long-term memory (`lge-memory`), all deterministic: no model call, no
+tokens added, and none changes what is already stored or what a session ledger holds.
+They reimplement, in lge's own code on LadybugDB, ideas read from memorilla (Apache-2.0)
+and Hindsight (MIT); see `docs/PRIOR_ART.md`. Nothing here has been run against real Codex
+sessions; the figures below come from synthetic fixtures and are not a saving.
+
+### Memory
+
+- **Relevance floor on injected memory.** The recent arm of `recall` only re-ranks now: a
+  fact that no query-dependent arm (keyword, entity, vector) returned is withheld, so a
+  message with no hit packs no memory section instead of the newest facts (a study of
+  real use saw 8 facts and 748 tokens for such a message). Explicit recall, the
+  `recall_memory` MCP tool and `lge memory recall`, keeps the old behaviour
+  (`RecallOptions::admit_recent_only`, off by default, set by those two). The packs of
+  `lge-proxy` and `lge-session` take the default. `Recall` reports `recency_only`, the
+  number of facts withheld, in both modes, so old and new can be compared from one call.
+  No score or weight changed; only new messages are affected, packs already in the
+  session ledger replay as they were.
+  The floor gates recency only: a message that shares an ordinary word with the stored
+  facts (such as "change" or "tests" against commit facts) still admits them through the
+  keyword arm, and `recency_only` does not count those. Keyword precision is not changed.
+  Measured on a synthetic corpus of 12 commit facts and one convention: a query matching
+  nothing recalls 0 facts and 0 tokens by default and 8 facts and 160 tokens with
+  `admit_recent_only` (the old result); a query matching one fact returns that fact and
+  counts 12 withheld; a fact found by both the keyword and recent arms ranks above one
+  found by keyword alone; two identical calls give identical text. The tests assert the
+  counts, not the token figures. Not verified: the 748-token figure on real data, and how
+  often real messages match nothing.
+- **Mass commits.** A commit that changes more than 200 files (an initial import, a tree
+  rename) is stored without file links and tagged `mass-commit` (after `commit` and, for a
+  merge, `merge`); before, the study saw 7,903 `MENTIONS` edges from one commit, which
+  made it match nearly every query about code. In `recall`, a fact linked to more than
+  200 nodes is never returned by the keyword, entity or vector arm, which also covers rows
+  stored earlier with no migration. `Recall` reports `mass_skipped`, each such fact
+  counted once. The entity arm now fetches wider, drops mass facts and orders the rest by
+  shared nodes over the square root of the fact's own link count (hindsight's hub damping
+  idea; ties by newest `valid_at`, then id); before, it ordered by shared nodes alone, then
+  newest. The docs that described a `tanh(0.5 x shared)` score were stale and are
+  corrected: no such score was ever in the code. The keyword
+  arm fetches wider than its cut so mass facts do not take the slots of real hits. The
+  recent arm is unchanged, so explicit recall can still list a mass commit as the newest
+  fact. The 200-file count is every file the commit changed, indexed or not; exactly 200
+  files keeps its links.
+  Measured on a synthetic repository of 210 files in one commit: it is stored with 0
+  links (210 `MENTIONS` edges before). For a query naming one file that a real fact is
+  linked to, default recall returned that one fact (25 tokens) and explicit recall
+  returned it and the mass commit (126 tokens); a legacy row linked to 210 files, stored
+  directly, stayed out of default recall with `mass_skipped` 1. Entity ordering is
+  byte-stable over repeated calls. Not verified: the time `get` takes on a very large
+  stored mass row (it re-checks every link; a store change is left for later), and damping
+  of a file that many facts mention.
+- **Dedup guard.** `retain` no longer folds a fact into an older one when the two differ
+  in a number, an identifier (with its case, for example `TLS` against `tls`) or a
+  negation, even if the texts are 90% alike. A changed value, such as a timeout
+  from 15 to 45 seconds, is now a new fact, and with the same key it supersedes the old
+  one, so the fact in the memory slot is the current one. Without a key nothing links
+  the two, so the old fact stays live next to the new one; pass a key for facts that can
+  change. A fact's id is now built from its exact text, so two facts the guard keeps
+  apart never share an id. Facts already stored are not touched.
+  Measured on three pairs whose character-3-gram Jaccard is above the 0.9 threshold
+  (15 against 45 seconds, 0.94; 900 against 600, 0.94; "memo 1" against "memo 2",
+  0.98), which the old ladder merged: the unit tests assert both the similarity and that
+  `same_fact` is false. The similarity figures come from a separate recomputation of the
+  formula, not from the Rust function. Three retains with one key and values 1, 2, 3 give
+  stored, superseded, superseded, leave one live fact and no `proof_count` of 4. Repeats
+  that differ only in case, spacing or a final full stop still merge. Not verified: the
+  negation word list (eight English words and `n't`) and the identifier rules were chosen
+  by reading, not tuned on real facts; a false veto stores a near copy instead of
+  counting a repeat.
 ## v0.0.6 (2026-11-20)
 
 Two days of real use showed numbers that mixed scopes, a few measurements that were wrong

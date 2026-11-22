@@ -11,9 +11,9 @@ mod pages;
 mod recall;
 mod retain;
 
-pub use history::{commit_key, ingest_commits, ingest_repo_history, Commit, HISTORY_DEPTH};
+pub use history::{commit_key, ingest_commits, ingest_repo_history, Commit, HISTORY_DEPTH, MASS_FILES};
 pub use pages::{
     export_pages, refresh_pages, search_pages, snippet, to_markdown, PageHit, MEMORY_PAGE_KIND, SEEDED, SNIPPET_CHARS,
 };
-pub use recall::{date, fact_line, recall, Embedder, Recall, RecallOptions, Recalled};
+pub use recall::{date, fact_line, recall, Embedder, Recall, RecallOptions, Recalled, MASS_LINKS};
 pub use retain::{entity_links, retain, Outcome, RetainInput, Retained, MAX_FACT_CHARS};

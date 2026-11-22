@@ -3,7 +3,7 @@
 //! known: a repeat raises a counter, and a newer fact with the same key closes
 //! the older one instead of deleting it.
 
-use crate::dedup::{normalize, same_fact};
+use crate::dedup::same_fact;
 use anyhow::{bail, Result};
 use lge_core::{file_id, kind, memory_kind, service_id, stable_id, MemoryRec, NodeLabel};
 use lge_retrieve::name_candidates;
@@ -159,7 +159,10 @@ pub fn retain(store: &dyn GraphStore, input: &RetainInput, now: i64) -> Result<R
         replaced.push(old.id);
     }
 
-    let id = stable_id(&["memory", fact_kind, &normalize(&text), &now.to_string()]);
+    // The id is built from the exact text, not the normalized one: the dedup
+    // guard keeps facts apart that only differ in case (`TLS` and `tls`), and the
+    // same id would make the second one overwrite the first.
+    let id = stable_id(&["memory", fact_kind, &text, &now.to_string()]);
     let rec = MemoryRec {
         id: id.clone(),
         kind: fact_kind.to_string(),

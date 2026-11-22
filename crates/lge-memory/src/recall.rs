@@ -12,7 +12,7 @@ use lge_retrieve::budget::{count, Budget};
 use lge_retrieve::{find_seeds, SeedOptions};
 use lge_store::GraphStore;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Turns text into vectors. Optional: without one, recall uses the other arms.
 pub trait Embedder: Send + Sync {
@@ -33,6 +33,12 @@ pub struct RecallOptions {
     pub tags: Vec<String>,
     /// Unix seconds, for the recency boost.
     pub now: i64,
+    /// Admit facts that only the recency arm returned. `false` (the default, for
+    /// injected packs): recency re-ranks facts another arm found, it never admits
+    /// one, so a query with no keyword, entity or vector hit recalls nothing.
+    /// `true` (explicit recall, by a person or the agent): the old behaviour, the
+    /// newest facts fill the answer when nothing matches.
+    pub admit_recent_only: bool,
 }
 
 impl Default for RecallOptions {
@@ -43,6 +49,7 @@ impl Default for RecallOptions {
             kinds: Vec::new(),
             tags: Vec::new(),
             now: 0,
+            admit_recent_only: false,
         }
     }
 }
@@ -62,7 +69,17 @@ pub struct Recall {
     pub tokens: usize,
     /// Facts that matched but did not fit.
     pub omitted: usize,
+    /// Facts only the recency arm returned; withheld unless `admit_recent_only`.
+    /// Filled in both modes, so the two behaviours can be compared from one call.
+    pub recency_only: usize,
+    /// Distinct mass facts (more than `MASS_LINKS` links) kept out of the keyword,
+    /// entity and vector arms in this call. Filled in both modes.
+    pub mass_skipped: usize,
 }
+
+/// A fact linked to more nodes than this is a mass fact (a huge commit). It is
+/// about everything and so about nothing: the query arms never return it.
+pub const MASS_LINKS: usize = crate::history::MASS_FILES;
 
 /// Cosine similarity below this is not a match (hindsight's semantic floor).
 const MIN_SIMILARITY: f64 = 0.3;
@@ -108,6 +125,45 @@ pub fn date(unix: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+fn is_mass(m: &MemoryRec) -> bool {
+    m.links.len() > MASS_LINKS
+}
+
+/// `facts` without the mass ones, which are remembered in `mass`.
+fn without_mass(facts: Vec<MemoryRec>, mass: &mut HashSet<String>) -> Vec<MemoryRec> {
+    facts
+        .into_iter()
+        .filter(|m| {
+            let big = is_mass(m);
+            if big {
+                mass.insert(m.id.clone());
+            }
+            !big
+        })
+        .collect()
+}
+
+/// The entity arm's list: mass facts dropped, the rest ordered by the nodes
+/// they share with the query over the square root of their own link count (a
+/// fact about two things that both matter beats one about forty that touches
+/// one of them), ties by newest `valid_at`, then id; cut to `wide`.
+fn damped(found: Vec<(MemoryRec, i64)>, wide: usize, mass: &mut HashSet<String>) -> Vec<MemoryRec> {
+    let mut scored: Vec<(f64, MemoryRec)> = found
+        .into_iter()
+        .filter(|(m, _)| {
+            let big = is_mass(m);
+            if big {
+                mass.insert(m.id.clone());
+            }
+            !big
+        })
+        .map(|(m, shared)| (shared as f64 / (m.links.len().max(1) as f64).sqrt(), m))
+        .collect();
+    scored.sort_by(|(a, x), (b, y)| b.total_cmp(a).then(y.valid_at.cmp(&x.valid_at)).then(x.id.cmp(&y.id)));
+    scored.truncate(wide);
+    scored.into_iter().map(|(_, m)| m).collect()
+}
+
 /// Facts relevant to `query`, best first, packed to the budget.
 pub fn recall(
     store: &dyn GraphStore,
@@ -118,24 +174,32 @@ pub fn recall(
     let wide = opts.limit.max(1) * 2;
     let mut by_id: HashMap<String, MemoryRec> = HashMap::new();
     let mut lists: Vec<(f64, Vec<String>)> = Vec::new();
-    let mut arm = |weight: f64, facts: Vec<MemoryRec>, by_id: &mut HashMap<String, MemoryRec>| {
+    // Ids returned by the arms that depend on the query (keyword, entity, vector).
+    // The recent arm is not one of them: it ranks, it does not admit.
+    let mut eligible: HashSet<String> = HashSet::new();
+    // Mass facts the query arms dropped, counted once each.
+    let mut mass_ids: HashSet<String> = HashSet::new();
+    let mut arm = |weight: f64, relevant: bool, facts: Vec<MemoryRec>, by_id: &mut HashMap<String, MemoryRec>| {
         let ids: Vec<String> = facts.iter().map(|m| m.id.clone()).collect();
+        if relevant {
+            eligible.extend(ids.iter().cloned());
+        }
         for m in facts {
             by_id.entry(m.id.clone()).or_insert(m);
         }
         lists.push((weight, ids));
     };
 
-    // Keyword arm.
-    arm(
-        1.0,
-        store
-            .search_memories(query, wide, false)?
-            .into_iter()
-            .map(|(m, _)| m)
-            .collect(),
-        &mut by_id,
-    );
+    // Keyword arm. A mass fact matches through the huge `signals` text; drop it.
+    // Fetch wider than `wide` so mass facts do not take the slots of real hits.
+    let keyword: Vec<MemoryRec> = store
+        .search_memories(query, (wide * 4).max(64), false)?
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    let mut keyword = without_mass(keyword, &mut mass_ids);
+    keyword.truncate(wide);
+    arm(1.0, true, keyword, &mut by_id);
 
     // Entity arm: facts that mention the code the query is about.
     let seeds = find_seeds(
@@ -151,20 +215,15 @@ pub fn recall(
     node_ids.sort();
     node_ids.dedup();
     if !node_ids.is_empty() {
-        arm(
-            1.0,
-            store
-                .memories_mentioning(&node_ids, wide)?
-                .into_iter()
-                .map(|(m, _)| m)
-                .collect(),
-            &mut by_id,
-        );
+        let fetch = (wide * 4).max(64);
+        let mentioning = store.memories_mentioning(&node_ids, fetch)?;
+        arm(1.0, true, damped(mentioning, wide, &mut mass_ids), &mut by_id);
     }
 
     // Recent arm, at half weight: being new is not being relevant.
     arm(
         0.5,
+        false,
         store.recent_memories(None, &opts.tags, opts.limit.max(1))?,
         &mut by_id,
     );
@@ -178,7 +237,7 @@ pub fn recall(
             let order: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
             let mut facts: Vec<MemoryRec> = facts.into_iter().filter(|m| m.expired_at == 0).collect();
             facts.sort_by_key(|m| order.get(m.id.as_str()).copied().unwrap_or(usize::MAX));
-            arm(1.0, facts, &mut by_id);
+            arm(1.0, true, without_mass(facts, &mut mass_ids), &mut by_id);
         }
     }
 
@@ -191,6 +250,22 @@ pub fn recall(
         .filter_map(|(id, _)| by_id.remove(&id))
         .filter(keep)
         .collect();
+
+    // The relevance floor: a fact no query-dependent arm returned is withheld.
+    let recency_only = fused.iter().filter(|m| !eligible.contains(&m.id)).count();
+    let fused: Vec<MemoryRec> = if opts.admit_recent_only {
+        fused
+    } else {
+        fused.into_iter().filter(|m| eligible.contains(&m.id)).collect()
+    };
+    let mass_skipped = mass_ids.len();
+    if fused.is_empty() {
+        return Ok(Recall {
+            recency_only,
+            mass_skipped,
+            ..Recall::default()
+        });
+    }
 
     // Rank-seeded score with small boosts, then the final order.
     let n = fused.len();
@@ -212,8 +287,12 @@ pub fn recall(
     scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.memory.id.cmp(&b.memory.id)));
 
     // Pack in rank order: an oversized fact is skipped and packing continues;
-    // the best fact is always returned.
-    let mut out = Recall::default();
+    // the best admitted fact is always returned.
+    let mut out = Recall {
+        recency_only,
+        mass_skipped,
+        ..Recall::default()
+    };
     let mut budget = Budget::new(opts.budget);
     for (i, item) in scored.into_iter().enumerate() {
         let line = fact_line(&item.memory);
@@ -235,6 +314,60 @@ pub fn recall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linked(id: &str, links: usize, valid_at: i64) -> MemoryRec {
+        MemoryRec {
+            id: id.into(),
+            valid_at,
+            links: (0..links).map(|i| format!("n{i}")).collect(),
+            ..MemoryRec::default()
+        }
+    }
+
+    fn order(found: Vec<(MemoryRec, i64)>, wide: usize) -> Vec<String> {
+        damped(found, wide, &mut HashSet::new())
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    #[test]
+    fn damping_ranks_by_shared_over_root_of_links() {
+        // 2 shared of 2 links (1.41) beats 1 shared of 40 (0.16), whatever the age.
+        let found = vec![(linked("b", 40, 900), 1), (linked("a", 2, 100), 2)];
+        assert_eq!(order(found, 10), ["a", "b"]);
+        // Equal shared counts: the fact with fewer links wins.
+        let found = vec![(linked("many", 9, 900), 2), (linked("few", 4, 100), 2)];
+        assert_eq!(order(found, 10), ["few", "many"]);
+        // Equal scores: newest valid_at, then id, whatever the input order.
+        let tied = || {
+            vec![
+                (linked("c", 4, 100), 2),
+                (linked("b", 4, 200), 2),
+                (linked("a", 4, 200), 2),
+            ]
+        };
+        let mut reversed = tied();
+        reversed.reverse();
+        assert_eq!(order(tied(), 10), ["a", "b", "c"]);
+        assert_eq!(order(reversed, 10), ["a", "b", "c"]);
+        assert_eq!(order(tied(), 2), ["a", "b"], "cut to wide");
+        // A fact with no live links does not divide by zero.
+        assert_eq!(order(vec![(linked("z", 0, 1), 1)], 5), ["z"]);
+    }
+
+    #[test]
+    fn mass_facts_are_dropped_and_counted_once() {
+        let mut mass = HashSet::new();
+        let big = linked("big", MASS_LINKS + 1, 1);
+        let edge = linked("edge", MASS_LINKS, 1);
+        let kept = damped(vec![(big.clone(), 3), (edge.clone(), 1)], 10, &mut mass);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "edge", "exactly MASS_LINKS links is not mass");
+        let kept = without_mass(vec![big, edge], &mut mass);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(mass.len(), 1, "the same fact in two arms counts once");
+    }
 
     #[test]
     fn boosts_and_dates() {

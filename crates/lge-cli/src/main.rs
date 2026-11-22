@@ -927,6 +927,7 @@ fn main() -> Result<()> {
                 let opts = lge_memory::RecallOptions {
                     budget,
                     now: unix_now(),
+                    admit_recent_only: true,
                     ..lge_memory::RecallOptions::default()
                 };
                 let found = lge_memory::recall(&store, &query, &opts, None)?;
