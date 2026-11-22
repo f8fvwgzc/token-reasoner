@@ -198,6 +198,20 @@ enum Cmd {
     /// base commit, one after another, then tokens, success and a verdict.
     /// Spends real tokens.
     Ab(AbArgs),
+    /// List the graphs the daemon keeps on disk (path, size, folder) and, with --delete, delete one.
+    /// A graph also holds the facts learned in its folder; a graph of a folder the daemon lists is
+    /// never deleted. Nothing is deleted without --yes.
+    Graphs {
+        /// Where the daemon keeps its data. Default: ~/.lge
+        #[arg(long, env = "LGE_HOME")]
+        data_dir: Option<PathBuf>,
+        /// The graph folder name (as listed) to delete.
+        #[arg(long, value_name = "NAME")]
+        delete: Option<String>,
+        /// Confirm the deletion, which cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args)]
@@ -283,6 +297,28 @@ enum UsageCmd {
         #[arg(long)]
         retain: bool,
     },
+    /// What if Codex compacted at another limit? Replays the long sessions of ~/.codex (or
+    /// CODEX_HOME) at other values of model_auto_compact_token_limit. An estimate, never a
+    /// measured saving; reads only, and never changes your configuration.
+    CompactWhatif {
+        /// Sessions of the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+        /// Candidate limits, comma separated.
+        #[arg(long, value_delimiter = ',', default_values_t = [100_000i64, 150_000, 200_000])]
+        limits: Vec<i64>,
+        /// Only the session whose id starts with this.
+        #[arg(long)]
+        session: Option<String>,
+        /// Tokens Codex has to read again after a compaction, on top of the history it keeps.
+        #[arg(long, default_value_t = 0)]
+        rework_tokens: i64,
+        #[arg(long)]
+        json: bool,
+        /// Say what each rollout held (compacted lines, events, usage records).
+        #[arg(long)]
+        explain: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,6 +359,74 @@ fn discover_repo(start: &Path) -> PathBuf {
             None => return start.to_path_buf(),
         }
     }
+}
+
+/// The folders the daemon lists, from its `daemon.json`.
+fn listed_graph_dirs(data: &Path) -> std::collections::HashSet<String> {
+    let text = std::fs::read_to_string(data.join("daemon.json")).unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    value
+        .get("repos")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str())
+        .map(|r| lge_proxy::graphs::dir_name(Path::new(r)))
+        .collect()
+}
+
+/// `lge graphs`: list, or delete one after confirmation.
+fn graphs(data: &Path, delete: Option<&str>, yes: bool) -> Result<()> {
+    let listed = listed_graph_dirs(data);
+    let all = lge_proxy::graphs::list(data);
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
+    if let Some(name) = delete {
+        let Some(g) = all.iter().find(|g| g.name == name) else {
+            bail!("no graph folder named `{name}` under {}", data.join("graphs").display());
+        };
+        if !yes {
+            println!(
+                "Would delete {} ({}, built for {}). It also holds the facts learned there, and this cannot be undone. Run again with --yes to delete it.",
+                data.join("graphs").join(name).display(),
+                mb(g.bytes),
+                g.root.as_ref().map_or("an unknown folder".to_string(), |r| r.display().to_string())
+            );
+            return Ok(());
+        }
+        let bytes = lge_proxy::graphs::delete(data, name, &listed)?;
+        println!("Deleted {name} ({}).", mb(bytes));
+        return Ok(());
+    }
+    if all.is_empty() {
+        println!("No graph under {}.", data.join("graphs").display());
+        return Ok(());
+    }
+    let total: u64 = all.iter().map(|g| g.bytes).sum();
+    println!(
+        "{} graphs, {} under {}:",
+        all.len(),
+        mb(total),
+        data.join("graphs").display()
+    );
+    for g in &all {
+        let state = match (&g.root, listed.contains(&g.name)) {
+            (_, true) => "listed".to_string(),
+            (Some(root), false) if !root.is_dir() => "not listed, folder no longer exists".to_string(),
+            _ => "not listed".to_string(),
+        };
+        println!(
+            "  {:<44} {:>10}  {}  [{state}]",
+            g.name,
+            mb(g.bytes),
+            g.root
+                .as_ref()
+                .map_or("(folder unknown: built before lge recorded it)".to_string(), |r| r
+                    .display()
+                    .to_string())
+        );
+    }
+    println!("Delete one with: lge graphs --delete <name> --yes (a listed folder's graph is never deleted).");
+    Ok(())
 }
 
 fn open(db: &Path) -> Result<Store> {
@@ -440,12 +544,48 @@ fn main() -> Result<()> {
         };
         return init::run(&places, &opts, &mut std::io::stdout().lock());
     }
+    if let Cmd::Graphs { data_dir, delete, yes } = &cli.cmd {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.clone());
+        let data = data_dir.clone().unwrap_or_else(|| home.join(".lge"));
+        return graphs(&data, delete.as_deref(), *yes);
+    }
     // Discover reads Codex's session files; only --retain opens the graph.
     if let Cmd::Usage {
         cmd: UsageCmd::Discover { days, json, retain },
     } = &cli.cmd
     {
         return usage_discover(&repo, &db, *days, *json, *retain);
+    }
+    if let Cmd::Usage {
+        cmd:
+            UsageCmd::CompactWhatif {
+                days,
+                limits,
+                session,
+                rework_tokens,
+                json,
+                explain,
+            },
+    } = &cli.cmd
+    {
+        if *days <= 0 {
+            bail!("--days must be at least 1");
+        }
+        let home = lge_usage::codex_home();
+        let opts = lge_usage::compact::Options {
+            limits: limits.clone(),
+            rework_tokens: *rework_tokens,
+            config: lge_usage::compact::read_config(&home),
+        };
+        let w = lge_usage::compact::whatif(&home, *days, session.as_deref(), &opts);
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&w)?);
+        } else {
+            print!("{}", lge_usage::compact::render(&w, *explain));
+        }
+        return Ok(());
     }
     // The A/B runner works in copies through the daemon; it never opens the repository's graph.
     if let Cmd::Ab(args) = &cli.cmd {
@@ -498,7 +638,7 @@ fn main() -> Result<()> {
 
     let store = open(&db)?;
     match cli.cmd {
-        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Ab(_) => unreachable!("handled above"),
+        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Ab(_) | Cmd::Graphs { .. } => unreachable!("handled above"),
         Cmd::Index {
             root,
             service_depth,
@@ -747,7 +887,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Usage {
-            cmd: UsageCmd::Discover { .. },
+            cmd: UsageCmd::Discover { .. } | UsageCmd::CompactWhatif { .. },
         } => unreachable!("handled above"),
         Cmd::Usage {
             cmd: UsageCmd::Report { days, json },
@@ -1142,5 +1282,32 @@ mod tests {
             } => assert_eq!((days, json, retain), (30, false, false)),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn graphs_are_deleted_only_with_yes_and_never_when_the_daemon_lists_the_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let listed_root = Path::new("/repo/shop");
+        for (name, root) in [
+            (lge_proxy::graphs::dir_name(listed_root), Some(listed_root)),
+            ("api-0000abcd".to_string(), None),
+        ] {
+            let dir = data.path().join("graphs").join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("graph.lbug"), b"x").unwrap();
+            if let Some(root) = root {
+                lge_proxy::graphs::write_root(&dir, root);
+            }
+        }
+        std::fs::write(data.path().join("daemon.json"), r#"{"repos":["/repo/shop"]}"#).unwrap();
+        let orphan = data.path().join("graphs/api-0000abcd");
+        graphs(data.path(), Some("api-0000abcd"), false).unwrap();
+        assert!(orphan.exists(), "without --yes nothing is deleted");
+        assert!(graphs(data.path(), Some(&lge_proxy::graphs::dir_name(listed_root)), true).is_err());
+        assert!(graphs(data.path(), Some("../graphs"), true).is_err());
+        graphs(data.path(), Some("api-0000abcd"), true).unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(lge_proxy::graphs::list(data.path()).len(), 1);
+        graphs(data.path(), None, false).unwrap();
     }
 }

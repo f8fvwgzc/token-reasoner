@@ -1165,6 +1165,52 @@ fn a_cold_restart_is_counted_after_an_idle_gap() {
 }
 
 #[test]
+fn a_tool_called_from_inside_an_exec_script_is_not_listed_as_never_called() {
+    let r = start();
+    let mut body = request_body(Path::new("/somewhere/else"), "conv-nested", "reset the browser");
+    body["tools"] = json!([
+        { "type": "function", "name": "view_image", "description": "Shows an image.", "parameters": { "type": "object" } },
+        { "type": "namespace", "name": "mcp__cua_repl__", "description": "Computer use.", "tools": [
+            { "type": "function", "name": "js_reset", "description": "Resets.", "parameters": { "type": "object" } },
+            { "type": "function", "name": "js", "description": "Runs.", "parameters": { "type": "object" } }
+        ] },
+        { "type": "namespace", "name": "clock", "description": "Time.", "tools": [
+            { "type": "function", "name": "curr_time", "description": "The time.", "parameters": { "type": "object" } }
+        ] }
+    ]);
+    let ghosts = |r: &Running| -> Vec<String> {
+        r.json("/lge/api/status")["ghost_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    r.send(&body);
+    let before = ghosts(&r);
+    assert!(
+        ["mcp__cua_repl__js_reset", "clockcurr_time", "view_image"]
+            .iter()
+            .all(|n| before.iter().any(|g| g == n)),
+        "{before:?}"
+    );
+    let items = body["input"].as_array_mut().unwrap();
+    items.push(json!({ "type": "custom_tool_call", "call_id": "s1", "name": "exec",
+        "input": "await tools.mcp__cua_repl__js_reset({});\nconst t = await tools.clock__curr_time();\ntext(String(t));" }));
+    items.push(json!({ "type": "custom_tool_call_output", "call_id": "s1", "output": "ok" }));
+    r.send(&body);
+    let after = ghosts(&r);
+    assert!(
+        !after
+            .iter()
+            .any(|g| g == "mcp__cua_repl__js_reset" || g == "clockcurr_time"),
+        "{after:?}"
+    );
+    assert!(after.iter().any(|g| g == "mcp__cua_repl__js"), "{after:?}");
+    assert!(after.iter().any(|g| g == "view_image"), "{after:?}");
+}
+
+#[test]
 fn the_status_reports_rules_holdout_prefix_ghost_tools_monitor_and_annuity() {
     let r = start();
     let mut body = request_body(Path::new("/somewhere/else"), "conv-t", "run the tests");
@@ -2022,6 +2068,53 @@ fn past_background_threads_are_left_out_of_before_and_after() {
 }
 
 #[test]
+fn compressed_rollouts_are_imported_and_a_corrupt_one_is_counted_as_unreadable() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("codex");
+    let day = home.join("sessions/2026/07/20");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = |id: &str| {
+        format!(
+            "{}\n{}\n",
+            json!({ "type": "session_meta", "payload": { "id": id, "source": "cli" } }),
+            json!({ "type": "event_msg", "payload": { "type": "token_count", "info": { "total_token_usage": { "input_tokens": 9000, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 1 } } } })
+        )
+    };
+    let packed =
+        ruzstd::encoding::compress_to_vec(rollout("old-1").as_bytes(), ruzstd::encoding::CompressionLevel::Fastest);
+    std::fs::write(day.join("rollout-2026-07-20T00-00-00-old-1.jsonl.zst"), packed).unwrap();
+    std::fs::write(
+        day.join("rollout-2026-07-20T00-00-01-old-2.jsonl.zst"),
+        b"not zstd at all",
+    )
+    .unwrap();
+    std::fs::write(day.join("rollout-2026-07-20T00-00-02-new-1.jsonl"), rollout("new-1")).unwrap();
+    let mut cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    cfg.codex_home = Some(home);
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let imported: Value = serde_json::from_slice(
+        &plain_agent()
+            .post(format!("http://{}/lge/api/import-history", s.addr))
+            .header("content-type", "application/json")
+            .send("{}")
+            .unwrap()
+            .into_body()
+            .read_to_vec()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (imported["imported"].as_u64(), imported["unreadable"].as_u64()),
+        (Some(2), Some(1)),
+        "{imported}"
+    );
+}
+
+#[test]
 fn held_out_sessions_are_not_counted_in_the_pack_totals() {
     let r = start();
     r.add_repo();
@@ -2135,6 +2228,104 @@ fn the_long_session_note_counts_requests_as_the_table_does() {
     assert_eq!(named, [("long-thread", 50)], "{}", status["long_sessions"]);
     let note = status["long_sessions"]["note"].as_str().unwrap();
     assert!(!note.contains('`'), "the page shows the note as text: {note}");
+}
+
+#[test]
+fn the_long_session_note_names_an_old_long_session_below_sixty_newer_background_sessions() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let now = lge_retrieve::unix_now();
+        store
+            .put_usage(&UsageRecord {
+                id: lge_core::stable_id(&["session", "old-long"]),
+                task_id: "old-long".to_string(),
+                session_id: "old-long".to_string(),
+                task: "a long task".to_string(),
+                mode: "proxy".to_string(),
+                started_at: now - 200_000,
+                finished_at: now - 129_600,
+                input_tokens: 60 * 200_000,
+                monitor: json!({ "requests": 60 }).to_string(),
+                ..UsageRecord::default()
+            })
+            .unwrap();
+        for n in 0..60 {
+            store
+                .put_usage(&UsageRecord {
+                    id: lge_core::stable_id(&["session", &format!("review-{n}")]),
+                    task_id: format!("review-{n}"),
+                    session_id: format!("review-{n}"),
+                    task: "review an action".to_string(),
+                    model: "codex-auto-review".to_string(),
+                    mode: "proxy-background".to_string(),
+                    started_at: now - 3_000 + n,
+                    finished_at: now - 2_900 + n,
+                    input_tokens: 30_000,
+                    monitor: json!({ "requests": 1, "background": "guardian" }).to_string(),
+                    ..UsageRecord::default()
+                })
+                .unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    let named: Vec<&str> = status["long_sessions"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(named, ["old-long"], "{}", status["long_sessions"]);
+    let row = session_row(&status, "old-long");
+    assert_eq!(row["requests"].as_u64(), Some(60));
+    let rows = status["sessions"].as_array().unwrap();
+    let background = rows.iter().filter(|s| s["mode"] == "proxy-background").count();
+    assert_eq!(background, 10, "background sessions have a window of their own");
+    assert!(status["prefix"]["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "old-long"));
+}
+
+#[test]
+fn the_cards_say_what_they_count_since_when_and_a_restart_keeps_the_stored_ones() {
+    let before = lge_retrieve::unix_now();
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        let now = lge_retrieve::unix_now();
+        store
+            .put_usage(&UsageRecord {
+                id: lge_core::stable_id(&["session", "earlier"]),
+                task_id: "earlier".to_string(),
+                session_id: "earlier".to_string(),
+                task: "an earlier task".to_string(),
+                mode: "proxy".to_string(),
+                started_at: now - 600,
+                finished_at: now - 60,
+                input_tokens: 400_000,
+                removed_tokens_sent: 120_000,
+                added_tokens_sent: 3_000,
+                monitor: json!({ "requests": 10 }).to_string(),
+                ..UsageRecord::default()
+            })
+            .unwrap();
+    });
+    let status = r.json("/lge/api/status");
+    // The live counts start at zero with the daemon; the stored ones stay.
+    assert_eq!(status["saved"]["tokens_before"], 0);
+    assert_eq!(status["annuity"]["removed_tokens_sent"], 120_000);
+    assert_eq!(status["annuity"]["added_tokens_sent"], 3_000);
+    let since = status["saved"]["since"]
+        .as_i64()
+        .expect("since when the live counts run");
+    assert!(since >= before && since <= lge_retrieve::unix_now(), "{since}");
+    // The page says so on both cards, and shows the stored totals.
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    for card in ["'Removed from tool output'", "'Graph context added'"] {
+        let line = page.lines().find(|l| l.contains(card)).expect(card);
+        assert!(line.contains("since the daemon started"), "{line}");
+    }
+    assert!(page.contains("'Kept out of requests'") && page.contains("'Packs sent'"));
 }
 
 #[test]
@@ -3395,6 +3586,52 @@ fn codex_own_memory_folders_are_never_indexed() {
 }
 
 #[test]
+fn folders_inside_codex_home_are_codexs_own_except_its_worktrees() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let home = work.join("agent-home");
+    let plugins = home.join(".tmp/plugins");
+    git_folder(&plugins, "plugin.py", "def plugin():\n    return 1\n");
+    let skills = home.join("vendor_imports/skills");
+    git_folder(&skills, "skill.py", "def skill():\n    return 1\n");
+    let nested = home.join("memories/memories_v2");
+    git_folder(&nested, "memory_summary.md", "# Summary\n");
+    // The desktop app's worktree of the user's own repository: its `.git` is a file.
+    let tree = home.join("worktrees/ab12/shop");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("cart.py"), "def cart():\n    return 1\n").unwrap();
+    std::fs::write(tree.join(".git"), "gitdir: /elsewhere/.git/worktrees/ab12\n").unwrap();
+    let mut cfg = config(dir.path(), &work.join("shop"), port);
+    cfg.codex_home = Some(home);
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let post = |path: &Path| {
+        let request = ureq::http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{}/lge/api/repos", s.addr))
+            .header("content-type", "application/json")
+            .body(json!({ "path": path.to_string_lossy() }).to_string().into_bytes())
+            .unwrap();
+        let response = plain_agent().run(request).unwrap();
+        let status = response.status().as_u16();
+        (
+            status,
+            String::from_utf8_lossy(&response.into_body().read_to_vec().unwrap()).to_string(),
+        )
+    };
+    for own in [&plugins, &skills, &nested] {
+        let (status, answer) = post(own);
+        assert_eq!(status, 400, "{}: {answer}", own.display());
+        assert!(answer.contains("keeps for itself"), "{answer}");
+    }
+    let (status, answer) = post(&tree);
+    assert_eq!(status, 200, "{answer}");
+}
+
+#[test]
 fn a_saved_codex_memory_folder_is_left_out_when_the_daemon_starts() {
     let (port, _received) = provider();
     let dir = tempfile::tempdir().unwrap();
@@ -3483,4 +3720,456 @@ fn the_page_says_when_a_folder_is_indexed_and_shows_a_setting_it_could_not_save(
         page.contains("e.target.value = (state && state.settings && state.settings.router_apply) || 'off'"),
         "a select that was not saved shows the daemon's value again"
     );
+}
+
+// ---- the measures added after the first week of real data ------------------------
+
+/// A guardian request of `parent` on `thread`: the policy as instructions and `items`
+/// as messages of about 1,500 tokens each (their text is `word`, many times).
+fn guardian_request(parent: &str, items: &[&str]) -> Value {
+    let text = |w: &str| format!("{} ", w).repeat(1500);
+    let mut input: Vec<Value> = items.iter().map(|w| user(&text(w))).collect();
+    input.push(user(">>> APPROVAL REQUEST"));
+    json!({
+        "model": "codex-auto-review", "prompt_cache_key": format!("guardian:{parent}"),
+        "instructions": "You are the approval reviewer.", "input": input, "stream": true,
+    })
+}
+
+fn send_guardian(r: &Running, parent: &str, thread: &str, items: &[&str]) -> Value {
+    let body = guardian_request(parent, items);
+    let (status, _, _) = r.post(
+        "/v1/responses",
+        &serde_json::to_vec(&body).unwrap(),
+        &[
+            ("authorization", "Bearer test-key"),
+            ("content-type", "application/json"),
+            ("thread-id", thread),
+            ("session-id", thread),
+            ("x-codex-parent-thread-id", parent),
+            ("x-openai-subagent", "guardian"),
+        ],
+    );
+    assert_eq!(status, 200);
+    body
+}
+
+#[test]
+fn a_guardian_request_is_measured_against_the_previous_request_of_the_same_parent() {
+    let r = start_with(provider_with(Box::new(|_, _, _| (200, stream_with(30_000, 0)))), |_| {});
+    let first = send_guardian(&r, "p1", "t1", &["alpha", "beta", "gamma"]);
+    let second = send_guardian(&r, "p1", "t2", &["alpha", "beta", "delta"]);
+    // Another parent: no previous sibling, not counted.
+    send_guardian(&r, "p2", "t3", &["alpha", "beta", "gamma"]);
+    let status = r.json("/lge/api/status");
+    let g = &status["guardian"];
+    // Shared: the instructions, the tools and the first two items, as estimated for the bytes sent.
+    let shared = lge_proxy::guardian::signature(&second).common_prefix_tokens(&lge_proxy::guardian::signature(&first));
+    assert!(shared > 3000, "{shared}");
+    assert_eq!(g["with_previous"], 1, "{g}");
+    assert_eq!(g["lcp_tokens"].as_i64(), Some(shared), "{g}");
+    assert_eq!(g["long_prefix"], 1);
+    // The stand-in reports nothing cached: all of the shared prefix was shareable and uncached.
+    assert_eq!(g["shareable_uncached"].as_i64(), Some(shared.min(30_000)), "{g}");
+    assert_eq!(g["splits"]["key_same"]["requests"], 1, "{g}");
+    assert_eq!(g["splits"]["new_thread"]["requests"], 1);
+    assert_eq!(g["splits"]["lge_unchanged_bytes"]["requests"], 1);
+    assert!(g["splits"].get("key_different").is_none());
+    // Counts only: the measure holds no text of the requests.
+    assert!(!g.to_string().contains("alpha"), "{g}");
+}
+
+#[test]
+fn guardian_threads_are_counted_apart_from_the_parents_they_work_for() {
+    let r = start_with(
+        provider_with(Box::new(|_, _, _| (200, stream_with(30_000, 10_000)))),
+        |_| {},
+    );
+    // Two parents over five reviewer threads, three of them with a single request.
+    send_guardian(&r, "p1", "t1", &["a"]);
+    send_guardian(&r, "p1", "t1", &["a", "b"]);
+    send_guardian(&r, "p1", "t2", &["a", "b"]);
+    send_guardian(&r, "p2", "t3", &["c"]);
+    send_guardian(&r, "p2", "t4", &["c"]);
+    send_guardian(&r, "p2", "t4", &["c", "d"]);
+    send_guardian(&r, "p2", "t5", &["c", "d"]);
+    let g = r.json("/lge/api/status")["guardian"].clone();
+    assert_eq!(
+        (g["parents"].as_u64(), g["threads"].as_u64()),
+        (Some(2), Some(5)),
+        "{g}"
+    );
+    assert_eq!(g["single_request_threads"], 3, "{g}");
+    assert_eq!(g["requests"], 7);
+    assert!((g["requests_per_parent"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+    // Cached tokens of the measured requests are the provider's.
+    assert_eq!(
+        g["cached_tokens"].as_i64(),
+        Some(10_000 * g["with_previous"].as_i64().unwrap())
+    );
+}
+
+#[test]
+fn the_background_table_gives_the_cached_and_uncached_input_of_each_label() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        for (key, input, cached) in [("g-one", 33_000, 8_000), ("g-two", 74_000, 70_000)] {
+            let mut rec = stored(
+                key,
+                "proxy-background",
+                "review",
+                json!({ "requests": 1, "background": "guardian", "background_requests": { "guardian": 1 } }),
+            );
+            rec.input_tokens = input;
+            rec.cached_input_tokens = cached;
+            store.put_usage(&rec).unwrap();
+        }
+    });
+    let status = r.json("/lge/api/status");
+    let row = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["label"] == "guardian")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (row["cached_tokens"].as_i64(), row["uncached_tokens"].as_i64()),
+        (Some(78_000), Some(29_000)),
+        "{row}"
+    );
+    assert_eq!(row["input_counted_requests"], 2);
+}
+
+#[test]
+fn compaction_requests_of_older_records_are_not_shown_as_costing_nothing() {
+    let r = start_with(provider(), |data| {
+        let store = Store::open(&data.join("usage.lbug")).unwrap();
+        // Recorded before v0.0.5: requests counted by label, no input by label.
+        let mut rec = stored(
+            "old-long",
+            "proxy",
+            "fix the cart",
+            json!({ "requests": 60, "background_requests": { "compaction": 5 } }),
+        );
+        rec.input_tokens = 1000;
+        store.put_usage(&rec).unwrap();
+    });
+    let status = r.json("/lge/api/status");
+    let row = status["background"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["label"] == "compaction")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (row["requests"].as_u64(), row["input_counted_requests"].as_u64()),
+        (Some(5), Some(0)),
+        "{row}"
+    );
+    assert_eq!(row["cached_tokens"], Value::Null, "nothing known, not 0");
+    // The page prints a dash for it, and says how many requests a sum leaves out.
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("input_counted_requests") && page.contains("requests not counted"));
+}
+
+#[test]
+fn an_arm_without_sessions_has_no_medians_on_the_page() {
+    let r = start();
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["holdout"]["proxy"]["sessions"], 0);
+    assert!(status["holdout"]["proxy"]["medians"].as_object().unwrap().is_empty());
+    assert!(status["holdout"]["holdout"]["medians"].as_object().unwrap().is_empty());
+    let page = String::from_utf8(r.get("/").1).unwrap();
+    assert!(page.contains("m[k] != null ? n(Math.round(m[k])) : '–'"));
+}
+
+#[test]
+fn a_message_seen_before_its_folder_has_a_graph_is_counted_and_a_folder_shows_its_index_time() {
+    let r = start();
+    // A folder that is no repository: no graph, so no pack, for good.
+    r.send(&request_body(
+        Path::new("/somewhere/else"),
+        "conv-nograph",
+        "fix the checkout total",
+    ));
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["packs"]["no_graph"], 1, "{}", status["packs"]);
+    assert_eq!(session_row(&status, "conv-nograph")["packs_no_graph"], 1);
+    r.add_repo();
+    let status = r.json("/lge/api/status");
+    assert!(
+        status["repos"][0]["index_seconds"].as_f64().unwrap() > 0.0,
+        "{}",
+        status["repos"]
+    );
+}
+
+#[test]
+fn a_graph_on_disk_records_its_folder_is_listed_with_its_size_and_is_deleted_only_when_not_listed() {
+    let r = start();
+    r.add_repo();
+    let status = r.json("/lge/api/status");
+    let graphs = status["graphs"]["graphs"].as_array().unwrap().clone();
+    assert_eq!(graphs.len(), 1, "{}", status["graphs"]);
+    let g = &graphs[0];
+    assert_eq!(g["root"].as_str(), Some(r.repo.to_string_lossy().as_ref()));
+    assert!(g["bytes"].as_u64().unwrap() > 0);
+    assert_eq!((g["listed"].as_bool(), g["exists"].as_bool()), (Some(true), Some(true)));
+    let dir = g["dir"].as_str().unwrap().to_string();
+    let data = r.dir.path().join("data/graphs").join(&dir);
+    assert_eq!(
+        std::fs::read_to_string(data.join("root.txt")).unwrap(),
+        r.repo.to_string_lossy()
+    );
+    let delete = |query: &str| -> (u16, Value) {
+        let response = r
+            .agent
+            .delete(format!("{}/lge/api/graphs?{query}", r.base))
+            .call()
+            .unwrap();
+        let code = response.status().as_u16();
+        (
+            code,
+            serde_json::from_slice(&response.into_body().read_to_vec().unwrap()).unwrap(),
+        )
+    };
+    let (code, answer) = delete(&format!("dir={dir}"));
+    assert_eq!(code, 400, "{answer}");
+    assert!(data.exists(), "a listed folder keeps its graph");
+    // Removed from the list: the graph stays, shown as not listed, and now it may be deleted.
+    let removed = r
+        .agent
+        .delete(format!("{}/lge/api/repos?path={}", r.base, r.repo.display()))
+        .call()
+        .unwrap();
+    assert_eq!(removed.status().as_u16(), 200);
+    let status = r.json("/lge/api/status");
+    assert_eq!(status["graphs"]["graphs"][0]["listed"], false);
+    assert_eq!(status["graphs"]["unlisted"], 1);
+    let (code, answer) = delete("dir=..");
+    assert_eq!(code, 400, "{answer}");
+    let (code, answer) = delete(&format!("path={}", r.repo.display()));
+    assert_eq!(code, 200, "{answer}");
+    assert!(answer["bytes"].as_u64().unwrap() > 0);
+    assert!(!data.exists());
+}
+
+#[test]
+fn the_configuration_column_names_only_keys_codex_reads() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("codex");
+    let plugin = home.join("plugins/cache/market/computer/1");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join(".mcp.json"),
+        r#"{"mcpServers":{"cua_repl":{"command":"x"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("config.toml"), "[mcp_servers.docs]\ncommand = \"docs\"\n").unwrap();
+    let mut cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    cfg.codex_home = Some(home);
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let agent = plain_agent();
+    let function = |name: &str| json!({ "type": "function", "name": name, "description": "d", "parameters": { "type": "object" } });
+    let namespace = |name: &str, tools: &[&str]| json!({ "type": "namespace", "name": name, "description": "d", "tools": tools.iter().map(|t| function(t)).collect::<Vec<_>>() });
+    let mut body = request_body(Path::new("/somewhere/else"), "conv-cfg", "run the tests");
+    body["tools"] = json!([
+        function("exec_command"),
+        function("request_user_input"),
+        namespace(
+            "collaboration",
+            &[
+                "spawn_agent",
+                "wait_agent",
+                "send_message",
+                "followup_task",
+                "interrupt_agent",
+                "list_agents"
+            ]
+        ),
+        namespace("clock", &["curr_time"]),
+        namespace("mcp__cua_repl__", &["js"]),
+        namespace("mcp__docs__", &["lookup"]),
+        namespace("mcp__other__", &["x"]),
+    ]);
+    send_to(&agent, s.addr, &body);
+    let status = status_of(&agent, s.addr);
+    let groups = status["prefix"]["fixed"]["groups"].as_array().unwrap();
+    let config_of = |g: &str| {
+        groups.iter().find(|x| x["group"] == g).unwrap()["config"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        config_of("collaboration").starts_with("[agents] enabled = false"),
+        "{}",
+        config_of("collaboration")
+    );
+    assert_eq!(config_of("clock"), "", "no switch is known");
+    assert_eq!(config_of("built-in"), "", "no key for a group of built-in tools");
+    assert_eq!(config_of("docs"), "[mcp_servers.docs]");
+    assert!(
+        config_of("cua_repl").starts_with("[plugins.\"computer@market\"] enabled = false"),
+        "{}",
+        config_of("cua_repl")
+    );
+    assert_eq!(config_of("other"), "", "declared nowhere");
+    let ghost = |name: &str| {
+        status["ghost_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == name)
+            .unwrap()["config"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(ghost("request_user_input").starts_with("[tools.experimental_request_user_input] enabled = false"));
+    assert_eq!(ghost("exec_command"), "", "no invented key");
+    assert!(ghost("collaborationsend_message").contains("[agents] enabled = false"));
+    // Only read: the file is as it was.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("codex/config.toml")).unwrap(),
+        "[mcp_servers.docs]\ncommand = \"docs\"\n"
+    );
+}
+
+#[test]
+fn unread_script_outputs_show_on_the_status_as_a_count_and_a_share_of_tool_output() {
+    let r = start();
+    let text: String = (0..300)
+        .map(|i| format!("STEP 1: entry {i} describes the order flow through the checkout service and its retries\n"))
+        .collect();
+    let script = "const cmds = [\"rg -n x src\", \"git status --short\"];\nfor (let i = 0; i < cmds.length; i++) { const r = await tools.exec_command({cmd: cmds[i], workdir: \"/repo\"}); text(`STEP ${i+1}: ${cmds[i]}\\n${r.output}`); }";
+    let mut body = request_body(Path::new("/somewhere/else"), "conv-unread", "check the repo");
+    let items = body["input"].as_array_mut().unwrap();
+    items.push(json!({ "type": "custom_tool_call", "call_id": "s1", "name": "exec", "input": script }));
+    items.push(json!({ "type": "custom_tool_call_output", "call_id": "s1", "output": [
+        { "type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+        { "type": "input_text", "text": text },
+    ] }));
+    r.send(&body);
+    r.send(&body);
+    let u = r.json("/lge/api/status")["unread_scripts"].clone();
+    assert_eq!(u["outputs"], 1, "{u}");
+    assert!(u["tokens"].as_u64().unwrap() > 2000);
+    let share = u["share"].as_f64().unwrap();
+    assert!(
+        share > 0.0 && share < 1.0,
+        "{u}: the pytest output of the request is tool output too"
+    );
+}
+
+#[test]
+fn a_mention_link_in_a_task_is_shown_by_its_label_only() {
+    let page = String::from_utf8(start().get("/").1).unwrap();
+    let from = page.find("function clean_task").expect("the page cleans task texts");
+    let code = &page[from..from + page[from..].find("\n\n").unwrap()];
+    let script = format!(
+        "{code}\nconst out = clean_task('use [$figma](/p/SKILL.md) and [@T](thread://1), keep [a link](http://x) and [$a$&](q)');\nprocess.stdout.write(out);"
+    );
+    let Ok(output) = std::process::Command::new("node").arg("-e").arg(&script).output() else {
+        eprintln!("node is not installed: the display function was not run");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "use $figma and @T, keep [a link](http://x) and $a$&"
+    );
+    for place in ["clean_task(x.task)", "clean_task(l.task)", "clean_task(c.task)"] {
+        assert!(page.contains(place), "{place}");
+    }
+}
+
+#[test]
+fn the_compaction_estimate_endpoint_is_a_get_that_changes_nothing_and_is_cached_until_a_rollout_changes() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("codex");
+    let day = home.join("sessions/2026/07/20");
+    std::fs::create_dir_all(&day).unwrap();
+    let mut cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    cfg.codex_home = Some(home.clone());
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let agent = plain_agent();
+    let get = || -> Value {
+        serde_json::from_slice(
+            &agent
+                .get(format!("http://{}/lge/api/compact-whatif", s.addr))
+                .call()
+                .unwrap()
+                .into_body()
+                .read_to_vec()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let first = get();
+    assert_eq!(first["sessions"].as_array().map(Vec::len), Some(0));
+    let second = get();
+    assert_eq!(
+        first["generated_at"], second["generated_at"],
+        "cached while no rollout changed"
+    );
+    assert!(
+        !home.join("config.toml").exists(),
+        "nothing is written to the agent home"
+    );
+    // A POST is not an endpoint.
+    let post = agent
+        .post(format!("http://{}/lge/api/compact-whatif", s.addr))
+        .header("content-type", "application/json")
+        .send("{}")
+        .unwrap();
+    assert_eq!(post.status().as_u16(), 400);
+    // A rollout appears: the answer is made again.
+    std::fs::write(
+        day.join("rollout-2026-07-20T00-00-00-a.jsonl"),
+        format!(
+            "{}\n",
+            json!({ "type": "session_meta", "payload": { "id": "a", "source": "cli" } })
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let third = get();
+    assert!(third["generated_at"].as_i64() >= first["generated_at"].as_i64());
+    assert!(third["rollouts_read"].as_u64().is_some());
+}
+
+#[test]
+fn the_page_has_the_compaction_estimate_block_under_the_long_session_note_and_loads_it_on_open() {
+    let page = include_str!("../src/ui.html");
+    let note = page.find("id=\"long_note\"").expect("the long-session note");
+    let block = page.find("id=\"whatif_box\"").expect("the estimate block");
+    assert!(block > note && block - note < 600, "directly under the note");
+    assert!(page.contains("<details id=\"whatif_box\""), "collapsed");
+    assert!(
+        page.contains("api('compact-whatif')") && page.contains("'toggle'"),
+        "one fetch, when opened"
+    );
+    assert!(
+        page.contains("$('whatif_box').hidden = !longList.length"),
+        "only when a long session is listed"
+    );
+    assert!(page.contains("lge never writes that file"));
+}
+
+#[test]
+fn the_page_says_when_cached_counts_cover_fewer_input_tokens_and_shows_no_estimate_as_such() {
+    let page = include_str!("../src/ui.html");
+    assert!(page.contains("b.cached_basis_tokens < b.request_input_tokens"));
+    assert!(page.contains("input tokens</span>"));
+    assert!(page.contains("c.delta_pct == null ? `At ${n(c.limit)}: no estimate.`"));
 }

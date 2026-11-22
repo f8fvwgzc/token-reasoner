@@ -254,12 +254,31 @@ pub fn parse_codex_jsonl(text: &str) -> ParsedSession {
     scan.finish()
 }
 
+/// True for `rollout-*.jsonl` and for the `rollout-*.jsonl.zst` that Codex
+/// keeps older sessions in.
+pub fn is_rollout_file_name(name: &str) -> bool {
+    name.starts_with("rollout-") && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+}
+
+/// A rollout file for reading line by line; a `.zst` file is decompressed on
+/// the way. A file that is not valid zstd fails when it is read.
+fn open_rollout(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = fs::File::open(path).with_context(|| format!("open rollout file {}", path.display()))?;
+    if path.extension().is_some_and(|e| e == "zst") {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(file)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("decompress rollout file {}", path.display()))?;
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
 /// Reads and parses one rollout file. The file is read line by line and invalid
 /// UTF-8 is replaced, so a large or damaged file still gives its usage. When the
 /// file has no `session_meta` line the session id is taken from the file name.
 pub fn parse_rollout_file(path: &Path) -> Result<ParsedSession> {
-    let file = fs::File::open(path).with_context(|| format!("open rollout file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_rollout(path)?;
     let mut scan = Scan::default();
     let mut buf = Vec::new();
     loop {
@@ -346,6 +365,7 @@ fn is_rollout_named(path: &Path, suffix: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("rollout-"))
+        .map(|rest| rest.strip_suffix(".zst").unwrap_or(rest))
         .and_then(|rest| rest.strip_suffix(suffix))
         .is_some_and(is_timestamp)
 }
@@ -362,7 +382,9 @@ fn is_timestamp(s: &str) -> bool {
 
 /// The session id at the end of `rollout-<timestamp>-<uuid>.jsonl`.
 fn id_from_file_name(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
+    let name = path.file_name()?.to_str()?;
+    let name = name.strip_suffix(".zst").unwrap_or(name);
+    let stem = name.strip_suffix(".jsonl")?.strip_prefix("rollout-")?;
     let id = stem.get(stem.len().checked_sub(UUID_LEN)?..)?;
     looks_like_uuid(id).then(|| id.to_string())
 }
@@ -468,6 +490,260 @@ pub fn rollout_requests(path: &Path) -> Result<u64> {
     Ok(n)
 }
 
+/// What a response cost, as one rollout line gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReqUsage {
+    /// The provider's response id when the usage came from a `token_usage_record` line.
+    pub response_id: Option<String>,
+    pub input: i64,
+    pub cached: i64,
+    pub output: i64,
+    pub reasoning: i64,
+    /// `last_token_usage.total_tokens`: input plus output, the number Codex compares with its limit.
+    pub total: i64,
+    /// Turns started before it.
+    pub turn: u32,
+    /// Compactions finished before it: requests of one window share the number.
+    pub window: u32,
+    pub kind: ReqKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReqKind {
+    /// A request of the work.
+    Regular,
+    /// The request for a compaction's summary.
+    Compaction,
+}
+
+/// One compaction a rollout records (a `compacted` line, which is always
+/// written, or a `context_compacted` event alone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompactionMark {
+    /// The compaction's own response (`compaction_response_id`), when named.
+    pub response_id: Option<String>,
+    /// Index in [`RolloutSeries::requests`] of the request for its summary,
+    /// when its usage was recorded under that id. Never guessed from where the
+    /// line sits: a remote compaction writes no `token_count` for it.
+    pub request: Option<usize>,
+    /// Codex's own estimate of the new history's tokens, written right after
+    /// the compaction (a `token_count` with zero input).
+    pub post_estimate: Option<i64>,
+}
+
+/// A session's requests in order, with its compactions. Counts, ids and type
+/// names only: no message text is kept, and a compaction's replacement history
+/// is parsed past and dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RolloutSeries {
+    pub session_id: String,
+    pub model: String,
+    pub provider: String,
+    pub background: Option<String>,
+    /// `info.model_context_window` (the usable window, 95% of the model's).
+    pub context_window: Option<i64>,
+    pub requests: Vec<ReqUsage>,
+    pub compactions: Vec<CompactionMark>,
+    /// Tokens of the user messages (bytes / 4), for the size of a compacted history.
+    pub user_tokens: i64,
+    /// What the file held, for `--explain`.
+    pub compacted_lines: usize,
+    pub context_compacted_events: usize,
+    pub recompute_events: usize,
+    pub usage_records: usize,
+}
+
+fn usage_numbers(v: &Value) -> (i64, i64, i64, i64, i64) {
+    let n = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let (input, output) = (n("input_tokens"), n("output_tokens"));
+    let total = if v.get("total_tokens").is_some() {
+        n("total_tokens")
+    } else {
+        input + output
+    };
+    (
+        input,
+        n("cached_input_tokens"),
+        output,
+        n("reasoning_output_tokens"),
+        total,
+    )
+}
+
+/// Reads the per-request series of one rollout file. The usage of each
+/// response comes from its `token_usage_record` line (written for every
+/// response, compaction requests included); only a file without any falls back
+/// to the `token_count` events. A background thread gives an empty series.
+pub fn rollout_series(path: &Path) -> Result<RolloutSeries> {
+    let mut series = RolloutSeries::default();
+    let mut fallback: Vec<ReqUsage> = Vec::new();
+    let mut turn = 0u32;
+    let mut from_event_only = false;
+    let mut requests_since_mark = 0usize;
+    // Work (a message or a tool call) written since the last `token_count`.
+    let mut work_since_count = false;
+    for_each_line(path, |v| {
+        let payload = &v["payload"];
+        match text(v, "type") {
+            "session_meta" => {
+                if series.session_id.is_empty() {
+                    series.session_id = text(payload, "id").to_string();
+                    series.provider = text(payload, "model_provider").to_string();
+                    series.background = background_session(payload);
+                }
+            }
+            "turn_context" => {
+                if series.model.is_empty() {
+                    series.model = text(payload, "model").to_string();
+                }
+            }
+            "response_item" => {
+                if matches!(
+                    text(payload, "type"),
+                    "message" | "function_call" | "custom_tool_call" | "local_shell_call"
+                ) {
+                    work_since_count = true;
+                }
+                if text(payload, "type") == "message" && text(payload, "role") == "user" {
+                    let bytes = content_text(&payload["content"]).len() as i64;
+                    series.user_tokens += bytes / 4;
+                }
+            }
+            "token_usage_record" => {
+                let usage = &payload["usage"];
+                let id = text(payload, "response_id").to_string();
+                if usage.is_object()
+                    && (id.is_empty() || !series.requests.iter().any(|r| r.response_id.as_deref() == Some(&id)))
+                {
+                    let (input, cached, output, reasoning, total) = usage_numbers(usage);
+                    series.usage_records += 1;
+                    requests_since_mark += 1;
+                    series.requests.push(ReqUsage {
+                        response_id: (!id.is_empty()).then_some(id),
+                        input,
+                        cached,
+                        output,
+                        reasoning,
+                        total,
+                        turn,
+                        window: series.compactions.len() as u32,
+                        kind: ReqKind::Regular,
+                    });
+                }
+            }
+            "compacted" => {
+                series.compacted_lines += 1;
+                let id = text(payload, "compaction_response_id");
+                let id = (!id.is_empty()).then(|| id.to_string());
+                // A file with no usage records (an older Codex, whose local compaction
+                // reports its own request in a `token_count`): that request is the last
+                // one, with no work after it. With usage records the id decides, never adjacency.
+                let mut by_adjacency = None;
+                if series.usage_records == 0 && !work_since_count {
+                    if let Some(last) = fallback.last_mut().filter(|l| l.kind == ReqKind::Regular) {
+                        last.kind = ReqKind::Compaction;
+                        by_adjacency = Some(fallback.len() - 1);
+                    }
+                }
+                // A compaction a `context_compacted` event announced a moment ago, with
+                // no request between, is the same one.
+                if from_event_only && requests_since_mark == 0 {
+                    if let Some(mark) = series.compactions.last_mut() {
+                        mark.response_id = id;
+                        mark.request = by_adjacency;
+                    }
+                } else {
+                    series.compactions.push(CompactionMark {
+                        response_id: id,
+                        request: by_adjacency,
+                        post_estimate: None,
+                    });
+                }
+                from_event_only = false;
+                requests_since_mark = 0;
+            }
+            "event_msg" => match text(payload, "type") {
+                "task_started" | "turn_started" => turn += 1,
+                "context_compacted" => {
+                    series.context_compacted_events += 1;
+                    if series.compactions.is_empty() || requests_since_mark > 0 {
+                        series.compactions.push(CompactionMark {
+                            response_id: None,
+                            request: None,
+                            post_estimate: None,
+                        });
+                        from_event_only = true;
+                        requests_since_mark = 0;
+                    }
+                }
+                "token_count" => {
+                    let info = &payload["info"];
+                    if let Some(w) = info.get("model_context_window").and_then(Value::as_i64) {
+                        series.context_window = Some(w);
+                    }
+                    let last = &info["last_token_usage"];
+                    if !last.is_object() {
+                        return;
+                    }
+                    let (input, cached, output, reasoning, total) = usage_numbers(last);
+                    if input > 0 {
+                        work_since_count = false;
+                        fallback.push(ReqUsage {
+                            response_id: None,
+                            input,
+                            cached,
+                            output,
+                            reasoning,
+                            total,
+                            turn,
+                            window: series.compactions.len() as u32,
+                            kind: ReqKind::Regular,
+                        });
+                    } else if cached == 0 && output == 0 && total > 0 {
+                        // Codex's estimate of the history after a compaction: not a request.
+                        series.recompute_events += 1;
+                        if let Some(mark) = series.compactions.last_mut() {
+                            mark.post_estimate = Some(total);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    })?;
+    if series.background.is_some() {
+        return Ok(RolloutSeries {
+            session_id: series.session_id,
+            background: series.background,
+            ..RolloutSeries::default()
+        });
+    }
+    if series.usage_records == 0 {
+        // An older Codex: the `token_count` events are the requests. Their windows
+        // were numbered as they came.
+        series.requests = fallback;
+    }
+    for i in 0..series.compactions.len() {
+        let Some(id) = series.compactions[i].response_id.clone() else {
+            continue;
+        };
+        if let Some(at) = series
+            .requests
+            .iter()
+            .position(|r| r.response_id.as_deref() == Some(&id))
+        {
+            series.requests[at].kind = ReqKind::Compaction;
+            series.compactions[i].request = Some(at);
+        }
+    }
+    if series.session_id.is_empty() {
+        series.session_id = id_from_file_name(path).unwrap_or_default();
+    }
+    Ok(series)
+}
+
 /// The folder a rollout file's session worked in: its `session_meta` line's
 /// `cwd`, else its first `turn_context` line's. `None` when neither is there
 /// or the file cannot be read.
@@ -490,8 +766,7 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
 }
 
 fn for_each_line(path: &Path, mut each: impl FnMut(&Value)) -> Result<()> {
-    let file = fs::File::open(path).with_context(|| format!("open rollout file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_rollout(path)?;
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -535,7 +810,7 @@ fn collect_rollouts(dir: &Path, since: i64, depth: usize, found: &mut Vec<PathBu
         let named = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+            .is_some_and(is_rollout_file_name);
         let modified = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -1235,6 +1510,36 @@ mod tests {
             .join(format!("rollout-2026-01-02T03-04-05-{ROLLOUT_ID}.jsonl"));
         fs::write(&path, ROLLOUT).unwrap();
         assert_eq!(parse_rollout_file(&path).unwrap(), parse_codex_jsonl(ROLLOUT));
+    }
+
+    #[test]
+    fn a_compressed_rollout_is_read_found_and_named_like_a_plain_one() {
+        let home = tempfile::tempdir().unwrap();
+        let day = home.path().join("sessions/2026/01/02");
+        fs::create_dir_all(&day).unwrap();
+        let name = format!("rollout-2026-01-02T03-04-05-{ROLLOUT_ID}.jsonl.zst");
+        let path = day.join(&name);
+        let packed = ruzstd::encoding::compress_to_vec(ROLLOUT.as_bytes(), ruzstd::encoding::CompressionLevel::Fastest);
+        fs::write(&path, packed).unwrap();
+        assert_eq!(parse_rollout_file(&path).unwrap(), parse_codex_jsonl(ROLLOUT));
+        assert_eq!(find_rollout(home.path(), ROLLOUT_ID), Some(path.clone()));
+        assert_eq!(rollout_files(home.path(), 0), std::slice::from_ref(&path));
+        assert!(is_rollout_file_name(&name) && !is_rollout_file_name("rollout-x.jsonl.bak"));
+        let mut lines = 0;
+        for_each_line(&path, |_| lines += 1).unwrap();
+        assert_eq!(lines, ROLLOUT.lines().filter(|l| !l.trim().is_empty()).count());
+        // The session id comes from the file name when the content has none.
+        assert_eq!(id_from_file_name(&path).as_deref(), Some(ROLLOUT_ID));
+    }
+
+    #[test]
+    fn a_corrupt_compressed_rollout_is_an_error_not_an_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-01-02T03-04-05-{ROLLOUT_ID}.jsonl.zst"));
+        fs::write(&path, b"this is not zstd").unwrap();
+        assert!(parse_rollout_file(&path).is_err());
     }
 
     #[test]

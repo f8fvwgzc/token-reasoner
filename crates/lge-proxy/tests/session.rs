@@ -1,6 +1,6 @@
 //! The proxy's decisions for one conversation, against a real indexed repository.
 use lge_proxy::responses::{transform, Seen};
-use lge_proxy::rules::{Mode, RuleModes};
+use lge_proxy::rules::{Mode, RuleId, RuleModes};
 use lge_proxy::session::{
     pack_budget, Graph, Ledger, Options, PrefixStats, Session, CONTEXT_CLOSE, CONTEXT_OPEN, FOLLOW_UP_PACK_TOKENS,
     LOCAL_CONTEXT_BUDGET, MIN_PACK_ROOM, PACK_HEADER,
@@ -468,6 +468,77 @@ fn exec_call(id: &str, command: &str, workdir: &Path) -> Value {
 
 fn exec_output(id: &str, text: &str) -> Value {
     json!({ "type": "function_call_output", "call_id": id, "output": text })
+}
+
+#[test]
+fn an_identical_reread_replaced_by_a_pointer_counts_once_for_the_skeleton_shadow() {
+    let (_dir, root, store, ledger) = ledger_repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let mut opts = Options::default();
+    opts.rules.set(RuleId::RepeatPointer, Mode::On);
+    opts.rules.set(RuleId::Skeleton, Mode::Shadow);
+    let first = [
+        environment(&root),
+        message("read the ledger"),
+        exec_call("c1", "cat orders_api/ledger.py", &root),
+        exec_output("c1", &ledger),
+    ];
+    let mut both = first.to_vec();
+    both.push(exec_call("c2", "cat orders_api/ledger.py", &root));
+    both.push(exec_output("c2", &ledger));
+
+    let mut session = Session::default();
+    turn(&mut session, &graph, &first, &opts);
+    let (sent, _) = turn(&mut session, &graph, &both, &opts);
+    assert!(
+        sent.last().unwrap()["output"].as_str().unwrap().len() < ledger.len(),
+        "the re-read is replaced"
+    );
+    assert_eq!(session.saved.by_rule["skeleton"].shadow_items, 1);
+    assert_eq!(session.saved.cohorts["python:16-64K"].reads, 1);
+
+    // A retry of the same request takes its shadow count back and adds it again once.
+    session.revert_new();
+    assert_eq!(session.saved.by_rule["skeleton"].shadow_items, 1);
+    turn(&mut session, &graph, &both, &opts);
+    assert_eq!(session.saved.by_rule["skeleton"].shadow_items, 1);
+    assert_eq!(session.saved.cohorts["python:16-64K"].reads, 1);
+}
+
+#[test]
+fn a_file_read_twice_is_counted_once_for_the_skeleton_shadow() {
+    let (_dir, root, store, ledger) = ledger_repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+
+    // The same read again.
+    let mut same = Session::default();
+    same.rewrite_call_output(Some(&graph), "c1", "cat orders_api/ledger.py", None, &ledger, &opts);
+    same.rewrite_call_output(Some(&graph), "c2", "cat orders_api/ledger.py", None, &ledger, &opts);
+    assert_eq!(same.saved.by_rule["skeleton"].shadow_items, 1);
+    assert_eq!(same.saved.cohorts["python:16-64K"].reads, 1);
+
+    // The same file from the top in another window: in `on` it would be sent
+    // whole, so shadow does not count it either.
+    let mut window = Session::default();
+    window.rewrite_call_output(Some(&graph), "c1", "cat orders_api/ledger.py", None, &ledger, &opts);
+    let top: String = ledger.lines().take(200).map(|l| format!("{l}\n")).collect();
+    window.rewrite_call_output(
+        Some(&graph),
+        "c2",
+        "sed -n '1,200p' orders_api/ledger.py",
+        None,
+        &top,
+        &opts,
+    );
+    assert_eq!(window.saved.by_rule["skeleton"].shadow_items, 1);
+    assert_eq!(window.saved.cohorts["python:16-64K"].reads, 1);
 }
 
 #[test]
@@ -1341,5 +1412,131 @@ fn a_restart_keeps_the_limit_of_packs_per_conversation() {
         restarted.saved.context_tokens_would_add <= FOLLOW_UP_PACK_TOKENS,
         "{}",
         restarted.saved.context_tokens_would_add
+    );
+}
+
+/// A message as Codex's IDE integration sends it: context, then the request.
+fn with_ide_context(selection: &str, request: &str) -> String {
+    format!(
+        "# Context from my IDE setup:\n\n## Active file: src/lib.rs\n\n## Active selection of the file:\n{selection}\n## Open tabs:\n- lib.rs: src/lib.rs\n\n## My request for Codex:\n{request}"
+    )
+}
+
+#[test]
+fn a_message_with_context_in_front_gets_its_pack_from_the_request_alone() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+
+    // A long selection used to pass the size guard of the whole message.
+    let selection = "let unrelated = 1;\n".repeat(1600);
+    assert!(selection.len() > 8000);
+    let long = with_ide_context(&selection, ABOUT_ROUTES);
+    let mut session = Session::default();
+    let (sent, seen) = turn(&mut session, &graph, &[environment(&root), message(&long)], &opts);
+    assert_eq!(packs(&sent).len(), 1, "the request names create_order");
+    assert_eq!(seen.first_user_message, ABOUT_ROUTES);
+    assert_eq!(seen.first_user_text, ABOUT_ROUTES);
+
+    // Words of the context are not starting points: the request says nothing.
+    let tabs = "## Open tabs:\n- create_order: orders_api/routes.py\n";
+    let wrapped = with_ide_context(tabs, "thanks, that looks good");
+    let mut quiet = Session::default();
+    let (sent, _) = turn(&mut quiet, &graph, &[environment(&root), message(&wrapped)], &opts);
+    assert!(packs(&sent).is_empty(), "{:?}", packs(&sent));
+
+    // A message that only mentions the heading is read whole.
+    let plain = format!("please explain what `## My request for Codex:` means for {ABOUT_ROUTES}");
+    let mut plain_session = Session::default();
+    let (sent, seen) = turn(
+        &mut plain_session,
+        &graph,
+        &[environment(&root), message(&plain)],
+        &opts,
+    );
+    assert_eq!(packs(&sent).len(), 1);
+    assert_eq!(seen.first_user_message, plain);
+}
+
+#[test]
+fn a_pack_decided_from_a_whole_message_before_an_upgrade_is_sent_again_as_it_was() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options::default();
+    let wrapped = with_ide_context("let order = create_order(payload);\n", ABOUT_ROUTES);
+
+    // Decided by the earlier version, from the whole message.
+    let mut before = Session::default();
+    let old = before.context_for(&graph, &wrapped, &opts).expect("named create_order");
+    let ledger = before.ledger().clone();
+    assert_eq!(ledger.contexts.len(), 1);
+
+    // After the restart the same history is sent: the stored pack, no new one.
+    let mut restarted = Session::default();
+    restarted.restore(ledger.clone());
+    let items = [environment(&root), message(&wrapped)];
+    let (sent, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(packs(&sent).len(), 1);
+    assert_eq!(restarted.saved.contexts_added, 0, "decided before, counted before");
+    assert_eq!(restarted.ledger().contexts, ledger.contexts);
+    assert!(packs(&sent)[0].contains(
+        old.trim_start_matches(CONTEXT_OPEN)
+            .trim_end_matches(CONTEXT_CLOSE)
+            .trim()
+    ));
+    let (again, _) = turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(again, sent);
+    assert_eq!((restarted.prefix.lge_breaks, restarted.prefix.client_breaks), (0, 0));
+
+    // A ledger that kept no pack text is built again from the whole message.
+    let mut stored = serde_json::to_value(&ledger).unwrap();
+    stored.as_object_mut().unwrap().remove("pack_texts");
+    let mut rebuilt = Session::default();
+    rebuilt.restore(serde_json::from_value(stored).unwrap());
+    let (from_graph, _) = turn(&mut rebuilt, &graph, &items, &opts);
+    assert_eq!(from_graph, sent);
+}
+
+#[test]
+fn a_message_declined_because_the_conversation_is_at_its_limit_of_packs_is_counted() {
+    let (_dir, root, store) = repo();
+    let graph = Graph {
+        store: &store,
+        root: &root,
+    };
+    let opts = Options {
+        max_contexts: 2,
+        pack_conversation_budget: 100_000,
+        ..Options::default()
+    };
+    let mut session = Session::default();
+    two_turns(&mut session, &graph, &root, &opts);
+    assert_eq!(session.saved.contexts_at_limit, 0, "both messages got a pack");
+    // A compaction retires the packs; the limit still counts them.
+    let mut items = compacted(&root, &[ABOUT_ROUTES, ABOUT_AUDIT]);
+    turn(&mut session, &graph, &items, &opts);
+    assert_eq!(session.saved.contexts_retired, 1);
+    let ledger = session.ledger().clone();
+    items.push(message(ABOUT_MAILER));
+    let (kept, _) = turn(&mut session, &graph, &items, &opts);
+    assert_eq!(packs(&kept).len(), 1, "no new pack");
+    assert_eq!(session.saved.contexts_at_limit, 1);
+    // Retired since this daemon started: a limit on live packs only would have let it through.
+    assert_eq!(session.saved.contexts_at_limit_live_would_add, 1);
+    // The same request again, or after a restart: counted once.
+    turn(&mut session, &graph, &items, &opts);
+    assert_eq!(session.saved.contexts_at_limit, 1);
+    let mut restarted = Session::default();
+    restarted.restore(ledger);
+    turn(&mut restarted, &graph, &items, &opts);
+    assert_eq!(
+        restarted.saved.contexts_at_limit, 1,
+        "the first decision of this daemon"
     );
 }

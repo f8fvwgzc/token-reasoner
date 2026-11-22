@@ -19,6 +19,7 @@ use crate::session::{output_key, producer_of, same_path, Before, CallView, Draft
 use crate::shorten::RunStatus;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -33,6 +34,10 @@ pub struct Seen {
     pub model: Option<String>,
     /// The first message the user typed, cut to 200 chars.
     pub first_user_message: String,
+    /// The first typed message as it was, trimmed and cut to 200 chars, even
+    /// when context comes before the request. Names a conversation that has
+    /// no cache key and no thread header, as it always did.
+    pub first_user_raw: String,
     /// The same message cut to [`ROUTED_CHARS`], for the router: a task whose
     /// scope is named after its first 200 characters is routed by all of it.
     pub first_user_text: String,
@@ -59,6 +64,9 @@ pub struct Seen {
     pub forwarded_hashes: Vec<u64>,
     /// Names of the tools called in the request, each once, in order.
     pub called_tools: Vec<String>,
+    /// Names the `exec` scripts of the request call from code mode
+    /// (`tools.<name>(...)`), each once, in order.
+    pub code_mode_calls: Vec<String>,
     /// Items first decided in this request (outputs, pointers, contexts).
     pub new_decisions: usize,
     /// The input item at which this request's forwarded prefix differs from
@@ -191,6 +199,51 @@ fn is_injected(item: &Value, text: &str) -> bool {
     }
     let t = text.trim_start().to_ascii_lowercase();
     INJECTED_STARTS.iter().any(|m| t.starts_with(m)) || t.starts_with('<')
+}
+
+/// The heading Codex puts between the context it adds in front of a message
+/// (the IDE's open files and selection, referenced chats) and what the user
+/// typed.
+const REQUEST_HEADING: &str = "## My request for Codex:";
+
+/// What the user asked, in a typed message that starts with context: the text
+/// after the first `## My request for Codex:` line, trimmed. A message that
+/// does not start with a `#` heading, or has no such line, is returned as it
+/// is; one with nothing after the heading (a message of attachments only)
+/// gives an empty string.
+pub fn request_text(text: &str) -> Cow<'_, str> {
+    // The harness's labels around an attached image (or audio clip) are lines
+    // of their own in the joined text: they name a path, and say nothing about the task.
+    let labelled = text.contains("<image") || text.contains("</image>") || text.contains("<audio");
+    let stripped: Cow<'_, str> = if labelled {
+        let is_label = |line: &str| {
+            let l = line.trim();
+            l == "</image>"
+                || l == "<image>"
+                || l.starts_with("<image name=")
+                || l.starts_with("<audio")
+                || l == "</audio>"
+        };
+        if text.lines().any(is_label) {
+            Cow::Owned(text.lines().filter(|l| !is_label(l)).collect::<Vec<_>>().join("\n"))
+        } else {
+            Cow::Borrowed(text)
+        }
+    } else {
+        Cow::Borrowed(text)
+    };
+    let t = stripped.trim_start();
+    if !t.starts_with('#') {
+        return stripped;
+    }
+    let mut at = 0;
+    for line in t.split_inclusive('\n') {
+        if line.starts_with(REQUEST_HEADING) {
+            return Cow::Owned(t[at + REQUEST_HEADING.len()..].trim().to_string());
+        }
+        at += line.len();
+    }
+    stripped
 }
 
 /// The text of a message the user typed, or `None` for any other item.
@@ -1096,8 +1149,14 @@ impl<'s, 'g> Known<'s, 'g> {
                             let line_id = format!("{id}#{}", skip + k);
                             self.text(at, j, ran, &line_id, &e.output, e.status)
                         } else {
-                            self.session
-                                .decide_content(&self.calls[at].call_id, &e.output, e.status, false, self.opts)
+                            self.session.decide_content(
+                                &self.calls[at].call_id,
+                                &e.output,
+                                e.status,
+                                false,
+                                false,
+                                self.opts,
+                            )
                         }
                     });
                     replaced += usize::from(decided.is_some());
@@ -1246,6 +1305,7 @@ fn rewrite_by_content(
     call: &str,
     code_mode: bool,
     minify: bool,
+    unread: bool,
 ) -> usize {
     let mut one = |raw: &mut String, outer: RunStatus| -> usize {
         match unframe(raw, code_mode) {
@@ -1254,7 +1314,7 @@ fn rewrite_by_content(
                     .iter()
                     .map(|(_, exec)| {
                         exec.as_ref()
-                            .and_then(|e| session.decide_content(call, &e.output, e.status, false, opts))
+                            .and_then(|e| session.decide_content(call, &e.output, e.status, false, unread, opts))
                     })
                     .collect();
                 let replaced = new.iter().filter(|n| n.is_some()).count();
@@ -1273,7 +1333,7 @@ fn rewrite_by_content(
                     running: status.running || outer.running,
                     masked: false,
                 };
-                match session.decide_content(call, &text, status, minify, opts) {
+                match session.decide_content(call, &text, status, minify, unread, opts) {
                     Some(new) => {
                         *raw = reframe(framed, new);
                         1
@@ -1327,7 +1387,7 @@ pub const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 
 /// A field of a request's turn metadata, from the body's `client_metadata`
 /// or else from the header (`turn_metadata`).
-fn turn_metadata_field(turn_metadata: Option<&str>, body: &Value, field: &str) -> Option<String> {
+pub(crate) fn turn_metadata_field(turn_metadata: Option<&str>, body: &Value, field: &str) -> Option<String> {
     let from_body = body
         .get("client_metadata")
         .and_then(|m| m.get(TURN_METADATA_HEADER))
@@ -1457,12 +1517,33 @@ pub fn inspect(body: &Value) -> Seen {
         if typed > 1 {
             seen.has_history = true;
         }
+        if seen.first_user_raw.is_empty() {
+            seen.first_user_raw = text.trim().chars().take(200).collect();
+        }
+        // The task is what the user asked, not the context in front of it; a
+        // message with nothing but context (attachments) is not the task.
         if seen.first_user_message.is_empty() {
-            seen.first_user_message = text.trim().chars().take(200).collect();
-            seen.first_user_text = text.trim().chars().take(ROUTED_CHARS).collect();
+            let request_owned = request_text(&text);
+            let request = request_owned.trim();
+            seen.first_user_message = request.chars().take(200).collect();
+            seen.first_user_text = request.chars().take(ROUTED_CHARS).collect();
         }
     }
     seen
+}
+
+/// The tools a code-mode script calls: `tools.name(` and `tools["name"](`.
+/// Names in a comment or a string count too: a tool then shows as called
+/// rather than as one nobody uses.
+pub fn nested_tool_names(script: &str) -> Vec<String> {
+    static CALL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let call = CALL.get_or_init(|| {
+        regex::Regex::new(r#"\btools(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([^"']+)["']\s*\])\s*\("#)
+            .expect("a valid pattern")
+    });
+    call.captures_iter(script)
+        .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()))
+        .collect()
 }
 
 /// Rewrite `body` in place. Only `input` is touched, and in it only tool
@@ -1482,6 +1563,21 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
     for call in &calls {
         if !seen.called_tools.contains(&call.name) {
             seen.called_tools.push(call.name.clone());
+        }
+    }
+    // A tool called from inside an `exec` script is named only in its text.
+    for item in items.iter() {
+        let script = match item.get("type").and_then(Value::as_str) {
+            Some("custom_tool_call") if item.get("name").and_then(Value::as_str) == Some("exec") => "input",
+            Some("function_call") if item.get("name").and_then(Value::as_str) == Some("exec") => "arguments",
+            _ => continue,
+        };
+        if let Some(text) = item.get(script).and_then(Value::as_str) {
+            for name in nested_tool_names(text) {
+                if !seen.code_mode_calls.contains(&name) {
+                    seen.code_mode_calls.push(name);
+                }
+            }
         }
     }
     // Calls of the provider's own tools carry no call id: named by their tool type.
@@ -1540,7 +1636,9 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                         })
                     );
                     let minify = matches!(call.map(|c| &c.kind), Some(CallKind::Tool(name)) if name != "write_stdin" && !file_tool(name));
-                    rewrite_by_content(&mut item, known.session, opts, &call_id, code_mode, minify)
+                    // A script's output that is not matched to a command is only counted.
+                    let unread = matches!(call.map(|c| &c.kind), Some(CallKind::Script { .. }));
+                    rewrite_by_content(&mut item, known.session, opts, &call_id, code_mode, minify, unread)
                 });
                 seen.outputs_replaced += replaced;
                 if fresh {
@@ -1580,7 +1678,9 @@ pub fn transform(body: &mut Value, session: &mut Session, graph: Option<&Graph>,
                             prefix: (!copy).then(|| prefixes[at]),
                             newest: at == newest,
                         };
-                        known.session.context_after(graph, &text, &before, opts)
+                        known
+                            .session
+                            .context_after_request(graph, &text, &request_text(&text), &before, opts)
                     }
                     _ => None,
                 };
@@ -2797,5 +2897,82 @@ mod tests {
             ),
             ("git status", false)
         );
+    }
+
+    #[test]
+    fn the_task_is_the_request_after_the_context_codex_puts_in_front() {
+        let task = |text: &str| {
+            let seen = inspect(&json!({ "input": [{ "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": text }] }] }));
+            (seen.first_user_message, seen.first_user_text, seen.first_user_raw)
+        };
+        let ide = "# Context from my IDE setup:\n\n## Active file: src/lib.rs\n\n## Open tabs:\n- lib.rs: src/lib.rs\n\n## My request for Codex:\nfix the login bug";
+        let (message, text, raw) = task(ide);
+        assert_eq!(
+            (message.as_str(), text.as_str()),
+            ("fix the login bug", "fix the login bug")
+        );
+        assert!(raw.starts_with("# Context from my IDE setup:"), "{raw}");
+        let files = "# Files mentioned by the user:\n\n## Screenshot.png: /var/folders/x/Screenshot.png\n\n## My request for Codex:\nwhy is the cart empty";
+        assert_eq!(task(files).0, "why is the cart empty");
+        let selection = "x".repeat(30_000);
+        let big = format!("# Context from my IDE setup:\n\n## Active selection of the file:\n{selection}\n## My request for Codex:\nwhy does this fail");
+        assert_eq!(task(&big).1, "why does this fail");
+        // Not a context: the phrase inside a plain message changes nothing.
+        let plain = "explain `## My request for Codex:` to me";
+        assert_eq!(request_text(plain), plain);
+        let inline = "# Notes\nsee ## My request for Codex: in the docs";
+        assert_eq!(request_text(inline), inline);
+        // No heading: the message as it is.
+        let no_heading = "# Files mentioned by the user:\n\n## a.png: /tmp/a.png";
+        assert_eq!(request_text(no_heading), no_heading);
+    }
+
+    #[test]
+    fn the_labels_around_an_attached_image_are_not_part_of_the_task() {
+        // Codex says the message is typed in its metadata; without it a message that opens
+        // with a tag counts as not typed (unchanged: that would move old decisions).
+        let user = |parts: Value| {
+            json!({ "type": "message", "role": "user", "content": parts,
+            "internal_chat_message_metadata_passthrough": { "content_item_kinds": ["user.text", "user.image", "user.text", "user.text"] } })
+        };
+        let seen = inspect(&json!({ "input": [user(json!([
+            { "type": "input_text", "text": "<image name=[Image #1] path=\"/tmp/a.png\">" },
+            { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+            { "type": "input_text", "text": "</image>" },
+            { "type": "input_text", "text": "fix the cart" },
+        ]))] }));
+        assert_eq!(seen.first_user_message, "fix the cart");
+        assert_eq!(seen.first_user_text, "fix the cart");
+        // The ledger key's text keeps the labels: it is what the client sent.
+        assert!(seen.first_user_raw.contains("<image name="), "{}", seen.first_user_raw);
+        assert_eq!(request_text("<audio>\nlisten\n</audio>\nplay it"), "listen\nplay it");
+        assert_eq!(request_text("use <image> tags in html"), "use <image> tags in html");
+    }
+
+    #[test]
+    fn a_message_of_attachments_only_is_not_the_task() {
+        let user = |text: &str| json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] });
+        let seen = inspect(&json!({ "input": [
+            user("# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n\n## My request for Codex:\n"),
+            user("why is the cart empty"),
+        ] }));
+        assert_eq!(seen.first_user_message, "why is the cart empty");
+        assert!(seen.has_history, "two typed messages");
+    }
+    #[test]
+    fn tools_called_from_an_exec_script_are_seen() {
+        assert_eq!(
+            nested_tool_names("await tools.mcp__cua_repl__js_reset({});\nconst t = await tools.clock__curr_time ();\nawait tools[\"my tool\"](1)"),
+            ["mcp__cua_repl__js_reset", "clock__curr_time", "my tool"]
+        );
+        assert!(nested_tool_names("const mytools.x = 1; tools.exec_command").is_empty());
+        let mut body = json!({ "input": [
+            { "type": "custom_tool_call", "call_id": "s1", "name": "exec", "input": "await tools.mcp__cua_repl__js_reset({}); await tools.clock__curr_time();" },
+            { "type": "custom_tool_call", "call_id": "s2", "name": "exec", "input": "await tools.clock__curr_time();" },
+            { "type": "custom_tool_call", "call_id": "s3", "name": "other", "input": "tools.hidden()" },
+        ] });
+        let seen = transform(&mut body, &mut Session::default(), None, &Options::default());
+        assert_eq!(seen.code_mode_calls, ["mcp__cua_repl__js_reset", "clock__curr_time"]);
     }
 }

@@ -5,7 +5,7 @@
 //! printed output as it would the output of that command run directly. The
 //! script is never changed.
 use lge_proxy::responses::transform;
-use lge_proxy::rules::Mode;
+use lge_proxy::rules::{Mode, RuleId};
 use lge_proxy::session::{Options, Session};
 use serde_json::{json, Value};
 
@@ -269,7 +269,11 @@ fn the_same_items_get_the_same_bytes_on_every_turn_and_are_counted_once() {
     transform(&mut next, &mut session, None, &opts);
     let prefix = |v: &Value| serde_json::to_string(&v["input"].as_array().unwrap()[..10]).unwrap();
     assert_eq!(prefix(&next), prefix(&first), "the cached prefix must not change");
-    assert_eq!(session.saved, saved, "decided once, counted once");
+    // The one new typed message is the only new count (first seen with no graph).
+    assert_eq!(session.saved.contexts_no_graph, saved.contexts_no_graph + 1);
+    let mut again = session.saved.clone();
+    again.contexts_no_graph = saved.contexts_no_graph;
+    assert_eq!(again, saved, "decided once, counted once");
 
     // Settings change mid-conversation (rules switched, shortening off, the
     // holdout arm): past items keep their bytes.
@@ -298,7 +302,9 @@ fn the_same_items_get_the_same_bytes_on_every_turn_and_are_counted_once() {
         );
         assert_eq!(seen.lge_break_item, None);
     }
-    assert_eq!(session.saved, saved);
+    let mut after = session.saved.clone();
+    after.contexts_no_graph = saved.contexts_no_graph;
+    assert_eq!(after, saved);
 
     // A fresh session (a restarted daemon) decides the same from the same items.
     let mut again = body(items);
@@ -532,4 +538,70 @@ fn each_printed_part_of_a_three_command_script_gets_its_own_decision() {
         tests.contains("lge: output of the command reduced"),
         "by content: {tests}"
     );
+}
+
+// ---- Scripts lge cannot read are counted, not changed ----
+
+const LOOP_SCRIPT: &str = "const cmds = [\"rg -n x src\", \"git status --short\"];\nfor (let i = 0; i < cmds.length; i++) { const r = await tools.exec_command({cmd: cmds[i], workdir: \"/repo\"}); text(`STEP ${i+1}: ${cmds[i]}\\n${r.output}`); }";
+
+/// About `lines * 12` tokens of ordinary text.
+fn prose(lines: usize) -> String {
+    (0..lines)
+        .map(|i| format!("STEP 1: entry {i} describes the order flow through the checkout service and its retries\n"))
+        .collect()
+}
+
+#[test]
+fn a_loop_script_that_runs_a_command_per_array_element_is_counted_as_an_unread_script() {
+    let big = prose(300);
+    let tokens = lge_retrieve::budget::count(&big) as u64;
+    assert!(tokens > 2000, "{tokens}");
+    let opts = Options::default();
+    let mut session = Session::default();
+    let mut request = body(vec![exec("s1", LOOP_SCRIPT), result("s1", &big)]);
+    transform(&mut request, &mut session, None, &opts);
+    assert_eq!(session.saved.unread_script_outputs, 1);
+    assert_eq!(session.saved.unread_script_tokens, tokens);
+    assert!(session.saved.output_tokens_seen >= tokens);
+    // The same output on the next request, with one more item: not counted again.
+    let mut next = body(vec![exec("s1", LOOP_SCRIPT), result("s1", &big), user("and now?")]);
+    transform(&mut next, &mut session, None, &opts);
+    assert_eq!(session.saved.unread_script_outputs, 1);
+    // A restarted daemon restores the ledger: the item counted before is not counted again.
+    let mut restarted = Session::default();
+    restarted.restore(session.ledger().clone());
+    let mut again = body(vec![exec("s1", LOOP_SCRIPT), result("s1", &big), user("and now?")]);
+    transform(&mut again, &mut restarted, None, &opts);
+    assert_eq!(restarted.saved.unread_script_outputs, 0);
+    assert_eq!(restarted.saved.unread_script_tokens, 0);
+}
+
+#[test]
+fn a_script_that_runs_one_command_is_not_counted_as_unread() {
+    let mut session = Session::default();
+    let mut request = body(vec![exec("s1", &script("\"rg -n x src\"")), result("s1", &prose(300))]);
+    transform(&mut request, &mut session, None, &Options::default());
+    assert_eq!(session.saved.unread_script_outputs, 0);
+    assert_eq!(session.saved.unread_script_tokens, 0);
+}
+
+#[test]
+fn an_unread_script_output_below_four_hundred_tokens_is_not_counted() {
+    let mut session = Session::default();
+    let mut request = body(vec![exec("s1", LOOP_SCRIPT), result("s1", &prose(10))]);
+    transform(&mut request, &mut session, None, &Options::default());
+    assert_eq!(session.saved.unread_script_outputs, 0);
+}
+
+#[test]
+fn counting_an_unread_script_changes_no_byte_of_the_request() {
+    let big = prose(300);
+    let mut counted = body(vec![exec("s1", LOOP_SCRIPT), result("s1", &big)]);
+    let mut options = Options::default();
+    for rule in RuleId::ALL {
+        options.rules.set(rule, Mode::Off);
+    }
+    let before = counted.clone();
+    transform(&mut counted, &mut Session::default(), None, &options);
+    assert_eq!(counted, before);
 }

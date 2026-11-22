@@ -11,6 +11,8 @@ serde.workspace = true
 serde_json.workspace = true
 # Reads the `[prices]` table of `lge.toml`. Parsing only: nothing is written back.
 toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+# Reads the rollouts Codex keeps compressed (`.jsonl.zst`). Pure Rust.
+ruzstd = "0.8"
 lge-core = { path = "../lge-core" }
 
 [dev-dependencies]

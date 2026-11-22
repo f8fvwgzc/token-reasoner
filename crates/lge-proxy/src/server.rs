@@ -39,6 +39,8 @@ use tiny_http::{Header, Method, Request, Response};
 const UI: &str = include_str!("ui.html");
 /// How long the first request in a new repository waits for its index.
 const FIRST_INDEX_WAIT: Duration = Duration::from_secs(10);
+/// A status call slower than this (milliseconds) is logged with its record count.
+const STATUS_SLOW_MS: u128 = 200;
 /// Largest request body the proxy reads into memory.
 const MAX_BODY: usize = 128 * 1024 * 1024;
 /// Most of a refused request's error body that is read before the retry.
@@ -446,6 +448,9 @@ struct Repo {
     /// Folders searches would wade through, found when the repository is
     /// indexed (not on every status call).
     bulky: Mutex<Vec<lge_index::BulkyDir>>,
+    /// Seconds the last index took (the first index of a worktree decides
+    /// whether the first message waits for it).
+    index_seconds: Mutex<Option<f64>>,
 }
 
 /// What each rule did in a session, as stored in `UsageRecord.rule_stats`.
@@ -514,6 +519,33 @@ struct MonitorJson {
     /// Input tokens of the background requests (and requests for a
     /// compaction's summary) by label, in this session.
     background_input: BTreeMap<String, i64>,
+    /// Cached input tokens of those requests by label, and how many requests
+    /// of each label had their input (and cached input) counted: requests
+    /// of older versions are in `background_requests` only.
+    background_cached: BTreeMap<String, i64>,
+    background_input_requests: BTreeMap<String, u64>,
+    /// Input tokens counted together with their cached tokens, by label (less
+    /// than `background_input` for a session that spans an upgrade).
+    #[serde(default)]
+    background_cached_basis: BTreeMap<String, i64>,
+    /// Outputs of scripts lge could not read (400 tokens or more), their
+    /// tokens, and the tokens of all tool outputs decided (the base of a share).
+    unread_script_outputs: u64,
+    unread_script_tokens: u64,
+    output_tokens_seen: u64,
+    /// Typed messages with a strong starting point declined for the limit of
+    /// packs, and those a limit on live packs only would have let through.
+    packs_at_limit: u64,
+    packs_at_limit_live_would_add: u64,
+    /// Typed messages first seen with no graph for their folder.
+    packs_no_graph: u64,
+    /// Guardian only: a short hash of the parent thread the reviewer worked
+    /// for, and the measure of its requests' common prefixes with the previous
+    /// request of the same parent (counts only).
+    guardian_parent: Option<String>,
+    guardian: crate::guardian::Stats,
+    /// Tokens lge removed from the requests of each background label.
+    background_removed: BTreeMap<String, i64>,
 }
 
 /// What a conversation's stored record had counted before this daemon
@@ -535,6 +567,8 @@ struct ToolDef {
     /// The group is an MCP server (`mcp__` names).
     mcp: bool,
     tokens: usize,
+    /// The name a script calls it by from code mode (`tools.<name>(...)`).
+    code_mode_name: String,
 }
 
 /// The fixed part of a conversation's requests, counted once per distinct
@@ -622,6 +656,15 @@ struct Conv {
     background_requests: BTreeMap<String, u64>,
     /// Their input tokens by label.
     background_input: BTreeMap<String, i64>,
+    /// Their cached input tokens by label, and the requests that counted input.
+    background_cached: BTreeMap<String, i64>,
+    background_input_requests: BTreeMap<String, u64>,
+    background_cached_basis: BTreeMap<String, i64>,
+    /// Guardian: the hashed parent thread and the measure so far (carried
+    /// from the stored record, then added to).
+    guardian_parent: Option<String>,
+    guardian: crate::guardian::Stats,
+    background_removed: BTreeMap<String, i64>,
     /// The request waited for the graph to send a pack decided before a
     /// restart again (once per conversation).
     waited_for_graph: bool,
@@ -664,6 +707,19 @@ impl Conv {
             randomized: base.randomized,
             ab_arm: base.ab_arm.clone(),
             background_input: self.background_input.clone(),
+            background_cached: self.background_cached.clone(),
+            background_input_requests: self.background_input_requests.clone(),
+            background_cached_basis: self.background_cached_basis.clone(),
+            unread_script_outputs: base.unread_script_outputs + saved.unread_script_outputs as u64,
+            unread_script_tokens: base.unread_script_tokens + saved.unread_script_tokens,
+            output_tokens_seen: base.output_tokens_seen + saved.output_tokens_seen,
+            packs_at_limit: base.packs_at_limit + saved.contexts_at_limit as u64,
+            packs_at_limit_live_would_add: base.packs_at_limit_live_would_add
+                + saved.contexts_at_limit_live_would_add as u64,
+            packs_no_graph: base.packs_no_graph + saved.contexts_no_graph as u64,
+            guardian_parent: self.guardian_parent.clone(),
+            guardian: self.guardian.clone(),
+            background_removed: self.background_removed.clone(),
         }
     }
 
@@ -675,14 +731,20 @@ impl Conv {
         self.record.monitor = serde_json::to_string(&self.monitor_json()).unwrap_or_default();
     }
 
-    /// Count a cold restart: the previous response was more than
-    /// [`COLD_GAP_SECONDS`] ago, its request had at least [`COLD_MIN_INPUT`]
-    /// input tokens, and this response read less than half of that from the
-    /// cache. The tokens counted are the previous input less what was cached.
-    fn observe_response(&mut self, now: i64, usage: &Usage) {
+    /// Count a cold restart: this request was sent more than
+    /// [`COLD_GAP_SECONDS`] after the previous response ended (the time the
+    /// model took to answer, and the tool's, is not idle time), the previous
+    /// request had at least [`COLD_MIN_INPUT`] input tokens, and this
+    /// response read less than half of that from the cache. The tokens
+    /// counted are the previous input less what was cached. `request_at` is
+    /// when the request arrived, `now` when its response ended.
+    fn observe_response(&mut self, request_at: i64, now: i64, usage: &Usage) {
         if let Some(at) = self.last_response_at {
             let previous = self.last_input_tokens;
-            if now - at > COLD_GAP_SECONDS && previous >= COLD_MIN_INPUT && usage.cached_input_tokens * 2 < previous {
+            if request_at - at > COLD_GAP_SECONDS
+                && previous >= COLD_MIN_INPUT
+                && usage.cached_input_tokens * 2 < previous
+            {
                 self.cold_restarts += 1;
                 self.cold_tokens += (previous - usage.cached_input_tokens).max(0);
             }
@@ -710,6 +772,12 @@ struct Rewritten {
     /// store at once: a restart before the first usage keeps the decision.
     decided_record: Option<UsageRecord>,
     conv: Arc<Mutex<Conv>>,
+    /// When the request arrived, for the idle time before it.
+    request_at: i64,
+    /// Guardian only: the parent thread, the request's place in the parent's
+    /// table and its comparison with the previous sibling, completed with the
+    /// response's usage.
+    guardian: Option<GuardianPending>,
     /// The trace of this request, completed with the response's numbers. It
     /// travels with the request: Codex may send the next request of the same
     /// conversation before this response has been fully relayed.
@@ -736,6 +804,16 @@ pub struct Daemon {
     /// Seconds added to the system clock (tests).
     clock_offset: AtomicI64,
     started: Instant,
+    /// The same moment as unix seconds: what the live counts are since.
+    started_unix: i64,
+    /// The graph folders on disk with their sizes, read at most once a minute
+    /// (a status call every 3 seconds must not walk them).
+    graph_sizes: Mutex<Option<(Instant, Vec<crate::graphs::GraphDir>)>>,
+    /// The last guardian request of each parent (hashes only), for the
+    /// common-prefix measure.
+    guardian_prev: Mutex<crate::guardian::Table>,
+    /// The compaction what-if: (signature of the rollouts it was made from, when, answer).
+    compact_cache: Mutex<Option<(String, Instant, Value)>>,
 }
 
 /// A poisoned lock means another request panicked; its data is still the best there is.
@@ -888,6 +966,21 @@ fn namespace_group(namespace: &str) -> (String, bool) {
     }
 }
 
+/// The name a tool has inside a code-mode script, as Codex builds it
+/// (codex-rs/tools/src/code_mode.rs): the bare name for a tool without a
+/// namespace or in the default one, else the namespace and the name joined
+/// directly when the namespace ends with `_` or the name starts with `_`, and
+/// with `__` between them otherwise.
+fn code_mode_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() || namespace == CODEX_NAMESPACE {
+        name.to_string()
+    } else if namespace.ends_with('_') || name.starts_with('_') {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}__{name}")
+    }
+}
+
 /// The group of a tool defined without a namespace: a flat MCP name
 /// (`mcp__server__tool`, Codex's older form) is grouped by the part before
 /// the last `__`, without `mcp__`; any other name is `built-in`.
@@ -935,6 +1028,7 @@ fn tool_defs(body: &Value) -> Vec<ToolDef> {
             for tool in entry.get("tools").and_then(Value::as_array).into_iter().flatten() {
                 let name = name_of(tool);
                 out.push(ToolDef {
+                    code_mode_name: code_mode_name(namespace, &name),
                     name: if namespace == CODEX_NAMESPACE {
                         name
                     } else {
@@ -949,6 +1043,7 @@ fn tool_defs(body: &Value) -> Vec<ToolDef> {
             let name = name_of(entry);
             let (group, mcp) = tool_group(&name);
             out.push(ToolDef {
+                code_mode_name: name.clone(),
                 name,
                 group,
                 mcp,
@@ -994,6 +1089,14 @@ fn instructions_text(body: &Value) -> String {
     }
 }
 
+/// A guardian request's measure, waiting for its response.
+#[derive(Debug, Clone)]
+struct GuardianPending {
+    parent: String,
+    seq: u64,
+    observation: Option<crate::guardian::Observation>,
+}
+
 /// What a request's headers say about where it comes from, for
 /// [`background_label`].
 #[derive(Debug, Clone, Default)]
@@ -1002,6 +1105,10 @@ struct Origin {
     subagent: Option<String>,
     /// The `x-codex-turn-metadata` header.
     turn_metadata: Option<String>,
+    /// The `x-codex-parent-thread-id` header: the thread a reviewer works for.
+    parent_thread: Option<String>,
+    /// The `session-id` header.
+    session_id: Option<String>,
 }
 
 /// The label under which requests for a compaction's summary are counted.
@@ -1012,6 +1119,11 @@ const COMPACTION_LABEL: &str = "compaction";
 /// rules apply as usual, it gets no pack, it is never held out, and it is
 /// left out of the holdout comparison and the before-and-after numbers.
 const BACKGROUND_MODE: &str = "proxy-background";
+
+/// Rows of the session table: the newest sessions of the user's, and the
+/// newest of Codex's background ones.
+const ORDINARY_ROWS: usize = 50;
+const BACKGROUND_ROWS: usize = 10;
 
 /// A proxy conversation's record (`proxy`, `proxy-holdout` or `proxy-background`).
 fn is_proxy_mode(mode: &str) -> bool {
@@ -1154,42 +1266,155 @@ fn classify_stored(records: &mut [UsageRecord]) {
     }
 }
 
+/// A stored record of v0.0.5 has input by label but no count of the requests
+/// that counted it: seed the count from the requests by label, so requests
+/// added by this daemon continue it instead of replacing it.
+fn seed_background_counts(monitor: &mut MonitorJson) {
+    for label in monitor.background_input.keys() {
+        let seeded = monitor.background_requests.get(label).copied().unwrap_or(0);
+        monitor.background_input_requests.entry(label.clone()).or_insert(seeded);
+    }
+}
+
 /// Codex's background requests by label: the sessions that were background
 /// sessions (their tokens included), every background request, in such
 /// sessions or in others, and the input tokens of those requests. A label
 /// that never forms a session (a compaction's summary) has `sessions` null.
 fn background_totals(records: &[UsageRecord]) -> Vec<Value> {
-    // label -> (sessions, requests, input tokens of its sessions, input tokens of its requests)
-    let mut by_label: BTreeMap<String, (u64, u64, i64, i64)> = BTreeMap::new();
+    #[derive(Default)]
+    struct Label {
+        sessions: u64,
+        requests: u64,
+        /// Input tokens of its sessions.
+        input: i64,
+        /// Input tokens of its requests, and the requests that counted them.
+        request_input: i64,
+        counted_requests: u64,
+        /// Cached tokens of those requests, over the input tokens they were
+        /// counted for (`cached_basis`): older records have no cached count.
+        cached: i64,
+        cached_basis: i64,
+        /// Tokens lge removed from its requests.
+        removed: i64,
+    }
+    let mut by_label: BTreeMap<String, Label> = BTreeMap::new();
     for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
         let m: MonitorJson = serde_json::from_str(&r.monitor).unwrap_or_default();
         let session_label = m.background.as_ref().filter(|_| r.mode == BACKGROUND_MODE);
         if let Some(label) = session_label {
             let slot = by_label.entry(label.clone()).or_default();
-            slot.0 += 1;
-            slot.2 += r.input_tokens;
+            slot.sessions += 1;
+            slot.input += r.input_tokens;
         }
         for (label, n) in &m.background_requests {
-            by_label.entry(label.clone()).or_default().1 += n;
+            by_label.entry(label.clone()).or_default().requests += n;
         }
-        // Input of the requests by label: counted per request since this
-        // version; a background session recorded before has its own input.
+        // Input of the requests by label: counted per request since v0.0.5; a
+        // background session recorded before has its own input (and cached
+        // input), for all its requests.
         let mut by_request = m.background_input.clone();
+        let mut cached = m.background_cached.clone();
+        let mut counted = m.background_input_requests.clone();
         if let Some(label) = session_label.filter(|l| !by_request.contains_key(*l)) {
             by_request.insert(label.clone(), r.input_tokens);
+            cached.insert(label.clone(), r.cached_input_tokens);
+            counted.insert(label.clone(), m.background_requests.get(label).copied().unwrap_or(0));
+        }
+        // A background session's own total covers requests counted before an
+        // upgrade too: take the larger.
+        let mut removed = m.background_removed.clone();
+        if let Some(label) = session_label {
+            let e = removed.entry(label.clone()).or_insert(0);
+            *e = (*e).max(r.removed_tokens_sent);
+        }
+        for (label, n) in removed {
+            by_label.entry(label).or_default().removed += n;
         }
         for (label, input) in by_request {
-            by_label.entry(label).or_default().3 += input;
+            let slot = by_label.entry(label.clone()).or_default();
+            slot.request_input += input;
+            // v0.0.5 counted input for every request without counting them.
+            let n = counted
+                .get(&label)
+                .copied()
+                .unwrap_or_else(|| m.background_requests.get(&label).copied().unwrap_or(0));
+            slot.counted_requests += n;
+            if let Some(c) = cached.get(&label) {
+                slot.cached += c;
+                slot.cached_basis += m.background_cached_basis.get(&label).copied().unwrap_or(input);
+            }
         }
     }
     by_label
         .into_iter()
-        .map(|(label, (sessions, requests, input, request_input))| {
-            let sessions = (!REQUEST_ONLY_LABELS.contains(&label.as_str())).then_some(sessions);
-            json!({ "label": label, "sessions": sessions, "requests": requests, "input_tokens": input,
-                    "request_input_tokens": request_input })
+        .map(|(label, l)| {
+            let sessions = (!REQUEST_ONLY_LABELS.contains(&label.as_str())).then_some(l.sessions);
+            let counted_any = l.request_input > 0 || l.counted_requests > 0;
+            json!({ "label": label, "sessions": sessions, "requests": l.requests, "input_tokens": l.input,
+                    "request_input_tokens": l.request_input,
+                    // How many requests the input is counted for: fewer than `requests` for
+                    // records of versions before v0.0.5, which stored none by label.
+                    "input_counted_requests": if counted_any { l.counted_requests } else { 0 },
+                    "cached_tokens": (l.cached_basis > 0).then_some(l.cached),
+                    "uncached_tokens": (l.cached_basis > 0).then_some(l.cached_basis - l.cached),
+                    "cached_basis_tokens": l.cached_basis,
+                    "removed_tokens": l.removed })
         })
         .collect()
+}
+
+/// The approval reviewer's sessions and requests as the page's guardian line
+/// reports them: its sessions are reviewer threads (a fork or a replaced trunk
+/// each), not approvals, and its requests include resampled denials and
+/// retries. With the parent threads the requests belong to, and the measure
+/// of how much of each request's start the previous request of its parent
+/// shares ([`crate::guardian`]); an upper bound, and a measurement only.
+fn guardian_totals(records: &[UsageRecord]) -> Value {
+    use std::collections::BTreeSet;
+    let mut stats = crate::guardian::Stats::default();
+    let mut parents: BTreeSet<String> = BTreeSet::new();
+    let (mut threads, mut without_parent, mut requests) = (0u64, 0u64, 0u64);
+    let (mut single, mut single_input, mut thread_input) = (0u64, 0i64, 0i64);
+    for r in records
+        .iter()
+        .filter(|r| r.mode == BACKGROUND_MODE && is_proxy_mode(&r.mode))
+    {
+        let m: MonitorJson = serde_json::from_str(&r.monitor).unwrap_or_default();
+        if m.background.as_deref() != Some("guardian") {
+            continue;
+        }
+        threads += 1;
+        let n = m
+            .background_requests
+            .get("guardian")
+            .copied()
+            .filter(|n| *n > 0)
+            .unwrap_or(m.requests);
+        requests += n;
+        thread_input += r.input_tokens;
+        if n == 1 {
+            single += 1;
+            single_input += r.input_tokens;
+        }
+        match m.guardian_parent {
+            Some(p) => {
+                parents.insert(p);
+            }
+            None => without_parent += 1,
+        }
+        stats = stats.plus(&m.guardian);
+    }
+    json!({
+        "threads": threads, "requests": requests, "parents": parents.len(), "threads_without_parent": without_parent,
+        "requests_per_parent": (!parents.is_empty()).then(|| requests as f64 / parents.len() as f64),
+        "single_request_threads": single, "single_request_input_tokens": single_input, "thread_input_tokens": thread_input,
+        "with_previous": stats.with_previous, "long_prefix": stats.long_prefix,
+        "lcp_tokens": stats.lcp_tokens, "input_tokens": stats.input_tokens, "cached_tokens": stats.cached_tokens,
+        "shareable_uncached": stats.shareable_uncached,
+        // The same tokens weighted as the cost goal does (a cached token costs a tenth): x0.9.
+        "shareable_uncached_weighted": (stats.shareable_uncached as f64 * 0.9).round() as i64,
+        "splits": stats.splits,
+    })
 }
 
 /// The rows of the page's session table (`rows`, as the status gives them)
@@ -1271,10 +1496,14 @@ impl Daemon {
             last_repo: Mutex::new(None),
             tools: Mutex::new(BTreeMap::new()),
             instructions_tokens: AtomicU64::new(0),
+            graph_sizes: Mutex::new(None),
+            guardian_prev: Mutex::new(crate::guardian::Table::default()),
+            compact_cache: Mutex::new(None),
             traces: Mutex::new(Traces::default()),
             recorded: AtomicU64::new(0),
             clock_offset: AtomicI64::new(0),
             started: Instant::now(),
+            started_unix: unix_now(),
         });
         // A folder that went away, or one lge no longer indexes (a folder
         // Codex keeps for itself), is dropped from the list, not an error.
@@ -1299,19 +1528,26 @@ impl Daemon {
     /// True for a git folder Codex keeps for itself, never the user's
     /// repository: one whose `.git` carries Codex's baseline marker
     /// (`codex-baseline-version`, written each time Codex resets its memory
-    /// folder's baseline), or Codex's memory folder itself
-    /// (`<CODEX_HOME>/memories` or `memories_v2`), which a reset that was
-    /// cut short may have left without the marker.
+    /// folder's baseline), Codex's memory folder itself
+    /// (`<CODEX_HOME>/memories` or `memories_v2`), which a reset that was cut
+    /// short may have left without the marker, or any other folder inside
+    /// `CODEX_HOME` (plugin and skill clones, imports). The exception is
+    /// `<CODEX_HOME>/worktrees`: Codex's desktop app checks out the user's own
+    /// repositories there, and they stay indexable.
     fn codex_internal(&self, dir: &Path) -> bool {
         if dir.join(".git").join("codex-baseline-version").is_file() {
             return true;
         }
         let home = self.codex_home();
         let home = home.canonicalize().unwrap_or(home);
-        ["memories", "memories_v2"].iter().any(|name| {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if ["memories", "memories_v2"].iter().any(|name| {
             let memory = home.join(name);
             dir == memory || memory.canonicalize().is_ok_and(|m| dir == m)
-        })
+        }) {
+            return true;
+        }
+        dir.starts_with(&home) && !dir.starts_with(home.join("worktrees"))
     }
 
     /// Unix seconds, as this daemon counts them.
@@ -1405,6 +1641,7 @@ impl Daemon {
             root: root.clone(),
             state: Mutex::new(RepoState::Indexing),
             bulky: Mutex::new(Vec::new()),
+            index_seconds: Mutex::new(None),
         });
         if lock(&self.repos).insert(root.clone(), repo.clone()).is_some() {
             // Already known: index again with the existing entry replaced.
@@ -1419,10 +1656,12 @@ impl Daemon {
                 let repo = repo.clone();
                 std::thread::spawn(move || *lock(&repo.bulky) = lge_index::bulky_dirs(&repo.root))
             };
+            let started = Instant::now();
             let state = match daemon.open_repo(&repo.root) {
                 Ok(server) => RepoState::Ready(Box::new(server)),
                 Err(e) => RepoState::Failed(format!("{e:#}")),
             };
+            *lock(&repo.index_seconds) = Some(started.elapsed().as_secs_f64());
             // A repository listed as ready has its warnings too.
             let _ = bulky.join();
             *lock(&repo.state) = state;
@@ -1437,29 +1676,13 @@ impl Daemon {
     }
 
     fn graph_dir(&self, root: &Path) -> PathBuf {
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "root".to_string());
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        self.cfg
-            .data_dir
-            .join("graphs")
-            .join(format!("{safe}-{}", &stable_id(&[&root.to_string_lossy()])[..8]))
+        self.cfg.data_dir.join("graphs").join(crate::graphs::dir_name(root))
     }
 
     fn open_repo(&self, root: &Path) -> Result<lge_mcp::Server> {
         let dir = self.graph_dir(root);
         std::fs::create_dir_all(&dir)?;
+        crate::graphs::write_root(&dir, root);
         let store = Store::open(&dir.join("graph.lbug"))?;
         let index = IndexOptions {
             service_depth: guess_service_depth(root),
@@ -1584,6 +1807,7 @@ impl Daemon {
                 if let Some(label) = monitor.background.clone().filter(|_| record.mode == BACKGROUND_MODE) {
                     monitor.background_input.entry(label).or_insert(record.input_tokens);
                 }
+                seed_background_counts(&mut monitor);
                 // The items decided before the restart keep their bytes and are not counted again.
                 session.restore(std::mem::take(&mut monitor.ledger));
                 session.restore_would_add(monitor.contexts_would_add as usize);
@@ -1643,6 +1867,12 @@ impl Daemon {
             background: carried.monitor.background.clone(),
             background_requests: carried.monitor.background_requests.clone(),
             background_input: carried.monitor.background_input.clone(),
+            background_cached: carried.monitor.background_cached.clone(),
+            background_input_requests: carried.monitor.background_input_requests.clone(),
+            background_cached_basis: carried.monitor.background_cached_basis.clone(),
+            guardian_parent: carried.monitor.guardian_parent.clone(),
+            guardian: carried.monitor.guardian.clone(),
+            background_removed: carried.monitor.background_removed.clone(),
             waited_for_graph: false,
             carried,
             last_response_at: None,
@@ -1673,13 +1903,7 @@ impl Daemon {
         let key = thread
             .map(str::to_string)
             .or_else(|| seen.conversation.clone())
-            .unwrap_or_else(|| {
-                stable_id(&[
-                    "conversation",
-                    &seen.first_user_message,
-                    seen.cwd.as_deref().unwrap_or(""),
-                ])
-            });
+            .unwrap_or_else(|| stable_id(&["conversation", &seen.first_user_raw, seen.cwd.as_deref().unwrap_or("")]));
         let conv = self.conv_for(&key, &seen, background.as_deref());
         let (mut options, router_apply) = {
             let settings = lock(&self.settings);
@@ -1902,6 +2126,16 @@ impl Daemon {
                         t.last_called = Some(now);
                     }
                 }
+                // Called from inside an `exec` script: only its code-mode
+                // name (or the name lge gives it) appears in the request.
+                for def in &c.fixed.tools {
+                    let nested = |n: &String| *n == def.code_mode_name || *n == def.name;
+                    if seen.code_mode_calls.iter().any(nested) {
+                        if let Some(t) = tools.get_mut(&def.name) {
+                            t.last_called = Some(now);
+                        }
+                    }
+                }
             }
         }
         // Nothing was replaced or added: send the bytes exactly as they came.
@@ -1911,6 +2145,45 @@ impl Daemon {
         } else {
             body.to_vec()
         };
+        // The approval reviewer's requests: how much of each one's start the
+        // previous request of the same parent shares (measured on the bytes
+        // sent; nothing is changed).
+        let guardian = if label.as_deref() == Some("guardian") && !again {
+            let parent = origin
+                .parent_thread
+                .clone()
+                .or_else(|| {
+                    value
+                        .get("client_metadata")
+                        .and_then(|m| m.get("parent_thread_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    crate::responses::turn_metadata_field(origin.turn_metadata.as_deref(), &value, "parent_thread_id")
+                });
+            parent.map(|parent| {
+                let current = crate::guardian::Current {
+                    thread: thread.map(str::to_string),
+                    prompt_cache_key: value
+                        .get("prompt_cache_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    session_id: origin.session_id.clone(),
+                    lge_changed_bytes: changed,
+                };
+                let (observation, seq) =
+                    lock(&self.guardian_prev).observe(&parent, now, crate::guardian::signature(&value), current);
+                lock(&conv).guardian_parent = Some(stable_id(&["guardian-parent", &parent])[..12].to_string());
+                GuardianPending {
+                    parent,
+                    seq,
+                    observation,
+                }
+            })
+        } else {
+            None
+        };
         Some(Rewritten {
             body,
             changed,
@@ -1919,6 +2192,8 @@ impl Daemon {
             effort_changed,
             decided_record,
             conv,
+            request_at: now,
+            guardian,
             trace,
         })
     }
@@ -1935,14 +2210,29 @@ impl Daemon {
     /// `label`: the request's background label (or `compaction`), whose
     /// input tokens are counted by label. Every [`CHECK_EVERY`] records, the
     /// rules' recovery rates are checked.
-    fn record_usage(&self, conv: &Arc<Mutex<Conv>>, usage: Usage, label: Option<&str>) {
+    fn record_usage(
+        &self,
+        conv: &Arc<Mutex<Conv>>,
+        usage: Usage,
+        label: Option<&str>,
+        request_at: i64,
+        guardian: Option<&GuardianPending>,
+    ) {
         let now = self.now();
         let record = {
             let mut c = lock(conv);
+            if let Some(o) = guardian.and_then(|g| g.observation.as_ref()) {
+                c.guardian.add(o, usage.input_tokens, usage.cached_input_tokens);
+            }
             if let Some(label) = label {
                 *c.background_input.entry(label.to_string()).or_default() += usage.input_tokens;
+                *c.background_cached.entry(label.to_string()).or_default() += usage.cached_input_tokens;
+                *c.background_input_requests.entry(label.to_string()).or_default() += 1;
+                *c.background_cached_basis.entry(label.to_string()).or_default() += usage.input_tokens;
+                let removed = c.last_sent.0;
+                *c.background_removed.entry(label.to_string()).or_default() += removed;
             }
-            c.observe_response(now, &usage);
+            c.observe_response(request_at, now, &usage);
             c.record.input_tokens += usage.input_tokens;
             c.record.cached_input_tokens += usage.cached_input_tokens;
             c.record.output_tokens += usage.output_tokens;
@@ -2100,6 +2390,8 @@ impl Daemon {
             origin = Origin {
                 subagent: header(SUBAGENT_HEADER),
                 turn_metadata: header(TURN_METADATA_HEADER),
+                parent_thread: header("x-codex-parent-thread-id"),
+                session_id: header("session-id"),
             };
             rewritten = plain
                 .as_deref()
@@ -2307,7 +2599,16 @@ impl Daemon {
         // the numbers right after the answer ends sees them.
         if let Some(r) = &rewritten {
             if let Some(usage) = usage {
-                self.record_usage(&r.conv, usage, r.background.as_deref());
+                self.record_usage(
+                    &r.conv,
+                    usage,
+                    r.background.as_deref(),
+                    r.request_at,
+                    r.guardian.as_ref(),
+                );
+            }
+            if let Some(g) = &r.guardian {
+                lock(&self.guardian_prev).ended(&g.parent, g.seq, self.now());
             }
             self.trace(&r.conv, r.trace.clone(), status.as_u16(), retried, usage);
         }
@@ -2455,7 +2756,101 @@ impl Daemon {
             "services": stat("services"),
             "memories": stat("memories"),
             "bulky": bulky,
+            "index_seconds": *lock(&repo.index_seconds),
+            "graph_dir": crate::graphs::dir_name(&repo.root),
         })
+    }
+
+    /// The graph folders on disk (sizes read at most once a minute) with
+    /// whether the daemon lists the folder each was built for and whether that
+    /// folder still exists. A report: nothing is deleted here.
+    fn graphs_json(&self) -> Value {
+        let fresh = {
+            let mut cache = lock(&self.graph_sizes);
+            if cache
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(60))
+            {
+                *cache = Some((Instant::now(), crate::graphs::list(&self.cfg.data_dir)));
+            }
+            cache.as_ref().map(|(_, g)| g.clone()).unwrap_or_default()
+        };
+        let listed: std::collections::HashSet<String> =
+            lock(&self.repos).keys().map(|r| crate::graphs::dir_name(r)).collect();
+        let rows: Vec<Value> = fresh
+            .iter()
+            .map(|g| {
+                json!({
+                    "dir": g.name,
+                    "path": self.cfg.data_dir.join("graphs").join(&g.name).to_string_lossy(),
+                    "root": g.root.as_ref().map(|r| r.to_string_lossy().to_string()),
+                    "bytes": g.bytes,
+                    "listed": listed.contains(&g.name),
+                    "exists": g.root.as_ref().map(|r| r.is_dir()),
+                })
+            })
+            .collect();
+        let unused = |r: &Value| r["listed"] == false;
+        let (n, bytes) = rows
+            .iter()
+            .filter(|r| unused(r))
+            .fold((0u64, 0u64), |(n, b), r| (n + 1, b + r["bytes"].as_u64().unwrap_or(0)));
+        json!({
+            "graphs": rows,
+            "total_bytes": rows.iter().map(|r| r["bytes"].as_u64().unwrap_or(0)).sum::<u64>(),
+            "unlisted": n,
+            "unlisted_bytes": bytes,
+        })
+    }
+
+    /// The compaction what-if from the rollouts of the last 30 days, read only
+    /// and never inside `status()`: cached in memory for ten minutes and made
+    /// again when a rollout changed. The answer says nothing about the
+    /// configuration, which lge never writes.
+    fn compact_whatif(&self) -> Result<Value> {
+        let home = self
+            .cfg
+            .codex_home
+            .clone()
+            .ok_or_else(|| anyhow!("no agent home folder is configured (mount ~/.codex and set LGE_CODEX_HOME)"))?;
+        let days = 30;
+        let mut signature = String::new();
+        for f in lge_usage::rollout_files(&home, unix_now() - days * 86_400) {
+            let m = std::fs::metadata(&f).ok();
+            let mtime = m
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            signature.push_str(&format!("{}:{}:{};", f.display(), mtime, m.map_or(0, |m| m.len())));
+        }
+        if let Some((sig, at, value)) = lock(&self.compact_cache).as_ref() {
+            if *sig == signature && at.elapsed() < Duration::from_secs(600) {
+                return Ok(value.clone());
+            }
+        }
+        let opts = lge_usage::compact::Options {
+            config: lge_usage::compact::read_config(&home),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(lge_usage::compact::whatif(&home, days, None, &opts))?;
+        *lock(&self.compact_cache) = Some((signature, Instant::now(), value.clone()));
+        Ok(value)
+    }
+
+    /// Delete the graph folder of a project folder or by name, after a person
+    /// asked: refused for a listed folder. Returns the bytes freed.
+    fn delete_graph(&self, root: Option<&Path>, dir: Option<&str>) -> Result<Value> {
+        let name = match (dir, root) {
+            (Some(d), _) => d.to_string(),
+            (None, Some(r)) => crate::graphs::dir_name(r),
+            (None, None) => bail!("`path` or `dir` is required"),
+        };
+        let listed: std::collections::HashSet<String> =
+            lock(&self.repos).keys().map(|r| crate::graphs::dir_name(r)).collect();
+        let bytes = crate::graphs::delete(&self.cfg.data_dir, &name, &listed)?;
+        *lock(&self.graph_sizes) = None;
+        Ok(json!({ "deleted": name, "bytes": bytes }))
     }
 
     fn status(&self) -> Value {
@@ -2540,9 +2935,10 @@ impl Daemon {
         };
         let mut recent: Vec<&UsageRecord> = records.iter().filter(|r| is_proxy_mode(&r.mode)).collect();
         recent.sort_by_key(|r| std::cmp::Reverse(r.finished_at));
-        let sessions: Vec<Value> = recent
+        // One row per stored session, newest first. The note on long sessions
+        // reads all of them; the table shows a window (below).
+        let all_rows: Vec<Value> = recent
             .iter()
-            .take(50)
             .map(|r| {
                 let current = live.get(&r.id).cloned();
                 let (s, repo) = current
@@ -2571,7 +2967,7 @@ impl Daemon {
                     "mean_input_tokens": requests.map(|n| mean_input(r, n)),
                     "packs_added": packs_added_of(&m), "packs_known": m.packs_known,
                     "packs_over_budget": m.packs_over_budget, "packs_too_large": m.packs_too_large,
-                    "packs_retired": m.packs_retired,
+                    "packs_retired": m.packs_retired, "packs_no_graph": m.packs_no_graph,
                     "started_at": r.started_at, "finished_at": r.finished_at,
                     "input_tokens": r.input_tokens, "cached_input_tokens": r.cached_input_tokens,
                     "output_tokens": r.output_tokens, "reasoning_tokens": r.reasoning_tokens,
@@ -2586,6 +2982,25 @@ impl Daemon {
                     "cold_restarts": m.cold_restarts, "cold_tokens": m.cold_tokens, "raw_retries": m.raw_retries,
                 })
             })
+            .collect();
+
+        // The table: the newest ORDINARY_ROWS sessions that are not Codex's
+        // background ones, and the newest BACKGROUND_ROWS of those, so that
+        // hundreds of approvals cannot push a long session out of it.
+        let long_sessions = long_sessions(&all_rows);
+        let (mut ordinary, mut background) = (0usize, 0usize);
+        let sessions: Vec<Value> = all_rows
+            .iter()
+            .filter(|row| {
+                let (count, limit) = if row["mode"] == BACKGROUND_MODE {
+                    (&mut background, BACKGROUND_ROWS)
+                } else {
+                    (&mut ordinary, ORDINARY_ROWS)
+                };
+                *count += 1;
+                *count <= limit
+            })
+            .cloned()
             .collect();
 
         let settings = lock(&self.settings).clone();
@@ -2635,11 +3050,18 @@ impl Daemon {
             g.3 = g.3.max(t.requests_seen);
         }
         let instructions_tokens = self.instructions_tokens.load(Ordering::Relaxed);
+        // The tools of each group, to tell sub-agent tools by their names.
+        let mut group_tools: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, t) in tools.iter() {
+            group_tools.entry(t.group.clone()).or_default().push(name.clone());
+        }
+        let home = self.cfg.codex_home.as_deref();
         let mut group_rows: Vec<Value> = groups
             .iter()
             .map(|(group, (mcp, n, tokens, requests))| {
+                let names = group_tools.get(group).map(Vec::as_slice).unwrap_or(&[]);
                 json!({ "group": group, "mcp": mcp, "tools": n, "tokens": tokens, "requests_seen": requests,
-                        "config": if *mcp { format!("[mcp_servers.{group}]") } else { String::new() } })
+                        "config": crate::config_hint::config_hint(group, None, *mcp, names, home) })
             })
             .collect();
         group_rows.sort_by_key(|g| std::cmp::Reverse(g["tokens"].as_u64().unwrap_or(0)));
@@ -2649,13 +3071,15 @@ impl Daemon {
         let ghost_tools: Vec<Value> = ghosts
             .iter()
             .map(|(name, t)| {
+                let names = group_tools.get(&t.group).map(Vec::as_slice).unwrap_or(&[]);
                 json!({ "name": name, "group": t.group, "mcp": t.mcp, "tokens": t.tokens, "requests_seen": t.requests_seen,
-                        "config": if t.mcp { format!("[mcp_servers.{}]", t.group) } else { String::new() } })
+                        "config": crate::config_hint::config_hint(&t.group, Some(name), t.mcp, names, home) })
             })
             .collect();
         let conversations: Vec<Value> = recent
             .iter()
-            .take(50)
+            .filter(|r| r.mode != BACKGROUND_MODE)
+            .take(ORDINARY_ROWS)
             .map(|r| {
                 let m = monitor_of(r);
                 json!({ "id": r.session_id, "task": r.task, "lge_breaks": m.prefix.lge_breaks, "client_breaks": m.prefix.client_breaks,
@@ -2700,12 +3124,22 @@ impl Daemon {
         // were not. What the held-out sessions would have added, apart.
         let mut packs = [0u64; 5];
         let mut would_add = 0u64;
+        let (mut at_limit, mut at_limit_live, mut no_graph) = (0u64, 0u64, 0u64);
+        let (mut unread_outputs, mut unread_tokens, mut tokens_seen) = (0u64, 0u64, 0u64);
         for r in records.iter().filter(|r| is_proxy_mode(&r.mode)) {
             let m = monitor_of(r);
+            if r.mode != BACKGROUND_MODE && m.ab_arm.is_none() {
+                unread_outputs += m.unread_script_outputs;
+                unread_tokens += m.unread_script_tokens;
+                tokens_seen += m.output_tokens_seen;
+            }
             if r.mode == "proxy-holdout" {
                 would_add += m.contexts_would_add;
                 continue;
             }
+            no_graph += m.packs_no_graph;
+            at_limit += m.packs_at_limit;
+            at_limit_live += m.packs_at_limit_live_would_add;
             for (slot, n) in packs.iter_mut().zip([
                 packs_added_of(&m),
                 m.packs_known,
@@ -2717,8 +3151,11 @@ impl Daemon {
             }
         }
         let background = background_totals(&records);
-        let long_sessions = long_sessions(&sessions);
 
+        // Counted from the conversations live in this daemon, each change
+        // once; not from the stored sessions.
+        let mut saved_json = serde_json::to_value(&saved).unwrap_or(Value::Null);
+        saved_json["since"] = json!(self.started_unix);
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.started.elapsed().as_secs(),
@@ -2730,8 +3167,10 @@ impl Daemon {
             "settings": settings,
             "settings_error": *lock(&self.settings_error),
             "repos": repos,
+            "graphs": self.graphs_json(),
+            "stored_records": records.len(),
             "modes": modes,
-            "saved": saved,
+            "saved": saved_json,
             "sessions": sessions,
             "rules": rules,
             "thresholds": { "min_judged": MIN_JUDGED, "demote_above": DEMOTE_ABOVE, "healthy_below": HEALTHY_BELOW, "window_days": WINDOW_SECONDS / 86_400 },
@@ -2747,12 +3186,21 @@ impl Daemon {
             "monitor": { "raw_retries": raw_retries, "cold_restarts": cold_restarts, "cold_tokens": cold_tokens, "lge_breaks": lge_breaks, "client_breaks": client_breaks },
             "annuity": { "removed_tokens_sent": removed, "added_tokens_sent": added, "net_tokens": removed - added },
             "packs": {
+                "no_graph": no_graph,
                 "added": packs[0], "known": packs[1], "over_budget": packs[2], "retired": packs[3], "too_large": packs[4],
                 "tokens_sent": added, "tokens_sent_uncounted": tokens_uncounted,
                 "tokens_sent_background": tokens_background, "since": packs_since,
                 "holdout_would_add": would_add,
+                "at_limit": at_limit, "at_limit_live_would_add": at_limit_live,
+            },
+            // Outputs of scripts lge could not match to a command, of 400 tokens or more,
+            // over the tool output tokens decided in the same sessions. A count.
+            "unread_scripts": {
+                "outputs": unread_outputs, "tokens": unread_tokens, "tool_output_tokens": tokens_seen,
+                "share": (tokens_seen > 0).then(|| unread_tokens as f64 / tokens_seen as f64),
             },
             "background": background,
+            "guardian": guardian_totals(&records),
             "long_sessions": long_sessions,
         })
     }
@@ -2787,7 +3235,7 @@ impl Daemon {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+                if !lge_usage::is_rollout_file_name(&name) {
                     continue;
                 }
                 let Ok(session) = lge_usage::parse_rollout_file(&path) else {
@@ -2875,7 +3323,21 @@ impl Daemon {
         let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let path_arg = || body.get("path").and_then(Value::as_str).map(PathBuf::from);
         let result: Result<Value> = match (method, path) {
-            (Method::Get, "/lge/api/status") => Ok(self.status()),
+            (Method::Get, "/lge/api/status") => {
+                let began = Instant::now();
+                let status = self.status();
+                // The page asks every 3 seconds and each call reads every stored
+                // record: say so in the log when it gets slow (measure before caching).
+                let ms = began.elapsed().as_millis();
+                if ms > STATUS_SLOW_MS {
+                    eprintln!(
+                        "lge: status took {ms} ms over {} stored records",
+                        status["stored_records"].as_u64().unwrap_or(0)
+                    );
+                }
+                Ok(status)
+            }
+            (Method::Get, "/lge/api/compact-whatif") => self.compact_whatif(),
             (Method::Get, "/lge/api/browse") => Ok(self.browse(query_value(query, "path"))),
             (Method::Post, "/lge/api/repos") => path_arg()
                 .ok_or_else(|| anyhow!("`path` is required"))
@@ -2887,6 +3349,11 @@ impl Daemon {
                     .or_else(path_arg)
                     .ok_or_else(|| anyhow!("`path` is required"));
                 path.map(|p| json!({ "removed": self.remove_repo(&p) }))
+            }
+            (Method::Delete, "/lge/api/graphs") => {
+                let dir = query_value(query, "dir");
+                let root = query_value(query, "path").map(PathBuf::from).or_else(path_arg);
+                self.delete_graph(root.as_deref(), dir.as_deref())
             }
             (Method::Post, "/lge/api/settings") => serde_json::from_value::<SettingsPatch>(body.clone())
                 .map_err(|e| anyhow!("{e}"))
@@ -3045,6 +3512,45 @@ fn browse_listing(path: Option<&str>, workspaces: &[PathBuf], home: Option<&Path
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_background_session_stored_before_the_upgrade_keeps_its_counts_when_more_requests_are_added() {
+        let mut monitor = MonitorJson {
+            background: Some("compaction".into()),
+            background_requests: BTreeMap::from([("compaction".to_string(), 3)]),
+            background_input: BTreeMap::from([("compaction".to_string(), 300_000)]),
+            ..MonitorJson::default()
+        };
+        seed_background_counts(&mut monitor);
+        // One more request after the restart, as record_usage counts it.
+        *monitor.background_input.get_mut("compaction").unwrap() += 100_000;
+        *monitor.background_cached.entry("compaction".into()).or_default() += 90_000;
+        *monitor.background_input_requests.get_mut("compaction").unwrap() += 1;
+        *monitor.background_cached_basis.entry("compaction".into()).or_default() += 100_000;
+        *monitor.background_removed.entry("compaction".into()).or_default() += 500;
+        monitor.background_requests.insert("compaction".into(), 4);
+        let record = UsageRecord {
+            mode: BACKGROUND_MODE.into(),
+            input_tokens: 400_000,
+            cached_input_tokens: 90_000,
+            removed_tokens_sent: 2_000,
+            monitor: serde_json::to_string(&monitor).unwrap(),
+            ..UsageRecord::default()
+        };
+        let rows = background_totals(&[record]);
+        let row = &rows[0];
+        assert_eq!(row["request_input_tokens"], 400_000);
+        assert_eq!(row["input_counted_requests"], 4, "the three before and the new one");
+        assert_eq!(row["cached_tokens"], 90_000);
+        assert_eq!(
+            row["cached_basis_tokens"], 100_000,
+            "cached counts exist for the new request only"
+        );
+        assert_eq!(row["uncached_tokens"], 10_000);
+        assert_eq!(
+            row["removed_tokens"], 2_000,
+            "the session's own total covers the earlier requests"
+        );
+    }
 
     #[test]
     fn the_effort_is_only_ever_lowered() {
@@ -3363,6 +3869,12 @@ mod tests {
             background: None,
             background_requests: BTreeMap::new(),
             background_input: BTreeMap::new(),
+            background_cached: BTreeMap::new(),
+            background_input_requests: BTreeMap::new(),
+            background_cached_basis: BTreeMap::new(),
+            guardian_parent: None,
+            guardian: crate::guardian::Stats::default(),
+            background_removed: BTreeMap::new(),
             waited_for_graph: false,
             carried: Carried::default(),
             raw_retries: 0,
@@ -3378,17 +3890,61 @@ mod tests {
             cached_input_tokens: cached,
             ..Usage::default()
         };
-        conv.observe_response(1000, &usage(50_000, 0));
-        conv.observe_response(1100, &usage(52_000, 1000));
+        conv.observe_response(950, 1000, &usage(50_000, 0));
+        conv.observe_response(1050, 1100, &usage(52_000, 1000));
         assert_eq!(conv.cold_restarts, 0, "no gap");
-        conv.observe_response(1500, &usage(53_000, 40_000));
+        conv.observe_response(1450, 1500, &usage(53_000, 40_000));
         assert_eq!(conv.cold_restarts, 0, "a gap, but the cache held");
-        conv.observe_response(2000, &usage(54_000, 3_000));
+        conv.observe_response(1950, 2000, &usage(54_000, 3_000));
         assert_eq!((conv.cold_restarts, conv.cold_tokens), (1, 50_000));
         conv.last_input_tokens = 1000;
-        conv.observe_response(3000, &usage(2000, 0));
+        conv.observe_response(2950, 3000, &usage(2000, 0));
         assert_eq!(conv.cold_restarts, 1, "too small to matter");
         assert_eq!(conv.monitor_json().cold_restarts, 1);
+    }
+
+    #[test]
+    fn time_the_model_takes_to_answer_is_not_an_idle_gap() {
+        let mut conv = Conv {
+            key: "k".into(),
+            session: Session::default(),
+            record: UsageRecord::default(),
+            repo: None,
+            requests: 0,
+            routed: false,
+            holdout: false,
+            background: None,
+            background_requests: BTreeMap::new(),
+            background_input: BTreeMap::new(),
+            background_cached: BTreeMap::new(),
+            background_input_requests: BTreeMap::new(),
+            background_cached_basis: BTreeMap::new(),
+            guardian_parent: None,
+            guardian: crate::guardian::Stats::default(),
+            background_removed: BTreeMap::new(),
+            waited_for_graph: false,
+            carried: Carried::default(),
+            raw_retries: 0,
+            cold_restarts: 0,
+            cold_tokens: 0,
+            last_response_at: None,
+            last_input_tokens: 0,
+            fixed: FixedPrefix::default(),
+            last_sent: (0, 0),
+        };
+        let usage = |input, cached| Usage {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            ..Usage::default()
+        };
+        conv.observe_response(950, 1000, &usage(50_000, 0));
+        // Sent 200 s after the previous response, answered after 200 s more:
+        // the cache had not expired when the request came.
+        conv.observe_response(1200, 1400, &usage(52_000, 1000));
+        assert_eq!(conv.cold_restarts, 0);
+        // Sent 400 s after the previous response ended.
+        conv.observe_response(1800, 1850, &usage(54_000, 1000));
+        assert_eq!((conv.cold_restarts, conv.cold_tokens), (1, 51_000));
     }
 
     #[test]

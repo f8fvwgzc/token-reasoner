@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.0.6 (2026-11-20)
+
+Two days of real use showed numbers that mixed scopes, a few measurements that were wrong
+or missing, and a task label that was only Codex's context. This release fixes those and
+adds measurements; the opt-in rules that change a request stay as they were. lge still
+never changes the model, the system prompt, tool definitions, reasoning items, tool calls,
+patches or diffs, never raises the reasoning effort (and lowers it only with
+`router_apply` on), and never edits Codex's configuration. No saving is measured yet.
+
+### What lge reads as your request
+
+- When a typed message starts with a `#` heading and has a line `## My request for
+  Codex:`, the task on the page, the router and a new pack decision use what follows the
+  first such line. A message without the heading, or without the line, is read whole. A
+  message with nothing after the line (attachments only) is not the task.
+- Image and audio label lines (`<image name=...>`, `</image>`, `<audio...`) are left out of
+  that text.
+- The pack's name in the ledger, the typed-message dedupe and the key of a conversation
+  without a cache key still use the whole message, so earlier items are sent again as they
+  were, a restart included, and lge breaks stay 0.
+- On the page a mention link `[$name](path)` shows as `$name`.
+
+### The page's numbers
+
+- **`read_delta` (measure only).** A narrower re-read after an edit is compared with its
+  own lines of the earlier read. Before, it was compared with the whole earlier read and
+  never measured, so the shadow count was too low.
+- **Skeleton shadow.** A file counts once, as in `on`, where its next read is sent whole.
+  Re-reads that a `repeat_pointer` replaces, or another window of the file, no longer add
+  to "would save". A restart can count a file once more.
+- **"Never called" tools.** A tool called from inside an `exec` script (`tools.name(...)`)
+  counts as called. A name in a comment or string counts too.
+- **Long sessions and the table.** Rows are built for every stored session. The long-session
+  note and the per-conversation cache table read all of them; the session table lists the
+  newest 50 ordinary sessions and the newest 10 background ones. Before, hundreds of
+  background sessions pushed a long session out.
+- **Cards.** "Removed from tool output" and "Graph context added" say they count the
+  conversations live in this daemon since it started, each change once. New cards "Kept out
+  of requests" and "Packs sent" give the stored totals. `status.saved.since` is new.
+- **Cold restarts.** The gap is the time between the previous response's end and the new
+  request's arrival, so the time the model and tools took is not idle time.
+- **Background table.** Cached and uncached input by label; "-" where a record has none; the
+  compaction row shows "-" instead of 0 when no request counted input.
+- **Holdout.** An arm with no sessions shows "-", not medians of 0.
+
+### Folders
+
+- Any git folder inside Codex's home is Codex's own and is never indexed, except inside
+  `<home>/worktrees`. The marker check and the memory-folder check stay.
+- Each graph records its folder (`root.txt`). The page and `lge graphs` list graphs with
+  size and state; removing a folder from the list says its graph's size and path;
+  `lge graphs --delete <name> --yes` or the page deletes one after confirmation and refuses
+  a listed folder's graph. Nothing deletes one by itself.
+- The folder list shows each index's last duration.
+- `import-history` also reads `rollout-*.jsonl.zst`; a file that does not decompress counts
+  as unreadable.
+
+### New measurements (nothing changes in a request)
+
+- **Scripts lge could not read:** outputs of 400 tokens or more of code-mode scripts that
+  lge cannot split per command, counted once each, with their tokens and share.
+- **Approval reviewer:** sessions are shown as reviewer threads with parents, single-request
+  threads and requests per parent; for each request the shared start with the previous
+  request of its parent (per item, estimated) is set against the cached tokens, split by
+  cause. Only hashes and counts are kept.
+- **Packs:** typed messages that met the 6-pack limit, with those a live-only count would
+  have added, and typed messages first seen with no graph yet.
+- **Configuration entry** advice for sub-agent tools, `request_user_input` and MCP servers
+  or their plugin; lge writes nothing.
+- A `status_ms` line in `serve.log` when the status call takes over 200 ms.
+
+### What if Codex compacted sooner? (an estimate)
+
+- New `lge usage compact-whatif [--days 30] [--limits ...] [--session <id>]
+  [--rework-tokens 0] [--json] [--explain]`, `GET /lge/api/compact-whatif` and a collapsed
+  block on the page under the long-session note. It reads the long sessions in
+  `~/.codex/sessions` (the usage records and compaction markers Codex wrote) and replays
+  them at other limits next to a run at the session's own limit, with its error. A limit
+  that would compact every few requests is marked thrash. It writes nothing and changes no
+  request.
+
+### Not verified
+
+- The layout of Codex desktop's file preamble is not public; only a message with the
+  `## My request for Codex:` line is cut. A real capture is needed.
+- The compaction estimate is checked against synthetic rollouts only (exact on a clean
+  series, within 5% on a noisy one); it has not run against the real Codex rollouts, and a
+  session is matched to a stored one by id only.
+- The guardian measure uses item-level estimates; it says what is shareable, not that a
+  routing change would recover it.
+- Configuration keys were checked against Codex 0.160.0 only; the narrower multi-agent v2
+  keys are left out.
+- Scripts lge could not read are counted, not read; whether reading them pays is open.
+- Records from before v0.0.5 have no input by label or cached counts; the page shows
+  "-" or a partial note.
+- None of this has run in a browser or against a real Codex yet.
+
 ## v0.0.5 (2026-11-18)
 
 The first full day of real use showed page numbers that mixed versions and kinds of

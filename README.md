@@ -23,7 +23,24 @@ and two ways of measuring a difference are built in: `lge ab` runs your own task
 off and on, and a holdout share of conversations runs with every rule measured but not
 applied.
 
-What v0.0.5 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+What v0.0.6 adds (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
+
+- **A pack is read from what you asked.** When Codex puts context before your text
+  (`## My request for Codex:`), the task, the router and a new pack use the request, not
+  the context; what lge sends for earlier messages stays the same bytes.
+- **Fewer wrong numbers.** `read_delta` measures a narrower re-read against its own lines;
+  the skeleton shadow counts a file once; the "Never called" table sees tools called from
+  inside `exec` scripts; a cold restart is judged on idle time before the request; a long
+  session is no longer hidden by hundreds of background sessions; the cards say what they
+  count; Codex's own folders under its home are never indexed; compressed (`.zst`)
+  rollouts are imported.
+- **New measurements.** Scripts lge could not read, the approval reviewer's shareable
+  prefix, packs lost to the limit or a missing graph, graph sizes (with a confirmed delete),
+  cached input of background labels, and advice for turning tool groups off.
+- **`lge usage compact-whatif`**, and a page block: what a different Codex compaction limit
+  would have cost, replayed from your rollouts. An estimate only.
+
+What v0.0.5 added (details in [CHANGELOG.md](CHANGELOG.md) and [docs/PROXY.md](docs/PROXY.md)):
 
 - **Page numbers that compare like with like.** Sessions of Codex's background requests
   stored by older versions (told by Codex's own prompts) count as background ones; a
@@ -286,7 +303,11 @@ Tools the agent gets over MCP:
    it the first time Codex works there.
 3. Use Codex as usual.
 
-The page shows, per session: requests and input tokens per request, input tokens, the
+The cards at the top count two ways, and say so: sessions, input and output cover every
+stored session; "Removed from tool output" and "Graph context added" cover the
+conversations live in this daemon since it started, each change counted once (the cards
+"Kept out of requests" and "Packs sent" give the stored totals, on every request that
+carried them). The page shows, per session: requests and input tokens per request, input tokens, the
 share that was cached, output and reasoning tokens, what lge removed from tool output,
 what graph context it added, and the tokens not sent over every request net of lge's own
 packs. Codex's background requests (the approval reviewer, reviews, task titles and
@@ -317,6 +338,9 @@ its input again on every request. The page names the sessions (background ones a
 `lge ab` runs aside) with at least 50 requests and more than 150,000 input tokens per
 request on average, the latest first, with when each last ran. What to do about it is
 your choice; lge only reports it and never edits Codex's configuration.
+`lge usage compact-whatif [--days 30] [--limits 100000,150000,200000] [--session <id>] [--json] [--explain]`,
+and the collapsed "What if Codex compacted sooner?" block on the page, replay the long sessions of
+`~/.codex` at other limits: an estimate, never a measured saving (see docs/PROXY.md).
 Two options:
 
 - Start a new session per task.
@@ -358,6 +382,7 @@ lge memory retain "Tokens expire after 15 minutes" --kind decision --key auth.to
 lge memory recall "token expiry"
 lge usage report                # tokens per task
 lge usage discover              # past Codex sessions through every rule (reads only)
+lge usage compact-whatif        # what a lower compaction limit would cost: an estimate (reads only)
 lge check                       # lint, types, tests: failures only
 lge ab tasks.toml               # A/B: each task with lge off and on (spends tokens)
 lge init --write                # the AGENTS.md rule; --terse, --batch: see section 4

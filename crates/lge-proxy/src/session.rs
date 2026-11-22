@@ -113,6 +113,10 @@ impl Options {
     }
 }
 
+/// Smallest output counted as an unread script output: shorter ones could
+/// never be shortened ([`crate::shorten`] needs 400 tokens).
+const UNREAD_MIN_TOKENS: usize = 400;
+
 /// Token counts of what the proxy changed, for the savings report. Each item
 /// is counted once, when it is first decided.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -146,6 +150,21 @@ pub struct Saved {
     pub contexts_too_large: usize,
     /// Packs no longer inserted after the client compacted its history.
     pub contexts_retired: usize,
+    /// Outputs of code-mode scripts lge could not match to a command (a loop,
+    /// a computed command, merged prints), of 400 tokens or more, and their
+    /// tokens. A plain counter: it changes nothing that is sent.
+    pub unread_script_outputs: usize,
+    pub unread_script_tokens: u64,
+    /// Typed messages with a strong starting point that got no pack because
+    /// the conversation was at its limit of packs (retired ones count).
+    pub contexts_at_limit: usize,
+    /// Of those, the ones a limit counting live packs only would have let
+    /// through (shadow: nothing is sent).
+    pub contexts_at_limit_live_would_add: usize,
+    /// Typed messages first seen with no graph for their folder (no pack, for good).
+    pub contexts_no_graph: usize,
+    /// Tokens of every tool output decided (the base of the unread share).
+    pub output_tokens_seen: u64,
 }
 
 impl Saved {
@@ -322,6 +341,7 @@ struct RequestLog {
     judged_added: Vec<(String, Pending)>,
     pending_added: Vec<String>,
     files_added: Vec<String>,
+    shadow_files_added: Vec<String>,
     /// Tokens not sent because of replaced items present in this request.
     removed_present: i64,
     /// Tokens of the context items present in this request.
@@ -411,6 +431,11 @@ pub struct Session {
     /// Files a skeleton was sent for. The next read of such a file is sent
     /// whole: the reader asked again, so it needs what was left out.
     shortened_files: BTreeSet<String>,
+    /// Files whose skeleton was counted in shadow. A re-read is counted again
+    /// by neither shadow nor `on` (the skeleton is not made for a file asked
+    /// for twice), so the shadow total says what `on` would save. Kept in
+    /// memory only: a restart can count a file once more.
+    shadow_files: BTreeSet<String>,
     /// Symbols and files the conversation is about, from the packs so far.
     relevant_symbols: BTreeSet<String>,
     relevant_files: BTreeSet<String>,
@@ -634,10 +659,14 @@ pub(crate) struct Draft {
     follow: Vec<(RuleId, bool, Facts)>,
     /// A skeleton was sent for this repository-relative file.
     shortened_file: Option<String>,
+    /// A skeleton was counted in shadow for this repository-relative file.
+    shadow_file: Option<String>,
     /// The skeleton cohort of an eligible first read, and what it would save.
     cohort: Option<(String, u64)>,
     condensed: bool,
     raw_call: bool,
+    /// The output of a script lge could not read (counted, nothing more).
+    pub unread: bool,
     /// Decided again from the ledger after a restart: counted before, so not
     /// counted, watched or reverted again.
     pub pinned: bool,
@@ -820,9 +849,25 @@ impl Session {
         before: &Before,
         opts: &Options,
     ) -> Option<String> {
+        self.context_after_request(graph, user_text, user_text, before, opts)
+    }
+
+    /// [`Session::context_after`] for a message whose request is only part of
+    /// its text: `user_text` is the whole message (it names the pack in the
+    /// ledger, so every decision of an earlier version still matches), and
+    /// `request` is what the user asked, after the context Codex or its IDE
+    /// put in front. A new decision (starting points, the size guard, the
+    /// pack, the words of the conversation) is made from `request` alone.
+    pub fn context_after_request(
+        &mut self,
+        graph: Option<&Graph>,
+        user_text: &str,
+        request: &str,
+        before: &Before,
+        opts: &Options,
+    ) -> Option<String> {
         let id = key(&["context", user_text]);
-        let lk = ledger_key(&id);
-        let kept = self.context_of(graph, &id, &lk, user_text, before, opts);
+        let kept = self.context_of(graph, &id, user_text, request, before, opts);
         // A held-out conversation counts what it would have added the same way.
         if kept.is_some() || opts.holdout {
             let seeds = self.pack_seeds.get(&id).cloned().unwrap_or_default();
@@ -835,15 +880,21 @@ impl Session {
         &mut self,
         graph: Option<&Graph>,
         id: &str,
-        lk: &str,
         user_text: &str,
+        request: &str,
         before: &Before,
         opts: &Options,
     ) -> Option<String> {
+        let lk = ledger_key(id);
+        let lk = lk.as_str();
         if let Some(known) = self.contexts.get(id).cloned() {
             return self.keep_or_retire(lk, known?, before, opts);
         }
-        let words: BTreeSet<String> = split_words(user_text).into_iter().collect();
+        // A message decided before the restart keeps the words and the text
+        // it was decided with; a new one is read from its request.
+        let decided_before = self.ledger.contexts.contains_key(lk);
+        let request = if decided_before { user_text } else { request };
+        let words: BTreeSet<String> = split_words(request).into_iter().collect();
         self.words.extend(words.iter().cloned());
         // Decided before the daemon restarted: the same bytes, counted once.
         // A pack whose text the ledger keeps is sent as it was; one of an
@@ -870,7 +921,13 @@ impl Session {
             self.contexts.insert(id.to_string(), again.clone());
             return self.keep_or_retire(lk, again?, before, opts);
         }
-        let decided = graph.and_then(|graph| self.decide_context(graph, id, user_text, &words, before, opts));
+        // A new message seen while its folder has no graph yet (the first index
+        // is still running, or the folder is not indexed) gets no pack for good:
+        // counted, so the page can say how often that happens.
+        if graph.is_none() && opts.inject_context && user_text.len() <= 8000 {
+            self.saved.contexts_no_graph += 1;
+        }
+        let decided = graph.and_then(|graph| self.decide_context(graph, id, request, &words, before, opts));
         let kept = match decided {
             Some(d) if opts.holdout => {
                 self.saved.contexts_would_add += 1;
@@ -966,9 +1023,10 @@ impl Session {
     ) -> Option<Decided> {
         let packs =
             self.saved.contexts_added + self.saved.contexts_would_add + self.pinned_contexts + self.pinned_would_add;
-        if !opts.inject_context || packs >= opts.max_contexts || user_text.len() > 8000 {
+        if !opts.inject_context || user_text.len() > 8000 {
             return None;
         }
+        let at_limit = packs >= opts.max_contexts;
         let seeds = find_seeds(graph.store, user_text, &SeedOptions::default()).ok()?;
         let strong = seeds.iter().any(|s| {
             s.exact || {
@@ -980,6 +1038,17 @@ impl Session {
             }
         });
         if !strong {
+            return None;
+        }
+        if at_limit {
+            // A message that would have got a pack, declined for the limit.
+            // The limit counts retired packs too; shadow-count the ones a
+            // limit on live packs only would have let through (retired
+            // since this daemon started: a measure, nothing is sent).
+            self.saved.contexts_at_limit += 1;
+            if packs.saturating_sub(self.saved.contexts_retired) < opts.max_contexts {
+                self.saved.contexts_at_limit_live_would_add += 1;
+            }
             return None;
         }
         // Nothing new to say: the packs before the message give these starting
@@ -1233,7 +1302,7 @@ impl Session {
     /// A recognised run is never also taken for a search. Decided once per
     /// distinct text and repeated exactly afterwards.
     pub fn rewrite_text(&mut self, output: &str, opts: &Options) -> Option<String> {
-        self.decide_content("", output, RunStatus::default(), false, opts)
+        self.decide_content("", output, RunStatus::default(), false, false, opts)
     }
 
     /// Start a request: forget which items were new in the last one, and keep
@@ -1311,6 +1380,9 @@ impl Session {
         }
         for f in &log.files_added {
             self.shortened_files.remove(f);
+        }
+        for f in &log.shadow_files_added {
+            self.shadow_files.remove(f);
         }
         // The retry decides them again, the same way.
         for k in &log.retired_added {
@@ -1488,6 +1560,11 @@ impl Session {
         let Some((rel, would)) = self.file_skeleton(graph, path, cwd, chain.original, numbered) else {
             return;
         };
+        // In shadow, a file counted once is not counted again: in `on` its
+        // next read is sent whole.
+        if chain.opts.mode(RuleId::Skeleton) == Mode::Shadow && self.shadow_files.contains(&rel) {
+            return;
+        }
         let cohort = cohort_key(&rel, chain.original.len());
         let saving = would.as_ref().map_or(0, |w| {
             let before = chain.draft.original_tokens(chain.original);
@@ -1496,8 +1573,10 @@ impl Session {
         if let Some(c) = &cohort {
             chain.draft.cohort = Some((c.clone(), saving));
         }
-        if chain.stage(RuleId::Skeleton, |_| would) == Some(Mode::On) {
-            chain.draft.shortened_file = Some(rel.clone());
+        match chain.stage(RuleId::Skeleton, |_| would) {
+            Some(Mode::On) => chain.draft.shortened_file = Some(rel.clone()),
+            Some(Mode::Shadow) => chain.draft.shadow_file = Some(rel.clone()),
+            _ => {}
         }
         chain.amend(RuleId::Skeleton, |f| f.read_file = Some(rel));
     }
@@ -1582,6 +1661,7 @@ impl Session {
         text: &str,
         status: RunStatus,
         minify: bool,
+        unread: bool,
         opts: &Options,
     ) -> Option<String> {
         let id = content_key(text, status, minify);
@@ -1591,6 +1671,7 @@ impl Session {
         let pinned = self.pinned(&id).map(|mask| opts.pinned(mask));
         let mut draft = self.draft_content(text, status, minify, pinned.as_ref().unwrap_or(opts));
         draft.pinned = pinned.is_some();
+        draft.unread = unread;
         self.commit(id, draft, text, call, None)
     }
 
@@ -1701,6 +1782,12 @@ impl Session {
         if draft.condensed {
             self.saved.condensed_upstream += 1;
         }
+        let tokens = draft.original_tokens(original);
+        self.saved.output_tokens_seen += tokens as u64;
+        if draft.unread && tokens >= UNREAD_MIN_TOKENS {
+            self.saved.unread_script_outputs += 1;
+            self.saved.unread_script_tokens += tokens as u64;
+        }
         if let Some((cohort, saving)) = &draft.cohort {
             let c = self.saved.cohorts.entry(cohort.clone()).or_default();
             c.reads += 1;
@@ -1709,6 +1796,11 @@ impl Session {
         if let Some(file) = draft.shortened_file.take() {
             if self.shortened_files.insert(file.clone()) {
                 self.request.files_added.push(file);
+            }
+        }
+        if let Some(file) = draft.shadow_file.take() {
+            if self.shadow_files.insert(file.clone()) {
+                self.request.shadow_files_added.push(file);
             }
         }
         if let Some(t) = text {

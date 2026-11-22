@@ -541,8 +541,10 @@ pub fn compare_arms(records: &[UsageRecord]) -> ArmComparison {
     let stats = |name: &str, recs: &[&UsageRecord]| ArmStats {
         arm: name.to_string(),
         sessions: recs.len(),
+        // An arm with no session has no median: a 0 would look measured.
         medians: ARM_METRICS
             .iter()
+            .filter(|_| !recs.is_empty())
             .map(|m| {
                 let values: Vec<f64> = recs.iter().map(|r| metric(r, m)).collect();
                 (m.to_string(), median(&values))
@@ -1489,7 +1491,8 @@ retry: tokens of attempts that were followed by an escalation
         assert_eq!(few.note.as_deref(), Some("not enough sessions"));
         assert!(few.differences.is_empty());
         let none = compare_arms(&[]);
-        assert_eq!(none.proxy.medians["input_tokens"], 0.0);
+        assert!(none.proxy.medians.is_empty(), "no session, no median");
+        assert!(none.holdout.medians.is_empty());
         assert_eq!((none.left_out, none.left_out_note), (0, None));
     }
 

@@ -27,6 +27,8 @@ lge-memory = { path = "../lge-memory" }
 lge-usage = { path = "../lge-usage" }
 lge-router = { path = "../lge-router" }
 regex = "1.13.1"
+# Reads Codex's config.toml (read-only) to tell which configuration entry a tool comes from.
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

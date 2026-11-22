@@ -298,15 +298,23 @@ pub fn read_delta(earlier: &str, earlier_start: usize, now: &str, now_start: usi
             "lge: lines {now_start}-{now_end} are identical to the same lines in the output of `{cmd}` earlier; not repeated here.\n"
         )
     } else {
-        let hunks = unified(&a, &b, CONTEXT);
-        if hunks.is_empty() || apply(&a, &hunks) != b {
+        // Compare with the lines of the earlier read this read covers, not with
+        // the whole earlier read.
+        if now_start < earlier_start {
+            return None;
+        }
+        let skip = (now_start - earlier_start).min(a.len());
+        let window = &a[skip..(skip + b.len()).min(a.len())];
+        let first = earlier_start.max(now_start);
+        let hunks = unified(window, &b, CONTEXT);
+        if window.is_empty() || hunks.is_empty() || apply(window, &hunks) != b {
             return None;
         }
         let mut out = format!(
-            "lge: lines {now_start}-{now_end} were read earlier by `{cmd}` (then lines {earlier_start}-{}); only what changed since then is shown, numbered in file lines:\n",
-            earlier_start + a.len().saturating_sub(1)
+            "lge: lines {now_start}-{now_end} were read earlier by `{cmd}` (then lines {first}-{}); only what changed since then is shown, numbered in file lines:\n",
+            first + window.len() - 1
         );
-        render(&mut out, &hunks, earlier_start - 1, now_start - 1);
+        render(&mut out, &hunks, first - 1, now_start - 1);
         out
     };
     worth_it(now, &out).then_some(out)
@@ -465,5 +473,16 @@ mod tests {
             read_delta(&numbered(100, 300, None), 100, &numbered(50, 300, None), 50, "x")
                 .is_none_or(|o| !o.contains("identical"))
         );
+    }
+
+    #[test]
+    fn a_narrower_re_read_after_an_edit_is_compared_with_its_own_lines_of_the_earlier_read() {
+        let earlier = numbered(1, 400, None);
+        let now = numbered(100, 160, Some(130));
+        let out = read_delta(&earlier, 1, &now, 100, "nl -ba src/a.rs | sed -n '100,160p'").expect("worth it");
+        assert!(out.contains("(then lines 100-160)"), "{out}");
+        assert!(out.contains("\n@@ -128,5 +128,5 @@\n"), "{out}");
+        assert!(out.contains("CHANGED"), "{out}");
+        assert!(!out.contains("line 99 ") && !out.contains("line 200 "), "{out}");
     }
 }

@@ -31,7 +31,7 @@ The model is whatever the agent asked for. So is the reasoning level, unless
   names no effort, or one with an effort this version does not know is left alone, and
   the conversation is marked as not applied.
 - It is decided once, on the conversation's genuine first request, from the router's
-  result for the first typed message (its first 4,000 characters), and needs the graph
+  result for the first typed message (its first 4,000 characters of what the user asked: see "What the user asked" below), and needs the graph
   ready at that moment. A genuine first request carries no earlier turn: no reasoning,
   tool call or tool output, assistant message, compaction item or item reference, no
   second typed message, no compaction summary or turn-aborted notice, no
@@ -89,7 +89,7 @@ nothing was replaced or added is forwarded as the exact bytes that came in.
 | `noise` | Progress lines of a command that exited with code 0, from a table of entries: installs (npm, pnpm, yarn, bun, pip, uv, poetry, bundle, composer, brew, `cargo fetch`/`update`/`install`), `git push`/`pull`/`fetch`/`clone`, the hints of a long `git status`, wget, `docker build`/`pull`, make, `terraform plan`, pre-commit. A line that mentions an error, a warning, a failure, a deprecation, a vulnerability, security, a denial, a conflict, a fatal condition or a URL is always kept, and so is a `remote:` line that is not git's own progress counter. There is never a cap on lines | shadow | ``lge: 214 progress lines of `npm install` left out (exit code 0).`` | Run the same command again before changing anything |
 | `lockfile` | A whole read of `Cargo.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` or `yarn.lock` becomes its sorted `name@version` list | shadow | ``lge: Cargo.lock shown as its package list (60 packages, name@version, sorted); hashes, sources and dependency lists are left out. Find an entry with: rg -n -A4 'name = "NAME"' Cargo.lock`` | The `rg` in the marker, or a range read |
 | `rerun_delta` | What a diff against the latest copy of the same command sent whole in the request would save. Measured only, never sent | measured | none (never sent) | - |
-| `read_delta` | What a diff against an earlier whole read covering the same lines would save. Measured only, never sent | measured | none (never sent) | - |
+| `read_delta` | What a diff against an earlier whole read covering the same lines would save: a read inside an earlier one is compared with its own lines of it, so a narrower re-read after an edit counts. Measured only, never sent | measured | none (never sent) | - |
 
 Every result except the repeat pointer is sent only when the output had at least 400
 tokens and the result is at most 70% of it. Which rules run depends on what the command
@@ -340,7 +340,9 @@ request's, or that request was counted by label.
 "Import past Codex sessions" leaves the same threads out of "Before and after": a rollout
 whose first `session_meta` names such a `thread_source`, a sub-agent source other than
 `thread_spawn` (`review`, `compact`, `memory_consolidation`, `guardian`, ...), or an
-internal source. It reports how many it left out.
+internal source. It reads `rollout-*.jsonl` and the `rollout-*.jsonl.zst` files Codex keeps
+older sessions in (decompressed in memory), and reports how many it left out and how many
+it could not read (a damaged file, a `.zst` that does not decompress).
 
 Codex's compactions are not background requests: codex-rs maps a `compact` sub-agent, but
 no request sends one. Codex asks for a compaction's summary within the conversation
@@ -350,12 +352,30 @@ with its input tokens: it re-sends the whole history, though it never forms a se
 its own (the page shows "–" for its sessions). The conversation stays what it was, and an
 effort `router_apply` lowered holds for it as for every request of the conversation.
 
+## What the user asked
+
+Codex and its IDE integration put context in front of what you type: the open files and
+the selection under `# Context from my IDE setup:`, referenced chats, and (in the desktop
+app) mentioned files. The part you typed follows the line `## My request for Codex:`.
+When a typed message starts with a `#` heading and has such a line, lge reads what comes
+after the first one for the task shown on the page, for the router, and for a new
+decision about a pack (starting points, the size check, the words of the conversation). A
+message that does not start with a `#` heading, or has no such line, is read whole, as
+before; a message with nothing after the line (attachments only) is not the task, and the
+next typed message is. The pack is still named in the ledger by the whole message, so a
+pack decided from the whole message before this version is sent again as it was, and a
+conversation with no cache key and no thread header keeps its key (from the first 200
+characters of the whole message). The layout of the desktop app's file preamble is not
+public: until one is known, a message without the line is read whole.
+
 ## Long sessions
 
 The page shows each session's requests and its input tokens per request (its input
 tokens over its requests); a session recorded before v0.0.2 stored no request count and
-shows "–" for both. Under the session table, a note names the sessions of the table,
-background ones and those of an `lge ab` run left out, with at least 50 requests and more
+shows "–" for both. The table lists the newest 50 sessions that are not Codex's background
+ones and the newest 10 background ones, so hundreds of approval reviews cannot push a long
+session out of it. Under it, a note names every stored session (not only those of the
+table), background ones and those of an `lge ab` run left out, with at least 50 requests and more
 than 150,000 input tokens per request on average, the latest first, each with when its
 last request was recorded: every request of such a session re-sends that many tokens. The
 status gives the same list (`long_sessions`, with `started_at` and `finished_at`).
@@ -442,7 +462,10 @@ is treated as `shadow`. The lossy rules are `check`, `search_cap`, `skeleton`,
 In shadow or on, the skeleton rule also records, for every eligible read of an indexed
 file of 16 KB to 2 MB, its cohort (language and size band: 16-64K, 64-256K, 256K-1M,
 1-2M), what a skeleton would save, and whether the file was patched within the next 5
-calls. Nothing promotes a rule by itself: you switch a rule to `on` after reviewing its
+calls. In shadow a file counts once, as in `on`, where its next read is sent whole: a
+re-read of the same file (identical or another window from line 1) adds nothing to the
+shadow total or the cohort, so the total says what `on` would save. Only a restart can
+count a file again. Nothing promotes a rule by itself: you switch a rule to `on` after reviewing its
 counts.
 
 ## Recovery rate and demotion
@@ -474,6 +497,49 @@ If `daemon.json` cannot be read, the daemon starts from the default settings (ru
 their default modes, not all in shadow), keeps the list of folders when it can still be
 read, copies the file to `daemon.json.unreadable`, logs a warning and shows it on the
 page. The file's settings are left as written until settings are saved from the page.
+
+## Measurements added in v0.0.6 (counts only, nothing is changed)
+
+- **Scripts lge could not read.** An output of a code-mode script that lge cannot split
+  per command (a loop over a command array, outputs joined in one `text(...)`, computed
+  `cmd` or `workdir`, an `apply_patch` and an `exec` in one script) is judged by its
+  content only. The page counts those outputs of 400 tokens or more (smaller ones could
+  never be shortened), once each, and shows their tokens and share of tool output ("Scripts
+  lge could not read"). Restoring an item from the ledger or a later request counts
+  nothing again. The count does not enter any rule's items or "Removed from tool output".
+  Nothing is built to read such scripts until this count shows a large share.
+- **The approval reviewer (guardian).** The page says its sessions are reviewer threads (one
+  per fork or replaced trunk), not approvals, and its requests include resampled denials and
+  retries, and shows parents, threads, single-request threads and requests per parent. For
+  each guardian request lge also compares, per item (instructions, tools, each input item),
+  its start with the previous request of the same parent and sets that against the
+  provider's cached tokens: "shareable but not cached" is an upper bound, split by overlap,
+  gap over 300 s, same or different cache key, same or new thread, and whether lge changed
+  bytes. Memory keeps only hashes and token estimates for the last request of up to 64
+  parents, each dropped after an hour. No text is stored and no request changes.
+- **Packs.** The packs line also counts typed messages that reached the 6-pack limit of a
+  conversation (retired packs count toward it) with those a live-only count would have
+  added, and typed messages first seen while their folder had no graph yet (no pack, for
+  good). The folder list shows how long its last index took.
+- **Graphs on disk.** Each graph folder records the project folder it was built for
+  (`root.txt`). The page and `lge graphs` list every graph with its size and whether its
+  folder is listed; removing a folder from the list says how big its graph is and where.
+  Nothing deletes a graph by itself: `lge graphs --delete <name> --yes` (or the page's
+  button) does, after you confirm, and refuses a graph of a listed folder.
+- **The background table** shows cached and uncached input per label (a "-" for sessions
+  recorded without it), and the compaction row shows "-" instead of 0 when none of its
+  requests counted input.
+- **The holdout comparison** shows "-" for an arm with no sessions, not medians of 0.
+- **The Configuration entry column** of the fixed-prefix table carries advice for the
+  groups Codex has a switch for (all sub-agent tools: `[agents] enabled = false`;
+  `request_user_input`; an MCP server or the plugin that declares it). Keys were checked
+  against Codex 0.160.0 and may differ in other versions; a tool with no known switch has an
+  empty cell. lge never writes the file.
+- **Task labels.** On the page, a mention link such as `[$name](path)` shows as `$name`.
+  Image and audio label lines of an attachment are left out of the text the task and the
+  pack are read from. What is stored and sent does not change.
+- **Slow status.** A status call over 200 ms logs `status_ms` and the record count in
+  `serve.log`, to measure before the page's reads are cached.
 
 ## Holdout
 
@@ -512,10 +578,10 @@ lge forwarded it. On each request it compares them with the previous request's: 
 first item Codex changed is a **client break** (a compaction, an edit of the history);
 before it, an item Codex left alone but lge forwarded differently is a **break caused by
 lge**, which is a bug: it is logged (`lge: cache break caused by lge at item 12
-(conversation 1a2b3c4d)`) and counted. A **cold restart** is a response more than 5
-minutes after the previous one of the conversation, after a request of at least 4,096
-input tokens, that read less than half of that input from the cache; the uncached tokens
-are counted.
+(conversation 1a2b3c4d)`) and counted. A **cold restart** is a response to a request sent more
+than 5 minutes after the previous response of the conversation ended (the time the model
+and the tools took is not idle time), after a request of at least 4,096 input tokens,
+that read less than half of that input from the cache; the uncached tokens are counted.
 
 The **fixed prefix** is what Codex sends at the start of every request: its base
 instructions (the `instructions` field, or the developer message that opens the input, as
@@ -524,7 +590,11 @@ current Codex sends them) and its tool definitions (`tools`, and the tools of
 and the tools are grouped as Codex names them: its own tools as built-in, an MCP server's
 tools (`mcp__server__` namespaces, or flat `mcp__server__tool` names) by server. Tools
 never called since the daemon started are listed with their tokens and, for an MCP server,
-the `[mcp_servers.<name>]` entry of `~/.codex/config.toml` that defines them. This is a
+the `[mcp_servers.<name>]` entry of `~/.codex/config.toml` that defines them. A tool
+called from inside an `exec` script (code mode: `tools.name(...)`) counts as called, by
+the name Codex gives it there (the bare name, `namespace__name`, or the namespace and the
+name joined when the namespace ends with `_` or the name starts with `_`); a name in a
+comment or a string counts too. This is a
 report only: lge never changes tool definitions or your configuration.
 
 The page also shows, per session, the tokens not sent: over every request, the tokens
@@ -633,7 +703,7 @@ never stored or logged. `lge ab` writes its own files in its work dir; see `docs
 
 | Endpoint | What it does |
 |---|---|
-| `GET /lge/api/status` | Settings, folders, sessions (with their background label, `lge ab` arm, requests and mean input per request, null when unknown, and pack counts), rules with their counts and rates, cohorts, holdout comparison (with the sessions left out and why), cache monitor, fixed prefix, unused tools, packs (over the sessions not held out, with what held-out ones would have added, and the tokens sent split into those of sessions whose packs no count covers and those of background sessions), background requests by label (with their input tokens), long sessions (with when each ran) |
+| `GET /lge/api/status` | Settings, folders, `saved` (what the conversations live in this daemon saved, each change counted once, with `since`, the unix time the daemon started), sessions (the newest 50 ordinary and 10 background ones; with their background label, `lge ab` arm, requests and mean input per request, null when unknown, and pack counts), rules with their counts and rates, cohorts, holdout comparison (with the sessions left out and why), cache monitor, fixed prefix, unused tools, packs (over the sessions not held out, with what held-out ones would have added, and the tokens sent split into those of sessions whose packs no count covers and those of background sessions), background requests by label (with their input tokens), long sessions (with when each ran) |
 | `POST /lge/api/settings` | Changes only the keys the JSON body names. `clear_demotion: "<rule>"` re-enables a demoted rule; `demoted` and `rule_since` in a body are ignored; an unknown rule id is ignored, an unknown mode is an error. `ab_arm` (`"on"`, `"off"` or `""`) is set by `lge ab`. Saving clears an unreadable-file warning |
 | `POST /lge/api/discover` | Replays the Codex sessions of the last 30 days through every rule, in memory |
 | `GET /lge/api/sessions/<thread-id>/requests` | The traces of one conversation, oldest first: per request its status, whether it was retried, the usage, the tokens lge added and removed, and its three largest new tool outputs (command cut to 120 characters, tokens, whether lge shortened it; no output text). Keyed by Codex's `thread-id` header, else the `prompt_cache_key`; the last 500 requests of the last 200 conversations, in memory |
@@ -704,7 +774,7 @@ takes its default, so a file written by v0.0.1 or v0.0.2 still loads.
 | `shorten_reads` | - | `false` | The older name of the skeleton switch: always `rules.skeleton == "on"`. In a file without `rules.skeleton`, `true` means `on` and `false` means `shadow` |
 | `context_budget` | - | `1500` | Tokens of one pack; a message about one file that nothing else uses gets at most 600 |
 | `pack_conversation_budget` | Tokens of graph context in one request | `3000` | Tokens of the packs present in one request together, each whole (frame and remembered facts included). A new pack is built to fit in the room the packs before it leave and is not added with less than 300 tokens of room, so a value under 300 adds no pack; a follow-up pack is at most 600. Packs already sent keep their bytes |
-| `auto_index` | Index a git repository the first time | `true` | A git repository inside the workspace is indexed the first time the agent works in it in a conversation someone works in: never for one of Codex's background requests, and never a folder Codex keeps for itself (a `.git` with Codex's `codex-baseline-version` marker, or `<CODEX_HOME>/memories` and `memories_v2`), which is not indexed even when added on the page and is dropped from the saved list when the daemon starts |
+| `auto_index` | Index a git repository the first time | `true` | A git repository inside the workspace is indexed the first time the agent works in it in a conversation someone works in: never for one of Codex's background requests, and never a folder Codex keeps for itself (a `.git` with Codex's `codex-baseline-version` marker, or any folder inside `<CODEX_HOME>` such as `memories`, `memories_v2`, `.tmp/plugins` and `vendor_imports/skills`, except `<CODEX_HOME>/worktrees`, where the desktop app checks out your own repositories), which is not indexed even when added on the page and is dropped from the saved list when the daemon starts |
 | `holdout_share` | Holdout | `0` | The share of new conversations held out, from 0 to 1; any other value is 0 |
 | `router_apply` | Lower the reasoning effort when the router recommends it | `"off"` | `"off"`, `"low-only"` or `"low-and-medium"`; any other value is refused. See "Lowering the reasoning effort" |
 | `ab_arm` | - | `""` | The arm of a running `lge ab` (`"on"` or `"off"`); set by `lge ab` and never read from the file. See "Holdout" |
@@ -733,3 +803,33 @@ takes its default, so a file written by v0.0.1 or v0.0.2 still loads.
   None of it is checked against a real Codex capture yet. What the pack budget, the
   follow-up rules and the retirement save is unmeasured until the holdout arm or
   `lge ab` measures it.
+
+
+## What if Codex compacted sooner? (an estimate)
+
+`lge usage compact-whatif [--days 30] [--limits 100000,150000,200000] [--session <id-prefix>]
+[--rework-tokens 0] [--json] [--explain]` and the collapsed block under the long-session note
+(`GET /lge/api/compact-whatif`, read only, cached in memory for ten minutes and made again when a
+rollout changes, never computed inside the status call) replay the long sessions (at least 50
+requests and more than 150,000 input tokens each on average, background threads left out) of
+Codex's own session files at other values of `model_auto_compact_token_limit`.
+
+How: the per-request series comes from the rollouts (`token_usage_record` lines, or `token_count`
+events in older files; a compaction request is the response named by a `compacted` line's
+`compaction_response_id`, never guessed from its neighbours). Codex compacts before the request
+that follows a response whose total (input plus output) reaches the limit (at most 90% of the
+model's window, 95% of it being the hard cap). The replay keeps each request's output and the
+growth of its history as they were, restarts the history at the size the session itself shows
+(or a rule gives), and prices uncached input 1, cached 0.1, output 8. It is first run at the
+session's own limit and shown next to the measured totals, with its error; every change is
+against that run, not against the measured totals. A candidate that would compact every few
+requests is marked thrash and shows no saving.
+
+The limit is read from `config.toml` (read only), else inferred from the totals before the
+compactions seen (approximate: within about one growth step, possibly low by tokens Codex counts
+that the last response did not report), else the default. A session whose own error is over 10%,
+whose limit is only assumed or with under 200 requests is marked low confidence. It is exact on
+a clean synthetic series and within 5% on a noisy one. Codex would work from a summary after each
+compaction, which cannot be modelled: the figure is an estimate and lge never writes your
+configuration. `--explain` says what each rollout held (compacted lines, events, usage records).
+A session is matched to a stored session by id; when there is no match the page says so.

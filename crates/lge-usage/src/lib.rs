@@ -48,14 +48,16 @@
 //! ```
 
 mod codex;
+pub mod compact;
 mod prices;
 mod record;
 mod report;
 
 pub use codex::{
     background_record, background_session, background_task, background_thread_source, codex_home, find_rollout,
-    parse_codex_jsonl, parse_rollout_file, rollout_cwd, rollout_files, rollout_items, rollout_requests, ParsedSession,
-    RolloutItem, TokenUsage, BACKGROUND_PROMPTS, GUARDIAN_PROMPT, MEMORY_PROMPT, REVIEWER_MODEL, TITLE_PROMPT,
+    is_rollout_file_name, parse_codex_jsonl, parse_rollout_file, rollout_cwd, rollout_files, rollout_items,
+    rollout_requests, rollout_series, CompactionMark, ParsedSession, ReqKind, ReqUsage, RolloutItem, RolloutSeries,
+    TokenUsage, BACKGROUND_PROMPTS, GUARDIAN_PROMPT, MEMORY_PROMPT, REVIEWER_MODEL, TITLE_PROMPT,
 };
 pub use prices::{load_prices, Prices, CONFIG_FILE};
 pub use record::{apply_session, new_record, task_id};

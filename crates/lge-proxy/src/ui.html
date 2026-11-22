@@ -61,6 +61,8 @@
     <h2>Folders in the graph</h2>
     <div class="card">
       <div class="scroll"><table id="repos"></table></div>
+      <div class="dim" id="graphs_line" style="margin-top:10px"></div>
+      <div class="scroll"><table id="graphs"></table></div>
       <div class="row" style="margin-top:12px">
         <input class="grow" type="text" id="path" placeholder="/path/to/a/repository" autocomplete="off">
         <button id="browse">Browse</button>
@@ -76,8 +78,10 @@
     <div class="card">
       <div class="scroll"><table id="sessions"></table></div>
       <div class="warn" id="long_note" style="margin-top:10px" hidden></div>
+      <details id="whatif_box" style="margin-top:10px" hidden><summary>What if Codex compacted sooner? (an estimate, read from Codex's own session files)</summary><div class="dim" id="whatif_body">Open to load.</div></details>
       <div class="dim" id="packs_line" style="margin-top:10px"></div>
-      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session (each re-sends the history: its input is counted per request)</h3><div class="scroll"><table id="background"></table></div></div>
+      <div class="dim" id="unread_line" style="margin-top:6px"></div>
+      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session (each re-sends the history: its input is counted per request)</h3><div class="scroll"><table id="background"></table></div><div class="dim" id="guardian_line" style="margin-top:6px"></div></div>
     </div>
   </section>
 
@@ -117,7 +121,7 @@
     <div class="card">
       <div class="dim">What Codex sends at the start of every request, by tool group, since the daemon started. Report only: lge never changes tool definitions or your configuration. To drop a server you do not use, remove its <span class="mono">[mcp_servers.&lt;name&gt;]</span> entry from <span class="mono">~/.codex/config.toml</span>.</div>
       <div class="scroll" style="margin-top:10px"><table id="groups"></table></div>
-      <div class="sub"><h3>Tools never called since the daemon started</h3><div class="scroll"><table id="ghosts"></table></div></div>
+      <div class="sub"><h3>Tools never called since the daemon started (a call inside an exec script counts by its name there)</h3><div class="scroll"><table id="ghosts"></table></div></div>
     </div>
   </section>
 
@@ -202,18 +206,26 @@ async function api(path, method = 'GET', body) {
 }
 function say(text, cls = 'dim') { const m = $('msg'); m.className = cls; m.textContent = text; }
 
+// Codex writes a mention into the text the model sees as [$name](path) or
+// [@name](path). Shown by its label only (display only: nothing sent or stored changes).
+function clean_task(s) { return String(s == null ? '' : s).replace(/\[([$@][^\]\n]+)\]\([^)\n]+\)/g, (m, label) => label); }
+
 function render(s, seq) {
   state = s;
   $('sub').textContent = `v${s.version} · listening on ${s.listen} · up ${Math.floor(s.uptime_seconds / 60)} min`;
   const proxy = (s.modes.find(m => m.mode === 'proxy')) || {};
   const sv = s.saved;
   const removed = sv.tokens_before - sv.tokens_after;
+  const an = s.annuity || {};
+  const since = sv.since ? `at ${new Date(sv.since * 1000).toLocaleString()} (up ${Math.floor(s.uptime_seconds / 60)} min)` : '';
   $('cards').innerHTML = [
     ['Sessions', n(proxy.sessions), 'all stored; background and lge ab runs apart'],
     ['Input tokens', n(proxy.input_tokens), `cached ${pct(proxy.cached_input_tokens, proxy.input_tokens)}`],
     ['Output tokens', n(proxy.output_tokens), `reasoning ${pct(proxy.reasoning_tokens, proxy.output_tokens)}`],
-    ['Removed from tool output', n(removed), `${n(sv.outputs_shortened)} outputs, ${pct(removed, sv.tokens_before)} smaller`],
-    ['Graph context added', n(sv.context_tokens), `${n(sv.contexts_added)} packs`],
+    ['Removed from tool output', n(removed), `${n(sv.outputs_shortened)} outputs, ${pct(removed, sv.tokens_before)} smaller; since the daemon started ${since}, each change counted once`],
+    ['Graph context added', n(sv.context_tokens), `${n(sv.contexts_added)} packs; since the daemon started ${since}, each pack counted once`],
+    ['Kept out of requests', n(an.removed_tokens_sent), 'all stored sessions, on every request that carried the change'],
+    ['Packs sent', n(an.added_tokens_sent), 'all stored sessions, on every request that carried a pack'],
   ].map(([k, v, d]) => `<div class="card"><div class="dim">${k}</div><div class="big">${v}</div><div class="dim">${d}</div></div>`).join('');
 
   const origin = location.origin;
@@ -222,10 +234,19 @@ function render(s, seq) {
 
   $('repos').innerHTML = '<tr><th>Folder</th><th>State</th><th class="n">Files</th><th class="n">Symbols</th><th class="n">Facts</th><th></th></tr>' +
     (s.repos.length ? s.repos.map(r => `<tr><td><b>${esc(r.name)}</b><div class="dim mono">${esc(r.root)}</div>${bulky(r)}</td>
-      <td class="${r.state === 'ready' ? 'ok' : r.state === 'failed' ? 'bad' : 'warn'}">${r.state}${r.detail ? '<div class="dim">' + esc(r.detail) + '</div>' : ''}</td>
+      <td class="${r.state === 'ready' ? 'ok' : r.state === 'failed' ? 'bad' : 'warn'}">${r.state}${r.detail ? '<div class="dim">' + esc(r.detail) + '</div>' : ''}${r.index_seconds != null ? `<div class="dim">last index ${r.index_seconds.toFixed(1)} s</div>` : ''}</td>
       <td class="n">${n(r.files)}</td><td class="n">${n(r.symbols)}</td><td class="n">${n(r.memories)}</td>
       <td class="n"><button data-reindex="${esc(r.root)}">Re-index</button> <button data-remove="${esc(r.root)}">Remove</button></td></tr>`).join('')
       : '<tr><td colspan="6" class="dim">No folder yet. Add one below, or start Codex in a git repository.</td></tr>');
+  // Graphs on disk. Nothing deletes one by itself: a graph also holds the facts learned in its folder.
+  const gr = s.graphs || {};
+  const mb = b => (b / 1048576).toFixed(b >= 10485760 ? 0 : 1) + ' MB';
+  $('graphs_line').textContent = `Graphs on disk: ${n((gr.graphs || []).length)}, ${mb(gr.total_bytes || 0)}; ${n(gr.unlisted)} for folders not in the list, ${mb(gr.unlisted_bytes || 0)} (sizes read once a minute). Removing a folder from the list keeps its graph, and the facts learned in it; delete one here only when you no longer need it. Deleting cannot be undone.`;
+  table('graphs', ['Graph folder', 'Built for', '#Size', 'State', ''],
+    (gr.graphs || []).map(g => `<tr><td class="mono">${esc(g.path)}</td><td class="mono">${g.root ? esc(g.root) : '<span class="dim">unknown (built before lge recorded it)</span>'}</td><td class="n">${mb(g.bytes)}</td>
+      <td>${g.listed ? '<span class="ok">listed</span>' : (g.exists === false ? '<span class="warn">not listed, folder no longer exists</span>' : '<span class="dim">not listed</span>')}</td>
+      <td class="n">${g.listed ? '' : `<button data-delete-graph="${esc(g.dir)}">Delete</button>`}</td></tr>`),
+    'No graph on disk.');
   // The note of a folder being added or re-indexed, once it is done, read
   // only from a status requested after the folder was sent.
   if (pending && seq > pendingAfter) {
@@ -241,7 +262,7 @@ function render(s, seq) {
   const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_too_large || x.packs_retired)
     ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} no room, ${n(x.packs_too_large)} too large, ${n(x.packs_retired)} retired after a rewrite of the history` : '';
   $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input / request</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(x.task || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${x.ab_arm ? ' · lge ab arm ' + esc(x.ab_arm) : ''}${packsOf(x)}</div></td>
+    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(clean_task(x.task) || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${x.ab_arm ? ' · lge ab arm ' + esc(x.ab_arm) : ''}${packsOf(x)}</div></td>
       <td class="n">${nn(x.requests)}</td><td class="n">${nn(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
       <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
@@ -250,12 +271,30 @@ function render(s, seq) {
   const ls = s.long_sessions || {};
   const longList = ls.sessions || [];
   $('long_note').hidden = !longList.length;
-  $('long_note').innerHTML = longList.length ? `${longList.map(l => `<b>${esc(l.task || l.id)}</b> (${n(l.requests)} requests, ${n(l.mean_input_tokens)} input tokens each on average, last request ${esc(when(l.finished_at))})`).join(', ')}. ${esc(ls.note)}` : '';
+  $('long_note').innerHTML = longList.length ? `${longList.map(l => `<b>${esc(clean_task(l.task) || l.id)}</b> (${n(l.requests)} requests, ${n(l.mean_input_tokens)} input tokens each on average, last request ${esc(when(l.finished_at))})`).join(', ')}. ${esc(ls.note)}` : '';
+  $('whatif_box').hidden = !longList.length;
   const pk = s.packs || {};
-  $('packs_line').textContent = `Packs (sessions not held out): ${n(pk.added)} added, ${n(pk.known)} not added as already known, ${n(pk.over_budget)} not added: no room left in the conversation budget, ${n(pk.too_large)} not added: larger than a follow-up pack may be (600 tokens), ${n(pk.retired)} retired after the history was rewritten (compaction, edit, rollback). ${n(pk.tokens_sent)} tokens of packs sent over all requests since ${esc(when(pk.since))}, every version; ${n(pk.tokens_sent_uncounted)} of them in sessions whose records count no pack (recorded before v0.0.2: their packs are not counted above), ${n(pk.tokens_sent_background)} in Codex's background sessions. Sessions recorded by v0.0.2 count their packs as added (from their ledger), never as already known, no room or too large. Held-out sessions would have added ${n(pk.holdout_would_add)}.`;
-  table('background', ['Label', '#Sessions', '#Requests', '#Input tokens of these requests', '#Input tokens of its sessions'],
-    (s.background || []).map(b => `<tr><td class="mono">${esc(b.label)}</td><td class="n">${nn(b.sessions)}</td><td class="n">${n(b.requests)}</td><td class="n">${n(b.request_input_tokens)}</td><td class="n">${b.sessions == null ? '–' : n(b.input_tokens)}</td></tr>`),
+  $('packs_line').textContent = `Packs (sessions not held out): ${n(pk.added)} added, ${n(pk.known)} not added as already known, ${n(pk.over_budget)} not added: no room left in the conversation budget, ${n(pk.too_large)} not added: larger than a follow-up pack may be (600 tokens), ${n(pk.retired)} retired after the history was rewritten (compaction, edit, rollback). ${n(pk.tokens_sent)} tokens of packs sent over all requests since ${esc(when(pk.since))}, every version; ${n(pk.tokens_sent_uncounted)} of them in sessions whose records count no pack (recorded before v0.0.2: their packs are not counted above), ${n(pk.tokens_sent_background)} in Codex's background sessions. Sessions recorded by v0.0.2 count their packs as added (from their ledger), never as already known, no room or too large. Held-out sessions would have added ${n(pk.holdout_would_add)}. ${n(pk.no_graph)} typed messages were first seen while their folder had no graph yet (no pack, for good; see the last index time of each folder). ${n(pk.at_limit)} typed messages with a strong starting point got no pack because their conversation was at its limit of 6 packs (retired ones count); a limit on live packs only would have let ${n(pk.at_limit_live_would_add)} of them through (a measure: nothing was changed, and retired packs are counted since the daemon started only).`;
+  const us = s.unread_scripts || {};
+  $('unread_line').textContent = us.outputs || us.tool_output_tokens ? `Scripts lge could not read: ${n(us.outputs)} outputs, ${n(us.tokens)} tokens (${us.share == null ? '–' : (us.share * 100).toFixed(1) + '% of tool output'}; outputs of 400 tokens or more, counted once each). These are scripts that loop over commands, compute the command or merge several prints: their output is judged by its content only. A count, nothing was changed. Run \`lge usage discover --days 3\` to see the same share in Codex's own rollouts.` : 'Scripts lge could not read: none counted yet (outputs of 400 tokens or more, counted once each; a count, nothing was changed).';
+  const bgInput = b => {
+    if (!b.input_counted_requests) return '–';
+    const missing = b.requests - b.input_counted_requests;
+    return n(b.request_input_tokens) + (missing > 0 ? ` <span class="dim">+ ${n(missing)} requests not counted (before v0.0.5)</span>` : '');
+  };
+  const bgCached = b => {
+    if (b.cached_tokens == null) return ['–', '–'];
+    // Cached counts exist for fewer input tokens than the input column shows.
+    const part = b.cached_basis_tokens < b.request_input_tokens ? ` <span class="dim">over ${n(b.cached_basis_tokens)} of ${n(b.request_input_tokens)} input tokens</span>` : '';
+    return [n(b.cached_tokens) + part, n(b.uncached_tokens)];
+  };
+  table('background', ['Label', '#Sessions', '#Requests', '#Input tokens of these requests', '#Cached', '#Uncached', '#Removed by lge', '#Input tokens of its sessions'],
+    (s.background || []).map(b => `<tr><td class="mono">${esc(b.label)}</td><td class="n">${nn(b.sessions)}</td><td class="n">${n(b.requests)}</td><td class="n">${bgInput(b)}</td><td class="n">${bgCached(b)[0]}</td><td class="n">${bgCached(b)[1]}</td><td class="n">${n(b.removed_tokens)}</td><td class="n">${b.sessions == null ? '–' : n(b.input_tokens)}</td></tr>`),
     'No background request yet.');
+  const gd = s.guardian || {};
+  const split = k => { const b = (gd.splits || {})[k]; return b ? `${n(b.requests)} requests, ${n(b.shareable_uncached)} tokens` : '0'; };
+  $('guardian_line').innerHTML = gd.threads ? `Guardian: its sessions are reviewer threads (one for each fork or replaced trunk), not approvals, and its requests include resampled denials and retries. ${n(gd.threads)} threads for ${n(gd.parents)} parent threads${gd.threads_without_parent ? ` (${n(gd.threads_without_parent)} threads recorded without a parent)` : ''}, ${n(gd.requests)} requests${gd.requests_per_parent == null ? '' : ` (${gd.requests_per_parent.toFixed(1)} per parent)`}; ${n(gd.single_request_threads)} threads had a single request (${pct(gd.single_request_input_tokens, gd.thread_input_tokens)} of the threads' input).
+    <br>Common prefix with the previous request of the same parent (a measurement, nothing was changed; token counts of prefixes are estimates by item, and cached tokens are the provider's): ${n(gd.with_previous)} requests had a previous sibling, ${n(gd.long_prefix)} of them shared 1,024 tokens or more. At most ${n(gd.shareable_uncached)} tokens (about ${n(gd.shareable_uncached_weighted)} weighted) were shared with the previous request and yet not cached: an upper bound, since a transcript window that slid cannot be recovered by any key. By cause: overlapped (the previous response still streaming) ${split('overlapped')}; gap over 300 s ${split('gap_over_300s')}; key the same ${split('key_same')}, key different ${split('key_different')}; lge changed bytes ${split('lge_changed_bytes')}; same thread ${split('same_thread')}, new thread ${split('new_thread')}.` : '';
 
   const err = $('settings_error');
   err.hidden = !s.settings_error; err.textContent = s.settings_error || '';
@@ -281,11 +320,12 @@ function render(s, seq) {
 
   const h = s.holdout || {};
   if (document.activeElement !== $('holdout_share')) $('holdout_share').value = s.settings.holdout_share;
+  const med = (m, k) => m && m[k] != null ? n(Math.round(m[k])) : '–';
   const metric = { input_tokens: 'Input / session', cached_input_tokens: 'Cached', uncached_input_tokens: 'Uncached', output_tokens: 'Output', reasoning_tokens: 'Reasoning', requests: 'Requests', removed_tokens_sent: 'Kept out by lge' };
   const diffs = Object.fromEntries((h.differences || []).map(d => [d.metric, d]));
   table('holdout', ['Median per session', '#Through lge (' + n(h.proxy && h.proxy.sessions) + ')', '#Held out (' + n(h.holdout && h.holdout.sessions) + ')', '#Difference (95% interval)'],
     Object.keys(metric).map(k => { const d = diffs[k];
-      return `<tr><td>${metric[k]}</td><td class="n">${n(Math.round(((h.proxy || {}).medians || {})[k] || 0))}</td><td class="n">${n(Math.round(((h.holdout || {}).medians || {})[k] || 0))}</td>
+      return `<tr><td>${metric[k]}</td><td class="n">${med((h.proxy || {}).medians, k)}</td><td class="n">${med((h.holdout || {}).medians, k)}</td>
         <td class="n">${d ? `${n(Math.round(d.difference))} (${n(Math.round(d.low))} to ${n(Math.round(d.high))})` : '–'}</td></tr>`; }), '');
   $('holdout_note').textContent = [h.note ? `${h.note}: each arm needs 30 sessions of the last 30 days.` : '', h.left_out_note ? h.left_out_note + '. The arms measure all of lge\'s changes together (rules, packs and, with router_apply on, the effort).' : ''].filter(Boolean).join(' ');
 
@@ -299,7 +339,7 @@ function render(s, seq) {
   ].map(([k, v, c]) => `<div class="card"><div class="dim">${k}</div><div class="big ${c}">${v}</div></div>`).join('');
   const conv = ((s.prefix || {}).conversations || []).filter(c => c.lge_breaks || c.client_breaks || c.cold_restarts);
   table('breaks', ['Session', '#lge breaks', '#Client breaks', '#Cold restarts'],
-    conv.map(c => `<tr><td>${esc(c.task || c.id)}${c.lge_breaks ? `<div class="bad">lge changed item ${c.first_lge_break_item}: a bug, please report it</div>` : ''}</td>
+    conv.map(c => `<tr><td>${esc(clean_task(c.task) || c.id)}${c.lge_breaks ? `<div class="bad">lge changed item ${c.first_lge_break_item}: a bug, please report it</div>` : ''}</td>
       <td class="n ${c.lge_breaks ? 'bad' : ''}">${n(c.lge_breaks)}</td><td class="n">${n(c.client_breaks)}</td><td class="n">${n(c.cold_restarts)}</td></tr>`), 'No cache break and no cold restart.');
 
   const fixed = (s.prefix || {}).fixed || {};
@@ -355,13 +395,46 @@ async function browse(path) {
 $('add').onclick = () => addRepo($('path').value.trim());
 $('browse').onclick = () => browse($('path').value.trim());
 $('folders').onclick = e => { const d = e.target.closest('[data-path]'); if (d) browse(d.dataset.path); };
+// The compaction what-if: one fetch when the block is opened; read only.
+function whatif_html(w) {
+  if (!w.sessions || !w.sessions.length) return 'No long session in Codex\'s session files of the last ' + n(w.days) + ' days.';
+  const one = a => {
+    const known = (state && state.sessions || []).find(x => x.id === a.session_id);
+    const rows = a.candidates.filter(c => c.limit != null && !(c.flags || []).includes('session limit')).map(c =>
+      c.thrash ? `At ${n(c.limit)}: Codex would compact every few requests; no saving is shown.`
+        : c.delta_pct == null ? `At ${n(c.limit)}: no estimate.`
+        : `At ${n(c.limit)}: about ${Math.abs(c.delta_pct).toFixed(0)}% ${c.delta_pct <= 0 ? 'less' : 'more'} weighted input cost, ${n(c.run.compactions - a.model_run.compactions)} more compactions, Codex works from a summary after each.`);
+    return `<div style="margin-top:8px"><b>${known ? esc(clean_task(known.task)) : 'session ' + esc(a.session_id.slice(0, 8)) + ' <span class="dim">(not matched to a stored session)</span>'}</b> (${n(a.work_requests)} requests, limit ${n(a.limit)}, ${esc(a.limit_source)}, confidence ${esc(a.confidence)})
+      <div>${rows.map(esc).join('<br>')}</div>
+      <div class="dim">The model at the current limit is off by ${a.error_pct.cost.toFixed(1)}% from your measured totals.</div></div>`;
+  };
+  return w.sessions.map(one).join('') + `<div class="dim" style="margin-top:8px">${esc((w.caveats || []).join(' '))} Set model_auto_compact_token_limit in ~/.codex/config.toml yourself if you decide to: lge never writes that file.</div>`;
+}
+$('whatif_box').addEventListener('toggle', async () => {
+  const box = $('whatif_box'); if (!box.open || box.dataset.loaded) return;
+  box.dataset.loaded = '1'; $('whatif_body').textContent = 'Reading the session files …';
+  try { $('whatif_body').innerHTML = whatif_html(await api('compact-whatif')); }
+  catch (e) { delete box.dataset.loaded; $('whatif_body').textContent = 'Could not compute: ' + e.message; }
+});
+
 $('repos').onclick = async e => {
   const b = e.target.closest('button'); if (!b) return;
   try {
     if (b.dataset.reindex) { await api('repos', 'POST', { path: b.dataset.reindex }); watch(b.dataset.reindex); say('Re-indexing …', 'ok'); }
-    if (b.dataset.remove) { pending = null; await api('repos?path=' + encodeURIComponent(b.dataset.remove), 'DELETE'); say('Removed from the list. Its graph stays on disk.', 'dim'); }
+    if (b.dataset.remove) {
+      pending = null;
+      const g = ((state.graphs || {}).graphs || []).find(x => x.root === b.dataset.remove);
+      await api('repos?path=' + encodeURIComponent(b.dataset.remove), 'DELETE');
+      say(`Removed from the list. Its graph${g ? ` (${(g.bytes / 1048576).toFixed(1)} MB, ${g.path})` : ''} stays on disk; delete it under the graphs table when you no longer need it.`, 'dim');
+    }
     refresh();
   } catch (err) { pending = null; say(err.message, 'bad'); }
+};
+$('graphs').onclick = async e => {
+  const b = e.target.closest('button'); if (!b || !b.dataset.deleteGraph) return;
+  if (!confirm('Delete this graph and the facts learned in it? This cannot be undone.')) return;
+  try { const r = await api('graphs?dir=' + encodeURIComponent(b.dataset.deleteGraph), 'DELETE'); say(`Deleted ${r.deleted} (${(r.bytes / 1048576).toFixed(1)} MB).`, 'ok'); refresh(); }
+  catch (err) { say(err.message, 'bad'); }
 };
 $('import').onclick = async () => {
   $('import').disabled = true;
