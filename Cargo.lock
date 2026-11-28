@@ -782,6 +782,7 @@ dependencies = [
  "lge-session",
  "lge-store",
  "lge-usage",
+ "libc",
  "serde_json",
  "tempfile",
 ]

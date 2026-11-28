@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- `lge report`: the daemon's page as plain text, to share in place of copying the page by
+  hand. It reads `GET /lge/api/status` from the running daemon (`--url`, default
+  `http://127.0.0.1:8787`) and prints every section in the page's order, with numbers
+  formatted as the page does: version and uptime, the cards, the folders (with the error of
+  a failed folder and the warnings on bulky folders), the sessions with the most input
+  (`--sessions N`, default 25, and how many were left out), the long-session note, the
+  packs, the background requests, the rules, the holdout, the prompt cache, the fixed
+  prefix, the unused tools, before and after, and the settings. When the daemon answers
+  `GET /lge/api/compact-whatif` (v0.0.6 and later), its summary is printed too.
+  Everything is read from the JSON as it comes, so the status of an older daemon (v0.0.4,
+  with fewer fields) renders as well: a missing field or section is left out, never shown
+  as `null`. `--redact` replaces each task with a stable label (`session 1`, `session 2`,
+  ... in the table's order, the same in every section) and every folder path and path under
+  the home folder with its last component, in error texts and warnings too; numbers are
+  kept. `--json` prints the status JSON (with the what-if under `compact_whatif`), and
+  `--out <file>` writes to a file. If no daemon answers, it says so and names the address.
+  The HTTP client is the one `lge ab` already uses; `libc` (already in the tree) gives the
+  local time on Unix.
+
 ## v0.0.7 (2026-11-22)
 
 Three changes to long-term memory (`lge-memory`), all deterministic: no model call, no

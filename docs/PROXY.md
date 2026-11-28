@@ -13,6 +13,8 @@ Codex desktop app / Codex CLI  ->  lge on 127.0.0.1:8787  ->  OpenAI
 - a **page** (`/`) that shows input, cached, output and reasoning tokens per session,
   what each rule did, the packs, Codex's background requests, the cache monitor, the
   fixed prefix, the holdout comparison and the folders in the graph.
+  `lge report` prints the same page as plain text (`--redact` to share it, `--json` for
+  the status JSON).
 
 The model is whatever the agent asked for. So is the reasoning level, unless
 `router_apply` is switched on (off by default; see "Lowering the reasoning effort").

@@ -370,6 +370,21 @@ Every model request also leaves one line in `~/.lge/serve.log`, without any cont
 lge: POST /v1/responses 200 | zstd 23075B read -> 65089B | | usage in 13143 (cached 6144) out 5 (reasoning 0)
 ```
 
+**Sharing a report.** To show someone what the page shows, do not copy the page: run
+
+```bash
+lge report                                   # every section of the page as plain text
+lge report --redact                          # the same, safe to share beyond your own chat
+lge report --json --out lge-report.json      # the status JSON, for a script or a bug report
+```
+
+`lge report` reads the running daemon (`--url`, default `http://127.0.0.1:8787`), works with
+older daemons too (sections they do not have are left out), and shows the 25 sessions with
+the most input (`--sessions N`). `--redact` replaces each session's task with a label
+(`session 1`, `session 2`, ... in the table's order, the same in every section) and every
+folder path and path under your home folder with its last component; numbers are kept.
+Read the output before you post it: names of MCP servers and tools stay as they are.
+
 Commands, for scripts and other agents:
 
 ```bash
@@ -383,6 +398,7 @@ lge memory recall "token expiry"
 lge usage report                # tokens per task
 lge usage discover              # past Codex sessions through every rule (reads only)
 lge usage compact-whatif        # what a lower compaction limit would cost: an estimate (reads only)
+lge report --redact             # the daemon's page as plain text, safe to share
 lge check                       # lint, types, tests: failures only
 lge ab tasks.toml               # A/B: each task with lge off and on (spends tokens)
 lge init --write                # the AGENTS.md rule; --terse, --batch: see section 4
