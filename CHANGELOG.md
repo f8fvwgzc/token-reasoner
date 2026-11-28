@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.0.9 (2026-11-28)
+
+A week of real use showed that re-reading long cached histories is most of Codex's cost,
+and reasoning a small part. This release adds a read-only estimate of one way lge could
+shorten those histories itself. Nothing in what lge sends changes.
 
 - New `lge usage trim-whatif [--days 30] [--session <id>] [--json]` and
   `GET /lge/api/trim-whatif`: replays the long sessions of `~/.codex` as if lge had replaced
