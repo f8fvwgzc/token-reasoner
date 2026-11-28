@@ -14,6 +14,7 @@ use std::time::Duration;
 
 mod discover;
 mod init;
+mod report;
 
 #[derive(Parser)]
 #[command(
@@ -198,6 +199,9 @@ enum Cmd {
     /// base commit, one after another, then tokens, success and a verdict.
     /// Spends real tokens.
     Ab(AbArgs),
+    /// The daemon's page as plain text to share: every section, read from the running daemon
+    /// (`lge serve`). --redact replaces task texts and paths; --json prints the status JSON.
+    Report(report::ReportArgs),
     /// List the graphs the daemon keeps on disk (path, size, folder) and, with --delete, delete one.
     /// A graph also holds the facts learned in its folder; a graph of a folder the daemon lists is
     /// never deleted. Nothing is deleted without --yes.
@@ -544,6 +548,10 @@ fn main() -> Result<()> {
         };
         return init::run(&places, &opts, &mut std::io::stdout().lock());
     }
+    // The report only reads the daemon's status over HTTP.
+    if let Cmd::Report(args) = &cli.cmd {
+        return report::run(args);
+    }
     if let Cmd::Graphs { data_dir, delete, yes } = &cli.cmd {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -638,7 +646,9 @@ fn main() -> Result<()> {
 
     let store = open(&db)?;
     match cli.cmd {
-        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Ab(_) | Cmd::Graphs { .. } => unreachable!("handled above"),
+        Cmd::Init { .. } | Cmd::Serve { .. } | Cmd::Ab(_) | Cmd::Graphs { .. } | Cmd::Report(_) => {
+            unreachable!("handled above")
+        }
         Cmd::Index {
             root,
             service_depth,

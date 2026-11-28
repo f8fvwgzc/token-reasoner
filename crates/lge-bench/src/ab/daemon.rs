@@ -53,6 +53,12 @@ impl HttpDaemon {
         &self.base
     }
 
+    /// `GET` of any path of the page API, such as `/lge/api/compact-whatif`
+    /// (`lge report`). An answer other than 200 is an error.
+    pub fn get(&self, path: &str) -> Result<Value> {
+        self.call("GET", path, None)
+    }
+
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         let uri = format!("{}{path}", self.base);
         let builder = ureq::http::Request::builder().method(method).uri(&uri);

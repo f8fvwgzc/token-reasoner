@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.0.8 (2026-11-28)
+
+A week of real use showed folders that failed to open once many Codex worktrees had
+graphs, and a page that had to be copied by hand to share. This release fixes the first
+and adds `lge report` for the second. lge still never changes the model, the system
+prompt, tool definitions, reasoning items, tool calls, patches or diffs, never raises the
+reasoning effort, and never edits Codex's configuration.
 
 ### Graphs fail to open once a dozen are open
 
@@ -13,6 +19,27 @@
   old setting the 15th failed. Graphs written before this change open as they are: the
   ceiling is a reservation, not a file format, and a large repository's graph is a few
   GB.
+
+### Sharing the page
+
+- `lge report`: the daemon's page as plain text, to share in place of copying the page by
+  hand. It reads `GET /lge/api/status` from the running daemon (`--url`, default
+  `http://127.0.0.1:8787`) and prints every section in the page's order, with numbers
+  formatted as the page does: version and uptime, the cards, the folders (with the error of
+  a failed folder and the warnings on bulky folders), the sessions with the most input
+  (`--sessions N`, default 25, and how many were left out), the long-session note, the
+  packs, the background requests, the rules, the holdout, the prompt cache, the fixed
+  prefix, the unused tools, before and after, and the settings. When the daemon answers
+  `GET /lge/api/compact-whatif` (v0.0.6 and later), its summary is printed too.
+  Everything is read from the JSON as it comes, so the status of an older daemon (v0.0.4,
+  with fewer fields) renders as well: a missing field or section is left out, never shown
+  as `null`. `--redact` replaces each task with a stable label (`session 1`, `session 2`,
+  ... in the table's order, the same in every section) and every folder path and path under
+  the home folder with its last component, in error texts and warnings too; numbers are
+  kept. `--json` prints the status JSON (with the what-if under `compact_whatif`), and
+  `--out <file>` writes to a file. If no daemon answers, it says so and names the address.
+  The HTTP client is the one `lge ab` already uses; `libc` (already in the tree) gives the
+  local time on Unix.
 
 ## v0.0.7 (2026-11-22)
 
