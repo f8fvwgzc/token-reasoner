@@ -52,6 +52,7 @@ pub mod compact;
 mod prices;
 mod record;
 mod report;
+pub mod trim;
 
 pub use codex::{
     background_record, background_session, background_task, background_thread_source, codex_home, find_rollout,

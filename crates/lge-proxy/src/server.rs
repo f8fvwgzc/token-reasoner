@@ -814,6 +814,8 @@ pub struct Daemon {
     guardian_prev: Mutex<crate::guardian::Table>,
     /// The compaction what-if: (signature of the rollouts it was made from, when, answer).
     compact_cache: Mutex<Option<(String, Instant, Value)>>,
+    /// The checkpoint-trim what-if, cached the same way.
+    trim_cache: Mutex<Option<(String, Instant, Value)>>,
 }
 
 /// A poisoned lock means another request panicked; its data is still the best there is.
@@ -1499,6 +1501,7 @@ impl Daemon {
             graph_sizes: Mutex::new(None),
             guardian_prev: Mutex::new(crate::guardian::Table::default()),
             compact_cache: Mutex::new(None),
+            trim_cache: Mutex::new(None),
             traces: Mutex::new(Traces::default()),
             recorded: AtomicU64::new(0),
             clock_offset: AtomicI64::new(0),
@@ -2808,6 +2811,33 @@ impl Daemon {
     /// again when a rollout changed. The answer says nothing about the
     /// configuration, which lge never writes.
     fn compact_whatif(&self) -> Result<Value> {
+        self.cached_whatif(&self.compact_cache, |home, days| {
+            let opts = lge_usage::compact::Options {
+                config: lge_usage::compact::read_config(home),
+                ..Default::default()
+            };
+            serde_json::to_value(lge_usage::compact::whatif(home, days, None, &opts))
+        })
+    }
+
+    /// The checkpoint-trim what-if, read only and cached like the compaction one.
+    fn trim_whatif(&self) -> Result<Value> {
+        self.cached_whatif(&self.trim_cache, |home, days| {
+            let opts = lge_usage::trim::Options {
+                count: lge_retrieve::budget::count,
+                ..Default::default()
+            };
+            serde_json::to_value(lge_usage::trim::whatif(home, days, None, &opts))
+        })
+    }
+
+    /// A what-if over the rollouts of the last 30 days, kept in `cache` for ten
+    /// minutes and made again when a rollout changed.
+    fn cached_whatif(
+        &self,
+        cache: &Mutex<Option<(String, Instant, Value)>>,
+        make: impl FnOnce(&Path, i64) -> serde_json::Result<Value>,
+    ) -> Result<Value> {
         let home = self
             .cfg
             .codex_home
@@ -2824,17 +2854,13 @@ impl Daemon {
                 .map_or(0, |d| d.as_secs());
             signature.push_str(&format!("{}:{}:{};", f.display(), mtime, m.map_or(0, |m| m.len())));
         }
-        if let Some((sig, at, value)) = lock(&self.compact_cache).as_ref() {
+        if let Some((sig, at, value)) = lock(cache).as_ref() {
             if *sig == signature && at.elapsed() < Duration::from_secs(600) {
                 return Ok(value.clone());
             }
         }
-        let opts = lge_usage::compact::Options {
-            config: lge_usage::compact::read_config(&home),
-            ..Default::default()
-        };
-        let value = serde_json::to_value(lge_usage::compact::whatif(&home, days, None, &opts))?;
-        *lock(&self.compact_cache) = Some((signature, Instant::now(), value.clone()));
+        let value = make(&home, days)?;
+        *lock(cache) = Some((signature, Instant::now(), value.clone()));
         Ok(value)
     }
 
@@ -3338,6 +3364,7 @@ impl Daemon {
                 Ok(status)
             }
             (Method::Get, "/lge/api/compact-whatif") => self.compact_whatif(),
+            (Method::Get, "/lge/api/trim-whatif") => self.trim_whatif(),
             (Method::Get, "/lge/api/browse") => Ok(self.browse(query_value(query, "path"))),
             (Method::Post, "/lge/api/repos") => path_arg()
                 .ok_or_else(|| anyhow!("`path` is required"))

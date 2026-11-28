@@ -341,6 +341,8 @@ your choice; lge only reports it and never edits Codex's configuration.
 `lge usage compact-whatif [--days 30] [--limits 100000,150000,200000] [--session <id>] [--json] [--explain]`,
 and the collapsed "What if Codex compacted sooner?" block on the page, replay the long sessions of
 `~/.codex` at other limits: an estimate, never a measured saving (see docs/PROXY.md).
+`lge usage trim-whatif [--days 30] [--session <id>] [--json]` replays the same sessions as if lge
+stubbed old, bulky tool outputs once the input passed a threshold: also an estimate, nothing is trimmed.
 Two options:
 
 - Start a new session per task.
@@ -398,6 +400,7 @@ lge memory recall "token expiry"
 lge usage report                # tokens per task
 lge usage discover              # past Codex sessions through every rule (reads only)
 lge usage compact-whatif        # what a lower compaction limit would cost: an estimate (reads only)
+lge usage trim-whatif           # what stubbing old tool outputs would save: an estimate (reads only)
 lge report --redact             # the daemon's page as plain text, safe to share
 lge check                       # lint, types, tests: failures only
 lge ab tasks.toml               # A/B: each task with lge off and on (spends tokens)

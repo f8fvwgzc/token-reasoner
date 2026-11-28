@@ -835,3 +835,18 @@ a clean synthetic series and within 5% on a noisy one. Codex would work from a s
 compaction, which cannot be modelled: the figure is an estimate and lge never writes your
 configuration. `--explain` says what each rollout held (compacted lines, events, usage records).
 A session is matched to a stored session by id; when there is no match the page says so.
+
+## What if lge trimmed old tool outputs? (an estimate)
+
+`lge usage trim-whatif [--days 30] [--session <id-prefix>] [--json]` and `GET /lge/api/trim-whatif`
+(read only, cached in memory for ten minutes like the compaction what-if) replay the same long
+sessions under a "checkpoint trim": once a request's input reaches a threshold T, every tool output
+(`function_call_output`, `custom_tool_call_output`) at least S tokens large from a user turn at least
+K turns back becomes a 20-token stub, if that removes at least R tokens. The prompt cache keeps the
+prefix up to the first changed byte, so the request after each checkpoint pays uncached only from the
+first trimmed output to the end of its shortened cached prefix (an output's place is estimated from
+the request before it; after a compaction it is unknown and the whole prefix is charged); every
+later request saves the trimmed tokens at the cached price; a later call with the same command or file as a trimmed output counts as a recovery
+and adds that output uncached. A compaction (or input falling below half) empties the history.
+Policies: T 100k/150k, K 2/4, S 500/2000, R 20k. An estimate from a replay, not a measured saving;
+quality effects are not measured, and lge does not trim anything today.

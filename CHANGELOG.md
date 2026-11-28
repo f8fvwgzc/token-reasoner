@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- New `lge usage trim-whatif [--days 30] [--session <id>] [--json]` and
+  `GET /lge/api/trim-whatif`: replays the long sessions of `~/.codex` as if lge had replaced
+  old, bulky tool outputs with a short stub once a conversation's input passed a threshold
+  (one cache miss per checkpoint, from the first trimmed output on, a smaller cached
+  history after it, recoveries counted
+  when a later call runs the same command or reads the same file). It is an estimate from a
+  replay, not a measured saving, and the quality effect of trimming is not measured. It
+  reads only; lge does not trim anything.
+
 ## v0.0.8 (2026-11-28)
 
 A week of real use showed folders that failed to open once many Codex worktrees had

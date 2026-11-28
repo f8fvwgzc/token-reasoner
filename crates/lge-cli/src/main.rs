@@ -323,6 +323,19 @@ enum UsageCmd {
         #[arg(long)]
         explain: bool,
     },
+    /// What if lge trimmed old, bulky tool outputs to a short stub once a conversation's input
+    /// passed a threshold? Replays the long sessions of ~/.codex (or CODEX_HOME) under a few
+    /// policies. An estimate from a replay, never a measured saving; reads only.
+    TrimWhatif {
+        /// Sessions of the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+        /// Only the session whose id starts with this.
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -592,6 +605,25 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&w)?);
         } else {
             print!("{}", lge_usage::compact::render(&w, *explain));
+        }
+        return Ok(());
+    }
+    if let Cmd::Usage {
+        cmd: UsageCmd::TrimWhatif { days, session, json },
+    } = &cli.cmd
+    {
+        if *days <= 0 {
+            bail!("--days must be at least 1");
+        }
+        let opts = lge_usage::trim::Options {
+            count: lge_retrieve::budget::count,
+            ..Default::default()
+        };
+        let w = lge_usage::trim::whatif(&lge_usage::codex_home(), *days, session.as_deref(), &opts);
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&w)?);
+        } else {
+            print!("{}", lge_usage::trim::render(&w));
         }
         return Ok(());
     }
@@ -897,7 +929,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Usage {
-            cmd: UsageCmd::Discover { .. } | UsageCmd::CompactWhatif { .. },
+            cmd: UsageCmd::Discover { .. } | UsageCmd::CompactWhatif { .. } | UsageCmd::TrimWhatif { .. },
         } => unreachable!("handled above"),
         Cmd::Usage {
             cmd: UsageCmd::Report { days, json },

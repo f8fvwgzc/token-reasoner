@@ -4149,6 +4149,39 @@ fn the_compaction_estimate_endpoint_is_a_get_that_changes_nothing_and_is_cached_
 }
 
 #[test]
+fn the_trim_estimate_endpoint_is_a_get_that_lists_the_policies_and_writes_nothing() {
+    let (port, _received) = provider();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("codex");
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let mut cfg = config(dir.path(), &work.canonicalize().unwrap().join("shop"), port);
+    cfg.codex_home = Some(home.clone());
+    let _slot = Slot::take();
+    let s = Serving::start(Daemon::open(cfg).unwrap());
+    let agent = plain_agent();
+    let v: Value = serde_json::from_slice(
+        &agent
+            .get(format!("http://{}/lge/api/trim-whatif", s.addr))
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_vec()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v["sessions"].as_array().map(Vec::len), Some(0), "{v}");
+    assert_eq!(v["policies"].as_array().map(Vec::len), Some(8), "{v}");
+    assert!(v["caveats"][0].as_str().unwrap().contains("not a measured saving"));
+    assert_eq!(
+        std::fs::read_dir(&home).unwrap().count(),
+        1,
+        "nothing is written to the agent home"
+    );
+}
+
+#[test]
 fn the_page_has_the_compaction_estimate_block_under_the_long_session_note_and_loads_it_on_open() {
     let page = include_str!("../src/ui.html");
     let note = page.find("id=\"long_note\"").expect("the long-session note");

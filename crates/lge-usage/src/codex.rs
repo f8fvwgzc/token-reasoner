@@ -554,7 +554,7 @@ pub struct RolloutSeries {
     pub usage_records: usize,
 }
 
-fn usage_numbers(v: &Value) -> (i64, i64, i64, i64, i64) {
+pub(crate) fn usage_numbers(v: &Value) -> (i64, i64, i64, i64, i64) {
     let n = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
     let (input, output) = (n("input_tokens"), n("output_tokens"));
     let total = if v.get("total_tokens").is_some() {
@@ -765,7 +765,7 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
     meta.or(turn)
 }
 
-fn for_each_line(path: &Path, mut each: impl FnMut(&Value)) -> Result<()> {
+pub(crate) fn for_each_line(path: &Path, mut each: impl FnMut(&Value)) -> Result<()> {
     let mut reader = open_rollout(path)?;
     let mut buf = Vec::new();
     loop {
@@ -1043,7 +1043,7 @@ fn count(v: &Value, key: &str) -> i64 {
 }
 
 /// A string field; "" when it is missing or not a string.
-fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
