@@ -142,7 +142,12 @@ say "Building lge (the first build takes a few minutes)"
 (cd "$REPO" && cargo build --release -p lge-cli)
 mkdir -p "$BIN_DIR" "$DATA"
 stop_daemon
-cp "$REPO/target/release/lge" "$BIN"
+# Copy to a new file and rename it into place. Copying over the old binary keeps
+# its inode, and macOS on Apple Silicon then checks the new code against the old
+# file's cached signature and kills it on start ("Killed: 9").
+cp "$REPO/target/release/lge" "$BIN.new"
+codesign --force --sign - "$BIN.new" 2>/dev/null || true
+mv -f "$BIN.new" "$BIN"
 say "Installed $BIN"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

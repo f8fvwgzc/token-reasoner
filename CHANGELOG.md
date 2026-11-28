@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.0.10 (2026-11-28)
+
+- Fix: `scripts/install-macos.sh` could leave an updated lge that macOS kills on start
+  (`Killed: 9`, then "lge did not start"). It copied the new binary over the old one, and
+  on Apple Silicon the kernel then checks the new code against the old file's cached
+  signature. The script now copies to a new file, signs it ad hoc, and renames it into
+  place.
+
 ## v0.0.9 (2026-11-28)
 
 A week of real use showed that re-reading long cached histories is most of Codex's cost,
