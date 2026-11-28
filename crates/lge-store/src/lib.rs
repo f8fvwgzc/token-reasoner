@@ -122,6 +122,14 @@ impl std::fmt::Debug for LadybugStore {
     }
 }
 
+/// The largest a database may grow: 64 GiB. LadybugDB reserves this much
+/// address space for every open database. Its default, 8 TiB, lets only about
+/// a dozen be open in one process on a Mac (`Mmap for size 8796093022208
+/// failed`), and the daemon keeps one graph open per folder, Codex worktrees
+/// included. A graph of a large repository is a few GB, and this ceiling lets
+/// about 2,000 be open at once.
+pub const MAX_DB_SIZE: u64 = 1 << 36;
+
 impl LadybugStore {
     /// Open or create the database at `path`, migrate an older schema, and
     /// load the `fts` extension when it is installed.
@@ -144,7 +152,7 @@ impl LadybugStore {
             std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
         let claim = FileClaim::new(path)?;
-        let db = Database::new(path, SystemConfig::default())
+        let db = Database::new(path, SystemConfig::default().max_db_size(MAX_DB_SIZE))
             .with_context(|| format!("cannot open the database at {}", path.display()))?;
         let store = LadybugStore {
             db,

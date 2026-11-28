@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Graphs fail to open once a dozen are open
+
+- Each graph now reserves at most 64 GiB of address space (`lge_store::MAX_DB_SIZE`)
+  instead of LadybugDB's default of 8 TiB. On a Mac, the default let only about a
+  dozen databases be open in one process; the daemon keeps one graph open per folder,
+  Codex worktrees included, so after that every further folder failed with
+  `cannot open the database ... Mmap for size 8796093022208 failed`. A week of real use
+  showed six folders failed this way. A test opens 40 graphs in one process; with the
+  old setting the 15th failed. Graphs written before this change open as they are: the
+  ceiling is a reservation, not a file format, and a large repository's graph is a few
+  GB.
+
 ## v0.0.7 (2026-11-22)
 
 Three changes to long-term memory (`lge-memory`), all deterministic: no model call, no
