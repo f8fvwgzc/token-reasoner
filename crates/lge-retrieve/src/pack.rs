@@ -31,7 +31,14 @@ pub struct PackOptions {
     /// text gives a short line here instead; the seeds are still found from
     /// the whole task.
     pub header: Option<String>,
+    /// Symbol id -> hash of the source this session already received. A seed
+    /// whose source is unchanged gets a one-line pointer instead, and the
+    /// budget goes to what the session has not seen.
+    pub shown: HashMap<String, String>,
 }
+
+/// Said instead of a source the session already received, unchanged.
+pub const SHOWN_EARLIER: &str = "  (source returned earlier in this session, unchanged; ask get_relevant_source for it if it is no longer in your context)\n";
 
 impl Default for PackOptions {
     fn default() -> Self {
@@ -43,6 +50,7 @@ impl Default for PackOptions {
             depth_used_by: 2,
             max_nodes: 80,
             header: None,
+            shown: HashMap::new(),
         }
     }
 }
@@ -67,6 +75,11 @@ pub struct EvidencePack {
     pub omitted: usize,
     pub unresolved_edges: i64,
     pub inferred_edges: usize,
+    /// Seeds whose whole source the text shows: (symbol id, hash of that
+    /// source), for a caller that remembers what a session received.
+    pub full_sources: Vec<(String, String)>,
+    /// Seeds given [`SHOWN_EARLIER`] instead of their source.
+    pub pointed: Vec<String>,
 }
 
 /// Share of the budget the seed bodies may take together.
@@ -311,6 +324,8 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
     let mut budget = Budget::new(opts.budget);
     let mut text = String::new();
     let mut shown = 0usize;
+    let mut full_sources: Vec<(String, String)> = Vec::new();
+    let mut pointed: Vec<String> = Vec::new();
     let mut omitted = 0usize;
     // Kept back for the closing lines, which must always fit.
     let reserve = 60usize.min(opts.budget / 4);
@@ -382,13 +397,21 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
             false => exact_source(store, root.as_deref(), node).unwrap_or(stored),
         };
         let mut block = String::new();
-        if !body.trim().is_empty() {
+        let seen = !body.trim().is_empty()
+            && opts.shown.get(&node.id) == Some(&lge_core::content_hash(body.trim_end().as_bytes()));
+        if seen && budget.take(count(SHOWN_EARLIER)) {
+            block = SHOWN_EARLIER.to_string();
+            pointed.push(node.id.clone());
+        } else if !seen && !body.trim().is_empty() {
             let (cut, tokens) = truncate_lines(
                 body.trim_end(),
                 body_allowance.min(budget.remaining().saturating_sub(8)),
             );
             // A body cut down to its marker tells nothing.
             if cut.lines().count() > 1 && budget.take(tokens + 8) {
+                if cut == body.trim_end() {
+                    full_sources.push((node.id.clone(), lge_core::content_hash(body.trim_end().as_bytes())));
+                }
                 block = format!("```\n{cut}\n```\n");
             }
         }
@@ -546,6 +569,8 @@ pub fn evidence_pack(store: &dyn GraphStore, task: &str, opts: &PackOptions) -> 
 
     pack.tokens = count(&text);
     pack.text = text;
+    pack.full_sources = full_sources;
+    pack.pointed = pointed;
     pack.seeds = seeds.into_iter().map(|s| s.hit).collect();
     pack.files = files.into_iter().collect();
     pack.services = services.into_iter().collect();

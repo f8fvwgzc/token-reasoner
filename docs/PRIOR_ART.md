@@ -244,6 +244,38 @@ summarise a format lge does not recognise).
   arm. Nothing is migrated, and no edge is invented or rewritten. No tokens are added;
   the change removes a fact that matched every query about a file.
 
+## 2026-11-29: Gortex (Apache-2.0), read for token techniques
+
+[Gortex](https://github.com/zzet/gortex) is a code-intelligence MCP server with Codex
+hooks. Its savings come from agents calling graph tools instead of reading whole files,
+plus a tab-separated wire format for its own tool responses (GCX1, about 27% smaller than
+JSON).
+
+- **Adopted, as a measurement first: re-reads after a compaction.** Gortex briefs the
+  agent once a compaction has happened (its SessionStart hook with source `compact`),
+  because a compacted agent re-reads what it lost. lge now counts that cost from the
+  rollouts: `lge usage trim-whatif` reports the outputs of file reads, in the first 20
+  requests after a compaction, of files read before it, and their cost-weighted tokens.
+  A post-compaction note of the working set in the proxy is built only if those numbers
+  are large. No code was copied.
+- **Adopted: what a session received, kept per session.** Gortex scopes every ledger to
+  an MCP session. lge's daemon now issues `Mcp-Session-Id` and keeps the source it sent
+  per session (before, one record was shared by every client of a folder).
+- **Adopted: conditional answers** (Gortex's ETag and `if_none_match`). A repeated call
+  whose answer did not change gets a one-line pointer to the earlier call. lge needs no
+  argument for it: the server remembers the answer's hash, and a third ask sends the
+  answer whole, since the client evidently lost it.
+- **Adopted: once per session** (Gortex credits a file's source once per session). A
+  search's starting symbol whose source the session already has unchanged gets a pointer,
+  and the budget goes to new code.
+- **Adopted: tiered dropping** (Gortex drops low-signal rows first under a budget). lge's
+  dependency lists put verified edges before inferred and unresolved ones.
+- **Not adopted:** the hooks that deny grep and file reads (they need Codex hooks and
+  edits to Codex's configuration, which lge never makes); enriching grep hits with
+  symbols (adds tokens); a compact tool surface (lge publishes 8 tools, about 870
+  tokens, cached); GCX1 for tool outputs in the proxy (JSON tool outputs are rare in
+  real Codex sessions: 2 in 30 days on one heavy user's machine).
+
 ## Deliberately not adopted
 
 - LLM extraction, contradiction and consolidation calls (graphiti, hindsight): they spend

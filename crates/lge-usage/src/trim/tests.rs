@@ -321,3 +321,43 @@ fn trim_whatif_json_lists_every_policy_the_best_one_and_the_caveat() {
     );
     assert!(text.contains("Warning: This is an estimate from a replay"), "{text}");
 }
+
+#[test]
+fn rereads_count_files_read_again_soon_after_a_compaction() {
+    let mut r = Rollout::new("sess-reread");
+    r.turn()
+        .exec("cat a.rs", 3_000)
+        .exec("cat b.rs", 1_000)
+        .req(60_000, 0, 100);
+    r.compacted();
+    // a.rs again: a re-read; c.rs is new; a later request carries it once cached.
+    r.turn()
+        .exec("cat a.rs", 3_000)
+        .exec("cat c.rs", 500)
+        .req(20_000, 0, 100);
+    r.turn().req(25_000, 20_000, 100);
+    let x = rereads(&r.timeline());
+    assert_eq!(x.compactions, 1);
+    assert_eq!(x.outputs, 1);
+    assert_eq!(x.tokens, 3_000);
+    // Sent uncached once, then cached on the two requests left in the segment.
+    assert!(close(x.cost, 3_000.0 * (1.0 + CACHED_WEIGHT * 2.0)), "{}", x.cost);
+}
+
+#[test]
+fn rereads_ignore_reads_without_a_compaction_and_reads_after_the_window() {
+    let mut r = Rollout::new("sess-noreset");
+    r.turn().exec("cat a.rs", 3_000).req(60_000, 0, 100);
+    r.turn().exec("cat a.rs", 3_000).req(64_000, 60_000, 100);
+    assert_eq!(rereads(&r.timeline()), Rereads::default());
+
+    let mut late = Rollout::new("sess-late");
+    late.turn().exec("cat a.rs", 3_000).req(60_000, 0, 100);
+    late.compacted();
+    for _ in 0..REREAD_WINDOW {
+        late.turn().req(20_000, 0, 100);
+    }
+    late.turn().exec("cat a.rs", 3_000).req(24_000, 20_000, 100);
+    let x = rereads(&late.timeline());
+    assert_eq!((x.compactions, x.outputs), (1, 0));
+}

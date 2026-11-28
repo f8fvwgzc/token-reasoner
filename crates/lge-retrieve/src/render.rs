@@ -193,8 +193,19 @@ pub fn render_deps(d: &Deps, commit: &str, budget_tokens: usize) -> String {
             site(e)
         )
     };
-    out.section("## Uses", d.uses.iter().map(line).collect());
-    out.section("## Used by", d.used_by.iter().map(line).collect());
+    // Verified edges first, guesses last (stable within a tier): a list cut
+    // for the budget drops what is least sure (after Gortex's tiered degrade).
+    let tiered = |edges: &[(EdgeRec, NodeRec)]| -> Vec<String> {
+        let mut sorted: Vec<&(EdgeRec, NodeRec)> = edges.iter().collect();
+        sorted.sort_by_key(|(e, _)| match e.method.as_str() {
+            lge_core::method::STATIC => 0,
+            lge_core::method::INFERRED => 1,
+            _ => 2,
+        });
+        sorted.into_iter().map(line).collect()
+    };
+    out.section("## Uses", tiered(&d.uses));
+    out.section("## Used by", tiered(&d.used_by));
     if d.uses.is_empty() && d.used_by.is_empty() {
         out.force("No edges in the graph.");
     }

@@ -562,6 +562,84 @@ pub fn simulate(tl: &Timeline, policy: &Policy) -> Outcome {
     o.finish()
 }
 
+/// Requests after a compaction in which a file read counts as a re-read of
+/// what the conversation held before it.
+pub const REREAD_WINDOW: usize = 20;
+
+/// Files read again soon after a compaction: what a post-compaction note of
+/// the conversation's working set could spare.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Rereads {
+    pub compactions: usize,
+    /// Outputs, in the first [`REREAD_WINDOW`] requests after a compaction, of
+    /// calls that read a file already read before it (since the start or the
+    /// compaction before).
+    pub outputs: usize,
+    pub tokens: i64,
+    /// Their cost-weighted tokens: sent once uncached, then cached on every
+    /// later request until the next compaction.
+    pub cost: f64,
+}
+
+impl Rereads {
+    fn add(&mut self, o: &Rereads) {
+        self.compactions += o.compactions;
+        self.outputs += o.outputs;
+        self.tokens += o.tokens;
+        self.cost += o.cost;
+    }
+}
+
+/// Counts the file re-reads after each compaction of a timeline.
+pub fn rereads(tl: &Timeline) -> Rereads {
+    // Requests left until the next compaction, after each event.
+    let mut left = vec![0usize; tl.events.len()];
+    let mut n = 0;
+    for (i, e) in tl.events.iter().enumerate().rev() {
+        match e {
+            Event::Reset => n = 0,
+            Event::Request { .. } => n += 1,
+            _ => {}
+        }
+        left[i] = n;
+    }
+    let mut r = Rereads::default();
+    let mut before: HashSet<String> = HashSet::new();
+    let mut current: HashSet<String> = HashSet::new();
+    let mut since_reset: Option<usize> = None;
+    let mut pending: HashMap<String, bool> = HashMap::new();
+    for (i, e) in tl.events.iter().enumerate() {
+        match e {
+            Event::Reset => {
+                r.compactions += 1;
+                before = std::mem::take(&mut current);
+                since_reset = Some(0);
+            }
+            Event::Request { .. } => {
+                if let Some(k) = since_reset.as_mut() {
+                    *k += 1;
+                }
+            }
+            Event::Call { call_id, keys } => {
+                let files: Vec<&String> = keys.iter().filter(|k| k.starts_with("file:")).collect();
+                let in_window = since_reset.is_some_and(|k| k < REREAD_WINDOW);
+                let again = in_window && files.iter().any(|f| before.contains(*f));
+                pending.insert(call_id.clone(), again);
+                current.extend(files.into_iter().cloned());
+            }
+            Event::Output { call_id, tokens } => {
+                if pending.remove(call_id) == Some(true) {
+                    r.outputs += 1;
+                    r.tokens += tokens;
+                    r.cost += *tokens as f64 * (1.0 + CACHED_WEIGHT * left[i] as f64);
+                }
+            }
+            Event::Turn => {}
+        }
+    }
+    r
+}
+
 /// One long session under every policy.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionTrim {
@@ -571,6 +649,8 @@ pub struct SessionTrim {
     pub tool_outputs: usize,
     pub tool_output_tokens: i64,
     pub actual_cost: f64,
+    /// Files read again soon after a compaction.
+    pub rereads: Rereads,
     /// One per policy, in the order of [`TrimWhatIf::policies`].
     pub outcomes: Vec<Outcome>,
 }
@@ -589,6 +669,7 @@ pub fn analyse(session_id: &str, model: &str, tl: &Timeline, policies: &[Policy]
         tool_outputs: outputs.clone().count(),
         tool_output_tokens: outputs.sum(),
         actual_cost: outcomes.first().map_or(0.0, |o| o.actual_cost),
+        rereads: rereads(tl),
         outcomes,
     }
 }
@@ -626,6 +707,8 @@ pub struct TrimWhatIf {
     pub totals: Vec<Outcome>,
     /// The policy with the largest net saving, by index.
     pub best: Option<usize>,
+    /// File re-reads after compactions, over the sessions.
+    pub rereads: Rereads,
     pub sessions: Vec<SessionTrim>,
     pub caveats: Vec<&'static str>,
 }
@@ -678,6 +761,10 @@ pub fn whatif(codex_home: &Path, days: i64, session: Option<&str>, opts: &Option
                 .map(|(i, _)| i)
         })
         .flatten();
+    let mut all = Rereads::default();
+    for s in &sessions {
+        all.add(&s.rereads);
+    }
     TrimWhatIf {
         generated_at: now,
         days,
@@ -687,6 +774,7 @@ pub fn whatif(codex_home: &Path, days: i64, session: Option<&str>, opts: &Option
         policies: opts.policies.clone(),
         totals,
         best,
+        rereads: all,
         sessions,
         caveats: vec![CAVEAT],
     }
@@ -778,8 +866,57 @@ pub fn render(w: &TrimWhatIf) -> String {
             t.recoveries
         );
     }
+    render_rereads(&mut o, w);
     let _ = writeln!(o, "\nWarning: {CAVEAT}");
     o
+}
+
+fn render_rereads(o: &mut String, w: &TrimWhatIf) {
+    use std::fmt::Write;
+    let r = &w.rereads;
+    let actual: f64 = w.sessions.iter().map(|s| s.actual_cost).sum();
+    let share = if actual > 0.0 { r.cost / actual * 100.0 } else { 0.0 };
+    let _ = writeln!(
+        o,
+        "\nre-reads after compaction (files read again in the first {REREAD_WINDOW} requests after a compaction that were read before it):"
+    );
+    let _ = writeln!(
+        o,
+        "{:<10} {:>11} {:>8} {:>10} {:>10} {:>7}",
+        "session", "compactions", "outputs", "tokens", "cost", "share"
+    );
+    for s in &w.sessions {
+        let x = &s.rereads;
+        let pct = if s.actual_cost > 0.0 {
+            x.cost / s.actual_cost * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            o,
+            "{:<10} {:>11} {:>8} {:>10} {:>10} {:>6.1}%",
+            s.session_id.chars().take(8).collect::<String>(),
+            x.compactions,
+            x.outputs,
+            x.tokens,
+            kilo(x.cost),
+            pct
+        );
+    }
+    let _ = writeln!(
+        o,
+        "{:<10} {:>11} {:>8} {:>10} {:>10} {:>6.1}%",
+        "TOTAL",
+        r.compactions,
+        r.outputs,
+        r.tokens,
+        kilo(r.cost),
+        share
+    );
+    let _ = writeln!(
+        o,
+        "A lower model_auto_compact_token_limit means more compactions and more of these; a note of the working set after each compaction is what could spare them."
+    );
 }
 
 #[cfg(test)]

@@ -159,7 +159,7 @@ fn code_tools_answer_compactly_and_end_with_the_commit() {
         json!({ "symbols": ["create_order"] }),
     );
     assert!(
-        again.contains("orders_api.routes.create_order  (source already shown above in this session, unchanged)"),
+        again.contains("orders_api.routes.create_order  (source returned earlier in this session, unchanged"),
         "{again}"
     );
     assert!(!again.contains("def create_order"), "{again}");
@@ -178,9 +178,17 @@ fn code_tools_answer_compactly_and_end_with_the_commit() {
         json!({ "symbols": ["insert_order"] }),
     );
     assert!(
-        second.contains("already shown above") && !second.contains("def insert_order"),
+        second.contains("returned earlier in this session") && !second.contains("def insert_order"),
         "{second}"
     );
+    // Asked once more, the client evidently no longer has it: sent whole.
+    let (third, _) = call(
+        &mut server,
+        41,
+        "get_relevant_source",
+        json!({ "symbols": ["insert_order"] }),
+    );
+    assert!(third.contains("def insert_order(customer_id, total):"), "{third}");
 
     let (lines, _) = call(
         &mut server,
@@ -277,4 +285,61 @@ fn an_edited_file_is_reindexed_before_the_next_answer() {
         "{after}"
     );
     assert!(after.contains("Cancel an order that was not shipped."), "{after}");
+}
+
+#[test]
+fn what_a_session_received_is_remembered_per_session_only() {
+    let (_dir, mut server) = server();
+    let ask = json!({ "symbols": ["insert_order"] });
+    let a1 = server.call_in(Some("a"), "get_relevant_source", &ask).unwrap();
+    assert!(a1.contains("def insert_order"), "{a1}");
+    // Another session never received it: it gets the source.
+    let b1 = server.call_in(Some("b"), "get_relevant_source", &ask).unwrap();
+    assert!(b1.contains("def insert_order"), "{b1}");
+    // A client without a session is never told it has something.
+    for _ in 0..2 {
+        let none = server.call_in(None, "get_relevant_source", &ask).unwrap();
+        assert!(none.contains("def insert_order"), "{none}");
+    }
+    // The first session did receive it.
+    let a2 = server.call_in(Some("a"), "get_relevant_source", &ask).unwrap();
+    assert!(
+        a2.contains("returned earlier") && !a2.contains("def insert_order"),
+        "{a2}"
+    );
+}
+
+#[test]
+fn a_repeated_call_with_the_same_answer_gets_a_pointer_then_the_answer() {
+    let (_dir, mut server) = server();
+    let ask = json!({ "target": "insert_order" });
+    let first = server.call_in(Some("s"), "find_dependencies", &ask).unwrap();
+    assert!(first.contains("# Dependencies of"), "{first}");
+    let second = server.call_in(Some("s"), "find_dependencies", &ask).unwrap();
+    assert!(second.starts_with("Same answer as call 1 of this session"), "{second}");
+    assert!(lge_retrieve::budget::count(&second) < 40, "{second}");
+    let third = server.call_in(Some("s"), "find_dependencies", &ask).unwrap();
+    assert_eq!(third, first);
+}
+
+#[test]
+fn a_search_points_to_source_the_session_already_received() {
+    let (_dir, mut server) = server();
+    let ask = json!({ "question": "create_order must validate the payload" });
+    let first = server.call_in(Some("s"), "search_code_context", &ask).unwrap();
+    assert!(first.contains("def create_order(payload: dict):"), "{first}");
+    let second = server.call_in(Some("s"), "search_code_context", &ask).unwrap();
+    assert!(
+        second.contains(lge_retrieve::SHOWN_EARLIER.trim_end()) && !second.contains("def create_order(payload: dict):"),
+        "{second}"
+    );
+    // Pointed to once: get_relevant_source now sends it whole.
+    let source = server
+        .call_in(
+            Some("s"),
+            "get_relevant_source",
+            &json!({ "symbols": ["create_order"] }),
+        )
+        .unwrap();
+    assert!(source.contains("def create_order(payload: dict):"), "{source}");
 }

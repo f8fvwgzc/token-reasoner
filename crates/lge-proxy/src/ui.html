@@ -5,167 +5,231 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lge</title>
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --ink:#15181d; --dim:#667085; --line:#e3e6eb; --accent:#1d6f5c; --warn:#b54708; --bad:#b42318; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1e24; --ink:#e8eaed; --dim:#98a2b3; --line:#2a3038; --accent:#4cc2a4; --warn:#f0a35e; --bad:#f97066; } }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  main { max-width:1080px; margin:0 auto; padding:20px 16px 48px; }
-  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
-  h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
-  .dim { color:var(--dim); } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:18px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
-  .big { font-size:22px; font-weight:650; } .ok { color:var(--accent); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-  section { margin-bottom:22px; }
-  table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--dim); font-weight:600; font-size:12px; } td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
-  .scroll { overflow-x:auto; }
-  input[type=text] { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
-  button { padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
+  :root { --bg:#f3f4f6; --card:#fff; --ink:#15181d; --dim:#667085; --line:#e3e6eb; --accent:#1d6f5c; --accent-soft:#e3f2ee; --warn:#b54708; --bad:#b42318; --shadow:0 10px 40px rgba(16,24,40,.18); }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0e1115; --card:#171b21; --ink:#e8eaed; --dim:#98a2b3; --line:#262c34; --accent:#4cc2a4; --accent-soft:#16302a; --warn:#f0a35e; --bad:#f97066; --shadow:0 10px 40px rgba(0,0,0,.5); } }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow:hidden; }
+  .app { height:100vh; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:8px; padding:8px 10px; }
+  .top { display:flex; align-items:center; gap:10px; min-width:0; }
+  h1 { font-size:17px; margin:0; letter-spacing:-.01em; }
+  #sub { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:0 1 auto; }
+  .tabs { display:flex; gap:2px; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:2px; margin-left:auto; flex:none; }
+  .tabs button { border:0; background:transparent; padding:5px 11px; border-radius:7px; color:var(--dim); }
+  .tabs button.on { background:var(--accent-soft); color:var(--ink); font-weight:600; }
+  .dim { color:var(--dim); } .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:9px 11px; min-width:0; }
+  #cards .card { padding:7px 10px; cursor:help; } #cards .big { font-size:18px; }
+  #cards .card > .dim:last-child { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; font-size:11.5px; }
+  #p_sessions .pane:first-child .foot { max-height:84px; }
+  .big { font-size:20px; font-weight:650; } .ok { color:var(--accent); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .panels { min-height:0; }
+  .panel { display:none; height:100%; min-height:0; gap:8px; }
+  .panel.on { display:grid; }
+  .pane { background:var(--card); border:1px solid var(--line); border-radius:10px; min-height:0; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+  .pane > h2 { font-size:11.5px; margin:0; padding:8px 11px; color:var(--dim); font-weight:650; text-transform:uppercase; letter-spacing:.05em; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  .pane > h2 .row { margin-left:auto; text-transform:none; letter-spacing:0; font-weight:400; }
+  .fill { flex:1 1 auto; min-height:0; overflow:auto; }
+  .foot { padding:7px 11px; border-top:1px solid var(--line); max-height:34%; overflow:auto; flex:none; }
+  .note { padding:7px 11px; border-bottom:1px solid var(--line); flex:none; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:5px 9px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:600; font-size:11.5px; position:sticky; top:0; background:var(--card); z-index:1; box-shadow:0 1px 0 var(--line); }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  tr.click { cursor:pointer; } tr.click:hover td { background:var(--accent-soft); }
+  .scroll { overflow:auto; }
+  input[type=text] { width:100%; padding:6px 9px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+  button { padding:5px 11px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; } button:disabled { opacity:.5; cursor:default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; } .grow { flex:1 1 260px; }
-  pre { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0 0; }
-  .folders { max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin-top:8px; }
-  .folders div { padding:6px 10px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:9px 11px; overflow-x:auto; margin:8px 0 0; }
+  .folders { max-height:200px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin-top:8px; }
+  .folders div { padding:5px 10px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
   .folders div:hover { background:var(--bg); }
   label.switch { display:flex; gap:8px; align-items:center; }
-  #msg { min-height:20px; }
-  .banner { background:var(--card); border:1px solid var(--bad); color:var(--bad); border-radius:10px; padding:10px 14px; margin-bottom:16px; }
-  select, input[type=number] { padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
+  #msg { min-height:18px; }
+  .banner { background:var(--card); border:1px solid var(--bad); color:var(--bad); border-radius:10px; padding:8px 12px; }
+  select, input[type=number] { padding:4px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font:inherit; }
   input[type=number] { width:90px; }
-  .tag { display:inline-block; padding:1px 7px; border-radius:999px; border:1px solid var(--line); font-size:12px; }
-  .sub { margin-top:14px; } .sub h3 { font-size:13px; margin:0 0 6px; color:var(--dim); font-weight:600; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; border:1px solid var(--line); font-size:11.5px; }
+  .sub { margin-top:10px; } .sub h3 { font-size:12px; margin:0 0 4px; color:var(--dim); font-weight:600; }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--ink); padding:0; width:min(760px, calc(100vw - 32px)); max-height:calc(100vh - 48px); box-shadow:var(--shadow); }
+  dialog::backdrop { background:rgba(0,0,0,.35); }
+  .dhead { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line); }
+  .dhead h2 { font-size:14px; margin:0; } .dhead button { margin-left:auto; }
+  .dbody { padding:12px 14px; overflow:auto; display:grid; gap:12px; }
+  .drawer { position:fixed; top:0; right:0; height:100vh; width:min(620px, 100vw); background:var(--card); border-left:1px solid var(--line); box-shadow:var(--shadow); transform:translateX(100%); transition:transform .18s ease; display:flex; flex-direction:column; z-index:10; }
+  .drawer.open { transform:none; }
+  .drawer .dbody { flex:1; }
+  .kv td:first-child { color:var(--dim); width:42%; }
+  /* Layouts of the panels */
+  #p_sessions { grid-template-rows:minmax(0,1fr) minmax(0,34%); }
+  #p_sessions .bottom { display:grid; grid-template-columns:1fr 1fr; gap:8px; min-height:0; }
+  #p_rules { grid-template-columns:minmax(0,3fr) minmax(0,2fr); }
+  #p_savings { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  #p_cache { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  #p_folders { grid-template-columns:minmax(0,3fr) minmax(0,2fr); }
+  #p_replay { grid-template-columns:minmax(0,1fr); }
+  @media (max-width: 900px) {
+    body { overflow:auto; } .app { height:auto; min-height:100vh; }
+    .top { flex-wrap:wrap; } .tabs { margin-left:0; overflow-x:auto; max-width:100%; }
+    .panel.on { display:flex; flex-direction:column; height:auto; } .pane { max-height:70vh; }
+    #p_sessions .bottom { grid-template-columns:1fr; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <header>
+<div class="app">
+  <div class="top">
     <h1>lge</h1>
     <span class="dim" id="sub">connecting…</span>
-  </header>
+    <nav class="tabs" id="tabs">
+      <button data-tab="sessions">Sessions</button>
+      <button data-tab="rules">Rules</button>
+      <button data-tab="savings">Savings</button>
+      <button data-tab="cache">Cache</button>
+      <button data-tab="folders">Folders</button>
+      <button data-tab="replay">Replay</button>
+    </nav>
+    <button id="open_connect">Connect Codex</button>
+    <button id="open_settings">Settings</button>
+  </div>
 
   <div class="banner" id="settings_error" hidden></div>
 
   <div class="grid" id="cards"></div>
 
-  <section>
-    <h2>Connect Codex</h2>
-    <div class="card">
-      <div>Add this to <span class="mono">~/.codex/config.toml</span>. One line: model requests go through this proxy, your ChatGPT or API-key login stays as it is, and the CLI and the desktop app both read this file. Remove the line to stop.</div>
-      <pre class="mono" id="snippet"></pre>
-      <div class="dim" style="margin-top:8px">Optional: the graph tools for the agent: <span class="mono" id="mcpcmd"></span></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Folders in the graph</h2>
-    <div class="card">
-      <div class="scroll"><table id="repos"></table></div>
-      <div class="dim" id="graphs_line" style="margin-top:10px"></div>
-      <div class="scroll"><table id="graphs"></table></div>
-      <div class="row" style="margin-top:12px">
-        <input class="grow" type="text" id="path" placeholder="/path/to/a/repository" autocomplete="off">
-        <button id="browse">Browse</button>
-        <button class="primary" id="add">Add and index</button>
+  <main class="panels">
+    <section class="panel" id="p_sessions">
+      <div class="pane">
+        <h2>Sessions through the proxy <span class="row dim">click a row for its details</span></h2>
+        <div class="fill"><table id="sessions"></table></div>
+        <div class="foot">
+          <div class="warn" id="long_note" hidden></div>
+          <details id="whatif_box" hidden><summary>What if Codex compacted sooner? (an estimate, read from Codex's own session files)</summary><div class="dim" id="whatif_body">Open to load.</div></details>
+          <div class="dim" id="packs_line" style="margin-top:6px"></div>
+          <div class="dim" id="unread_line" style="margin-top:4px"></div>
+        </div>
       </div>
-      <div class="folders" id="folders" hidden></div>
-      <div id="msg" class="dim" style="margin-top:8px"></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Sessions through the proxy</h2>
-    <div class="card">
-      <div class="scroll"><table id="sessions"></table></div>
-      <div class="warn" id="long_note" style="margin-top:10px" hidden></div>
-      <details id="whatif_box" style="margin-top:10px" hidden><summary>What if Codex compacted sooner? (an estimate, read from Codex's own session files)</summary><div class="dim" id="whatif_body">Open to load.</div></details>
-      <div class="dim" id="packs_line" style="margin-top:10px"></div>
-      <div class="dim" id="unread_line" style="margin-top:6px"></div>
-      <div class="sub"><h3>Codex's background requests (approval reviews, reviews, titles, recaps, memory): no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session (each re-sends the history: its input is counted per request)</h3><div class="scroll"><table id="background"></table></div><div class="dim" id="guardian_line" style="margin-top:6px"></div></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Rules</h2>
-    <div class="card">
-      <div class="dim">Each rule runs <b>off</b>, in <b>shadow</b> (what it would save is counted, the output is sent as it is) or <b>on</b>. A change applies to outputs seen from then on; outputs already sent keep their bytes. A lossy rule whose outputs are recovered (re-run, re-read) more than <span id="th_demote"></span> of the time over at least <span id="th_min"></span> judged outputs moves to shadow by itself; below <span id="th_healthy"></span> it is healthy. Counts are over the stored sessions of the last <span id="th_days"></span> days.</div>
-      <div class="scroll" style="margin-top:10px"><table id="rules"></table></div>
-      <div class="sub"><h3>Skeletons of first reads, by language and size (measured)</h3><div class="scroll"><table id="cohorts"></table></div></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Holdout</h2>
-    <div class="card">
-      <div class="row">
-        <span>Share of new conversations held out (every rule in shadow, nothing added):</span>
-        <input type="number" id="holdout_share" min="0" max="1" step="0.05">
-        <button id="holdout_save">Save</button>
+      <div class="bottom">
+        <div class="pane">
+          <h2>Codex's background requests</h2>
+          <div class="note dim">Approval reviews, reviews, titles, recaps, memory: no pack, left out of the holdout comparison and of before and after. Requests for a compaction's summary are counted under compaction and stay in their session (each re-sends the history: its input is counted per request).</div>
+          <div class="fill"><table id="background"></table></div>
+          <div class="foot dim" id="guardian_line"></div>
+        </div>
+        <div class="pane">
+          <h2>Before and after</h2>
+          <div class="fill"><table id="modes"></table></div>
+          <div class="foot dim">Over every stored session. Sessions of an <span class="mono">lge ab</span> run are counted apart; runs recorded before lge tagged them cannot be told apart and count as through the proxy.
+            <div class="row" style="margin-top:6px"><button id="import">Import past Codex sessions</button><span>Reads token counts from the agent's session files to get a baseline. No conversation text is stored.</span></div></div>
+        </div>
       </div>
-      <div class="scroll" style="margin-top:10px"><table id="holdout"></table></div>
-      <div class="dim" id="holdout_note" style="margin-top:6px"></div>
-    </div>
-  </section>
+    </section>
 
-  <section>
-    <h2>Prompt cache</h2>
-    <div class="card">
-      <div class="grid" id="monitor" style="margin-bottom:8px"></div>
-      <div class="dim">A break caused by lge is a bug: the bytes lge sent for an earlier item changed. A client break is Codex changing its own history (a compaction, an edit). A cold restart is a response after more than 5 idle minutes that read less than half of the previous request from the cache.</div>
-      <div class="scroll" style="margin-top:10px"><table id="breaks"></table></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Fixed prefix</h2>
-    <div class="card">
-      <div class="dim">What Codex sends at the start of every request, by tool group, since the daemon started. Report only: lge never changes tool definitions or your configuration. To drop a server you do not use, remove its <span class="mono">[mcp_servers.&lt;name&gt;]</span> entry from <span class="mono">~/.codex/config.toml</span>.</div>
-      <div class="scroll" style="margin-top:10px"><table id="groups"></table></div>
-      <div class="sub"><h3>Tools never called since the daemon started (a call inside an exec script counts by its name there)</h3><div class="scroll"><table id="ghosts"></table></div></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Past sessions replayed</h2>
-    <div class="card">
-      <div class="row">
-        <button id="discover">Replay past sessions</button>
-        <span class="dim">Runs every rule over the tool outputs of your Codex sessions of the last 30 days, in memory. Nothing is stored.</span>
+    <section class="panel" id="p_rules">
+      <div class="pane">
+        <h2>Rules</h2>
+        <div class="note"><span class="dim">Each rule runs <b>off</b>, in <b>shadow</b> (what it would save is counted, the output is sent as it is) or <b>on</b>. A change applies to outputs seen from then on; outputs already sent keep their bytes. A lossy rule whose outputs are recovered (re-run, re-read) more than <span id="th_demote"></span> of the time over at least <span id="th_min"></span> judged outputs moves to shadow by itself; below <span id="th_healthy"></span> it is healthy. Counts are over the stored sessions of the last <span id="th_days"></span> days.</span></div>
+        <div class="fill"><table id="rules"></table></div>
       </div>
-      <div id="discovered"></div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Before and after</h2>
-    <div class="card">
-      <div class="scroll"><table id="modes"></table></div>
-      <div class="dim" style="margin-top:6px">Over every stored session. Sessions of an <span class="mono">lge ab</span> run are counted apart; runs recorded before lge tagged them cannot be told apart and count as through the proxy.</div>
-      <div class="row" style="margin-top:12px">
-        <button id="import">Import past Codex sessions</button>
-        <span class="dim">Reads token counts from the agent's session files to get a baseline. No conversation text is stored.</span>
+      <div class="pane">
+        <h2>Skeletons of first reads, by language and size (measured)</h2>
+        <div class="fill"><table id="cohorts"></table></div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section>
-    <h2>Settings</h2>
-    <div class="card row">
-      <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
-      <label class="switch"><input type="checkbox" id="s_shorten"> Apply the rules to tool output (each rule's own switch is in the table above)</label>
-      <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
-      <span class="row"><span>Tokens of graph context in one request at most (every pack is re-sent on every later request):</span>
-        <input type="number" id="pack_conversation_budget" min="0" step="100"> <button id="pack_budget_save">Save</button></span>
-      <span class="row"><span>Lower the reasoning effort when the router recommends it:</span>
-        <select id="router_apply">
-          <option value="off">off (log the recommendation only)</option>
-          <option value="low-only">low only (a change in one file)</option>
-          <option value="low-and-medium">low and medium (one service)</option>
-        </select>
-        <span class="dim">Never raises the effort. Decided on a conversation's first request (only when lge sees it from its start) and kept for all of it, the request for a compaction's summary included. Held-out and background sessions are never changed.</span></span>
-    </div>
-  </section>
-</main>
+    <section class="panel" id="p_savings">
+      <div class="pane">
+        <h2>Holdout <span class="row"><span class="dim">share held out</span><input type="number" id="holdout_share" min="0" max="1" step="0.05"><button id="holdout_save">Save</button></span></h2>
+        <div class="note dim">Share of new conversations held out: every rule in shadow, nothing added. The two arms measure what lge saves.</div>
+        <div class="fill"><table id="holdout"></table></div>
+        <div class="foot dim" id="holdout_note"></div>
+      </div>
+      <div class="pane">
+        <h2>Prompt cache</h2>
+        <div class="note"><div class="grid" id="monitor"></div></div>
+        <div class="note dim">A break caused by lge is a bug: the bytes lge sent for an earlier item changed. A client break is Codex changing its own history (a compaction, an edit). A cold restart is a response after more than 5 idle minutes that read less than half of the previous request from the cache.</div>
+        <div class="fill"><table id="breaks"></table></div>
+      </div>
+    </section>
+
+    <section class="panel" id="p_cache">
+      <div class="pane">
+        <h2>Fixed prefix</h2>
+        <div class="note dim">What Codex sends at the start of every request, by tool group, since the daemon started. Report only: lge never changes tool definitions or your configuration. To drop a server you do not use, remove its <span class="mono">[mcp_servers.&lt;name&gt;]</span> entry from <span class="mono">~/.codex/config.toml</span>.</div>
+        <div class="fill"><table id="groups"></table></div>
+      </div>
+      <div class="pane">
+        <h2>Tools never called since the daemon started</h2>
+        <div class="note dim">A call inside an exec script counts by its name there.</div>
+        <div class="fill"><table id="ghosts"></table></div>
+      </div>
+    </section>
+
+    <section class="panel" id="p_folders">
+      <div class="pane">
+        <h2>Folders in the graph</h2>
+        <div class="fill"><table id="repos"></table></div>
+        <div class="foot">
+          <div class="row">
+            <input class="grow" type="text" id="path" placeholder="/path/to/a/repository" autocomplete="off">
+            <button id="browse">Browse</button>
+            <button class="primary" id="add">Add and index</button>
+          </div>
+          <div class="folders" id="folders" hidden></div>
+          <div id="msg" class="dim" style="margin-top:6px"></div>
+        </div>
+      </div>
+      <div class="pane">
+        <h2>Graphs on disk</h2>
+        <div class="note dim" id="graphs_line"></div>
+        <div class="fill"><table id="graphs"></table></div>
+      </div>
+    </section>
+
+    <section class="panel" id="p_replay">
+      <div class="pane">
+        <h2>Past sessions replayed <span class="row"><button id="discover">Replay past sessions</button></span></h2>
+        <div class="note dim">Runs every rule over the tool outputs of your Codex sessions of the last 30 days, in memory. Nothing is stored.</div>
+        <div class="fill" style="padding:8px 11px"><div id="discovered"></div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="connect_dialog">
+  <div class="dhead"><h2>Connect Codex</h2><button data-close>Close</button></div>
+  <div class="dbody">
+    <div>Add this to <span class="mono">~/.codex/config.toml</span>. One line: model requests go through this proxy, your ChatGPT or API-key login stays as it is, and the CLI and the desktop app both read this file. Remove the line to stop.</div>
+    <pre class="mono" id="snippet"></pre>
+    <div class="dim">Optional: the graph tools for the agent: <span class="mono" id="mcpcmd"></span></div>
+  </div>
+</dialog>
+
+<dialog id="settings_dialog">
+  <div class="dhead"><h2>Settings</h2><button data-close>Close</button></div>
+  <div class="dbody">
+    <label class="switch"><input type="checkbox" id="s_inject"> Add graph context after a message about the code</label>
+    <label class="switch"><input type="checkbox" id="s_shorten"> Apply the rules to tool output (each rule's own switch is on the Rules tab)</label>
+    <label class="switch"><input type="checkbox" id="s_auto"> Index a git repository the first time the agent works in it</label>
+    <div class="row"><span>Tokens of graph context in one request at most (every pack is re-sent on every later request):</span>
+      <input type="number" id="pack_conversation_budget" min="0" step="100"> <button id="pack_budget_save">Save</button></div>
+    <div class="row"><span>Lower the reasoning effort when the router recommends it:</span>
+      <select id="router_apply">
+        <option value="off">off (log the recommendation only)</option>
+        <option value="low-only">low only (a change in one file)</option>
+        <option value="low-and-medium">low and medium (one service)</option>
+      </select></div>
+    <div class="dim">Never raises the effort. Decided on a conversation's first request (only when lge sees it from its start) and kept for all of it, the request for a compaction's summary included. Held-out and background sessions are never changed.</div>
+  </div>
+</dialog>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="dhead"><h2 id="drawer_title">Session</h2><button id="drawer_close">Close</button></div>
+  <div class="dbody" id="drawer_body"></div>
+</aside>
 <script>
 const $ = id => document.getElementById(id);
 const n = v => (v || 0).toLocaleString();
@@ -226,7 +290,7 @@ function render(s, seq) {
     ['Graph context added', n(sv.context_tokens), `${n(sv.contexts_added)} packs; since the daemon started ${since}, each pack counted once`],
     ['Kept out of requests', n(an.removed_tokens_sent), 'all stored sessions, on every request that carried the change'],
     ['Packs sent', n(an.added_tokens_sent), 'all stored sessions, on every request that carried a pack'],
-  ].map(([k, v, d]) => `<div class="card"><div class="dim">${k}</div><div class="big">${v}</div><div class="dim">${d}</div></div>`).join('');
+  ].map(([k, v, d]) => `<div class="card" title="${esc(String(d || '').replace(/<[^>]*>/g, ''))}"><div class="dim">${k}</div><div class="big">${v}</div><div class="dim">${d}</div></div>`).join('');
 
   const origin = location.origin;
   $('snippet').textContent = `openai_base_url = "${origin}/v1"`;
@@ -261,8 +325,9 @@ function render(s, seq) {
   // Packs of a session, when it had any decision about one.
   const packsOf = x => (x.packs_added || x.packs_known || x.packs_over_budget || x.packs_too_large || x.packs_retired)
     ? ` · packs: ${n(x.packs_added)} added, ${n(x.packs_known)} already known, ${n(x.packs_over_budget)} no room, ${n(x.packs_too_large)} too large, ${n(x.packs_retired)} retired after a rewrite of the history` : '';
+  shownSessions = s.sessions;
   $('sessions').innerHTML = '<tr><th>Task</th><th class="n">Requests</th><th class="n">Input / request</th><th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th><th class="n">Reasoning</th><th class="n">Kept out (all requests)</th><th class="n">Added</th><th class="n">Net</th><th class="n">Net share</th></tr>' +
-    (s.sessions.length ? s.sessions.map(x => `<tr><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(clean_task(x.task) || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${x.ab_arm ? ' · lge ab arm ' + esc(x.ab_arm) : ''}${packsOf(x)}</div></td>
+    (s.sessions.length ? s.sessions.map((x, i) => `<tr class="click" data-i="${i}"><td>${x.background ? `<span class="tag">background: ${esc(x.background)}</span> ` : ''}${esc(clean_task(x.task) || '(no typed message)')}<div class="dim">${esc(x.model || '')}${x.repo ? ' · ' + esc(x.repo.split('/').pop()) : ''}${x.recommended_level ? ' · router: ' + esc(x.recommended_level) + (x.applied_level ? ' (applied)' : '') : ''}${x.mode === 'proxy-holdout' ? ' · held out' : ''}${x.ab_arm ? ' · lge ab arm ' + esc(x.ab_arm) : ''}${packsOf(x)}</div></td>
       <td class="n">${nn(x.requests)}</td><td class="n">${nn(x.mean_input_tokens)}</td><td class="n">${n(x.input_tokens)}</td><td class="n">${pct(x.cached_input_tokens, x.input_tokens)}</td>
       <td class="n">${n(x.output_tokens)}</td><td class="n">${n(x.reasoning_tokens)}</td>
       <td class="n">${n(x.removed_tokens_sent)}</td><td class="n">${n(x.added_tokens_sent)}</td><td class="n">${n(x.net_tokens)}</td><td class="n">${rate(x.net_share)}</td></tr>`).join('')
@@ -495,6 +560,57 @@ $('discover').onclick = async () => {
   } catch (e) { $('discovered').innerHTML = `<div class="bad">${esc(e.message)}</div>`; }
   $('discover').disabled = false;
 };
+
+// ---- tabs, dialogs and the session drawer ---------------------------------
+let shownSessions = [];
+function showTab(name) {
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'p_' + name));
+  try { localStorage.setItem('lge_tab', name); } catch (e) {}
+}
+$('tabs').onclick = e => { const b = e.target.closest('button[data-tab]'); if (b) showTab(b.dataset.tab); };
+let firstTab = 'sessions';
+try { firstTab = localStorage.getItem('lge_tab') || 'sessions'; } catch (e) {}
+if (!document.getElementById('p_' + firstTab)) firstTab = 'sessions';
+showTab(firstTab);
+$('open_settings').onclick = () => $('settings_dialog').showModal();
+$('open_connect').onclick = () => $('connect_dialog').showModal();
+document.querySelectorAll('dialog').forEach(d => {
+  d.addEventListener('click', e => { if (e.target === d || e.target.closest('[data-close]')) d.close(); });
+});
+const closeDrawer = () => { $('drawer').classList.remove('open'); $('drawer').setAttribute('aria-hidden', 'true'); };
+$('drawer_close').onclick = closeDrawer;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+const LABELS = { id: 'Conversation', task: 'Task', model: 'Model', repo: 'Folder', mode: 'Mode', requests: 'Requests',
+  mean_input_tokens: 'Input per request', input_tokens: 'Input tokens', cached_input_tokens: 'Cached input tokens',
+  output_tokens: 'Output tokens', reasoning_tokens: 'Reasoning tokens', removed_tokens_sent: 'Kept out (all requests)',
+  added_tokens_sent: 'Added (all requests)', net_tokens: 'Net', net_share: 'Net share', started_at: 'Started', finished_at: 'Last request' };
+function kvValue(k, v) {
+  if (v == null || v === '') return '–';
+  if (k.endsWith('_at')) return esc(when(v));
+  if (k === 'net_share') return rate(v);
+  if (typeof v === 'number') return n(v);
+  if (typeof v === 'object') return `<span class="mono">${esc(JSON.stringify(v))}</span>`;
+  return esc(k === 'task' ? clean_task(v) : v);
+}
+async function openSession(x) {
+  $('drawer_title').textContent = clean_task(x.task) || '(no typed message)';
+  const keys = Object.keys(x);
+  const first = Object.keys(LABELS).filter(k => k in x);
+  const rest = keys.filter(k => !(k in LABELS));
+  const rows = first.concat(rest).map(k => `<tr><td>${esc(LABELS[k] || k.replace(/_/g, ' '))}</td><td class="${typeof x[k] === 'number' ? 'n' : ''}">${kvValue(k, x[k])}</td></tr>`).join('');
+  $('drawer_body').innerHTML = `<table class="kv">${rows}</table><div><h3 class="dim" style="font-size:12px;margin:0 0 6px">Requests</h3><div id="drawer_requests" class="dim">Loading…</div></div>`;
+  $('drawer').classList.add('open'); $('drawer').setAttribute('aria-hidden', 'false');
+  try {
+    const r = await api('sessions/' + encodeURIComponent(x.id) + '/requests');
+    const list = r.requests || [];
+    if (!list.length) { $('drawer_requests').textContent = 'No request trace is kept for this conversation.'; return; }
+    const cols = Object.keys(list[0]).filter(k => typeof list[0][k] !== 'object');
+    $('drawer_requests').innerHTML = `<div class="scroll"><table><tr>${cols.map(c => `<th>${esc(c.replace(/_/g, ' '))}</th>`).join('')}</tr>` +
+      list.map(q => `<tr>${cols.map(c => `<td class="${typeof q[c] === 'number' ? 'n' : ''}">${typeof q[c] === 'number' ? n(q[c]) : esc(q[c])}</td>`).join('')}</tr>`).join('') + '</table></div>';
+  } catch (err) { $('drawer_requests').textContent = err.message; }
+}
+$('sessions').onclick = e => { const r = e.target.closest('tr[data-i]'); if (r && shownSessions[+r.dataset.i]) openSession(shownSessions[+r.dataset.i]); };
 refresh(); setInterval(refresh, 3000);
 </script>
 </body>

@@ -827,6 +827,21 @@ fn header(name: &str, value: &str) -> Option<Header> {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
 }
 
+/// A new MCP session id: unique in this process, not guessable from the last.
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!("lge-{:016x}", h.finish())
+}
+
 fn respond_json(request: Request, status: u16, body: &Value) {
     let mut response = Response::from_string(body.to_string()).with_status_code(status);
     if let Some(h) = header("Content-Type", "application/json") {
@@ -2683,6 +2698,16 @@ impl Daemon {
         }
         let (_, query) = split_url(request.url());
         let repo = self.mcp_repo(query);
+        // Streamable HTTP sessions: an id is given with the answer to
+        // `initialize` and sent back by the client with every later request.
+        // What a session received (source, answers) is remembered per id, so
+        // one Codex session is never told it already has what another got.
+        let mut session = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Session-Id"))
+            .map(|h| h.value.as_str().to_string())
+            .filter(|v| !v.is_empty() && v.len() <= 128);
         let mut text = String::new();
         if request
             .as_reader()
@@ -2699,13 +2724,22 @@ impl Daemon {
                 &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "invalid JSON" } }),
             );
         };
+        let initialize = |m: &Value| m.get("method").and_then(Value::as_str) == Some("initialize");
+        let initializing = match &message {
+            Value::Array(batch) => batch.iter().any(initialize),
+            single => initialize(single),
+        };
+        let issued = (session.is_none() && initializing).then(new_session_id);
+        if issued.is_some() {
+            session = issued.clone();
+        }
         let mut call = |name: &str, args: &Value| -> Result<String> {
             let Some(repo) = &repo else {
                 bail!("no indexed repository yet; add a folder on the lge page first")
             };
             let mut state = lock(&repo.state);
             match &mut *state {
-                RepoState::Ready(server) => server.call(name, args),
+                RepoState::Ready(server) => server.call_in(session.as_deref(), name, args),
                 RepoState::Indexing => bail!("{} is still being indexed; try again in a moment", repo.root.display()),
                 RepoState::Failed(e) => bail!("{} could not be indexed: {e}", repo.root.display()),
             }
@@ -2718,7 +2752,16 @@ impl Daemon {
             single => lge_mcp::reply(single, &mut call),
         };
         match answer {
-            Some(v) => respond_json(request, 200, &v),
+            Some(v) => {
+                let mut response = Response::from_string(v.to_string()).with_status_code(200);
+                if let Some(h) = header("Content-Type", "application/json") {
+                    response = response.with_header(h);
+                }
+                if let Some(h) = issued.as_deref().and_then(|id| header("Mcp-Session-Id", id)) {
+                    response = response.with_header(h);
+                }
+                let _ = request.respond(response);
+            }
             None => {
                 let _ = request.respond(Response::empty(202));
             }

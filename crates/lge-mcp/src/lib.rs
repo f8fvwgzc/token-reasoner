@@ -21,7 +21,7 @@ use lge_retrieve::{
 };
 use lge_store::GraphStore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -40,6 +40,22 @@ const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11
 const MAX_BUDGET: usize = 20_000;
 /// Default for [`Server::fresh_for`].
 const FRESH_FOR: Duration = Duration::from_millis(250);
+/// MCP sessions remembered at once; the oldest is forgotten first.
+const MAX_SESSIONS: usize = 64;
+/// Answers remembered per session for [`Server::dedup`].
+const MAX_ANSWERS: usize = 256;
+/// The session of the stdio transport: one client per process.
+pub const STDIO_SESSION: &str = "stdio";
+
+/// What one MCP session (one client connection) has received.
+#[derive(Debug, Default)]
+struct McpSession {
+    /// Symbol id -> hash of the source already returned whole.
+    sent: HashMap<String, String>,
+    /// Tool and arguments -> (hash of the answer, the call that gave it).
+    answers: HashMap<String, (String, u32)>,
+    calls: u32,
+}
 
 pub struct ToolDef {
     pub name: &'static str,
@@ -189,8 +205,14 @@ pub struct Server {
     root: PathBuf,
     index: IndexOptions,
     fresh: Freshness,
-    /// Symbol id -> hash of the source already returned in this session.
-    sent: HashMap<String, String>,
+    /// What each MCP session received, by session id. A call without a
+    /// session (an HTTP client that sent no `Mcp-Session-Id`) is answered
+    /// in full, with nothing remembered: one client is never told that it
+    /// already has what another one received.
+    sessions: HashMap<String, McpSession>,
+    session_order: VecDeque<String>,
+    /// The session of the call being answered.
+    current: Option<String>,
     /// Where pages are mirrored as markdown; `None` keeps them in the database only.
     pub pages_dir: Option<PathBuf>,
     /// Re-index a changed tree before answering. Off for a read-only snapshot.
@@ -237,7 +259,9 @@ impl Server {
             root: root.to_path_buf(),
             index,
             fresh: Freshness::default(),
-            sent: HashMap::new(),
+            sessions: HashMap::new(),
+            session_order: VecDeque::new(),
+            current: None,
             pages_dir: None,
             keep_fresh: true,
             fresh_for: FRESH_FOR,
@@ -284,8 +308,64 @@ impl Server {
         }
     }
 
-    /// Run one tool and return its text.
+    /// The state of the session being answered, created on first use.
+    fn session(&mut self) -> Option<&mut McpSession> {
+        let id = self.current.clone()?;
+        if !self.sessions.contains_key(&id) {
+            if self.sessions.len() >= MAX_SESSIONS {
+                if let Some(old) = self.session_order.pop_front() {
+                    self.sessions.remove(&old);
+                }
+            }
+            self.session_order.push_back(id.clone());
+        }
+        Some(self.sessions.entry(id).or_default())
+    }
+
+    /// Run one tool for the stdio client and return its text.
     pub fn call(&mut self, name: &str, args: &Value) -> Result<String> {
+        self.call_in(Some(STDIO_SESSION), name, args)
+    }
+
+    /// Run one tool for an MCP session (`None`: a client without one) and
+    /// return its text.
+    pub fn call_in(&mut self, session: Option<&str>, name: &str, args: &Value) -> Result<String> {
+        self.current = session.map(str::to_string);
+        let text = self.run(name, args)?;
+        Ok(self.dedup(name, args, text))
+    }
+
+    /// The same call with the same answer as earlier in the session gets a
+    /// one-line pointer to that call instead (after Gortex's conditional
+    /// fetch). Asked again, the answer is sent whole: the client evidently
+    /// no longer has it.
+    fn dedup(&mut self, name: &str, args: &Value, text: String) -> String {
+        if name == "retain_memory" || text.starts_with("error") {
+            return text;
+        }
+        let Some(s) = self.session() else {
+            return text;
+        };
+        s.calls += 1;
+        let call = s.calls;
+        let key = format!("{name} {args}");
+        let hash = content_hash(text.as_bytes());
+        if let Some((_, at)) = s.answers.get(&key).filter(|(h, _)| *h == hash) {
+            let at = *at;
+            let pointer = format!(
+                "Same answer as call {at} of this session: nothing changed since. If it is no longer in your context, ask again and it is sent whole.\n"
+            );
+            s.answers.insert(key, (content_hash(pointer.as_bytes()), call));
+            return pointer;
+        }
+        if s.answers.len() >= MAX_ANSWERS {
+            s.answers.clear();
+        }
+        s.answers.insert(key, (hash, call));
+        text
+    }
+
+    fn run(&mut self, name: &str, args: &Value) -> Result<String> {
         // Recall needs the latest commits too; storing a fact needs nothing fresh.
         let warning = if name == "retain_memory" { None } else { self.freshen() };
         let text = match name {
@@ -307,16 +387,17 @@ impl Server {
         let opts = PackOptions {
             budget: budget_arg(args, DEFAULT_TOOL_BUDGET),
             service: opt_text(args, "service").map(str::to_string),
+            shown: self.session().map(|s| s.sent.clone()).unwrap_or_default(),
             ..PackOptions::default()
         };
         let pack = evidence_pack(self.store.as_ref(), question, &opts)?;
-        // The pack showed the seeds' source: remember it, so a later request
-        // for the same symbol is answered with a pointer.
-        for seed in &pack.seeds {
-            if let Some(body) = self.store.symbol_body(&seed.id)? {
-                if pack.text.contains(body.trim_end()) {
-                    self.sent.insert(seed.id.clone(), content_hash(body.as_bytes()));
-                }
+        // The source the pack showed whole is remembered, so a later request
+        // for the same symbol gets a pointer; one already pointed to is
+        // forgotten, so asking for it gets it whole.
+        if let Some(s) = self.session() {
+            s.sent.extend(pack.full_sources.iter().cloned());
+            for id in &pack.pointed {
+                s.sent.remove(id);
             }
         }
         Ok(pack.text)
@@ -464,10 +545,12 @@ impl Server {
                     self.file_lines(&n.file_path, n.start_line as usize, n.end_line as usize)
                         .unwrap_or(stored)
                 };
-                let hash = content_hash(body.as_bytes());
-                if self.sent.get(&n.id) == Some(&hash) {
+                let hash = content_hash(body.trim_end().as_bytes());
+                // Pointed to once; asked again, it is sent whole.
+                if let Some(s) = self.session().filter(|s| s.sent.get(&n.id) == Some(&hash)) {
+                    s.sent.remove(&n.id);
                     out.push_str(&format!(
-                        "{header}  (source already shown above in this session, unchanged)\n"
+                        "{header}  (source returned earlier in this session, unchanged; ask again if it is no longer in your context)\n"
                     ));
                     continue;
                 }
@@ -479,7 +562,9 @@ impl Server {
                 left = left.saturating_sub(used + count(&header) + 12);
                 // Only a complete body counts as shown.
                 if code == body.trim_end() {
-                    self.sent.insert(n.id.clone(), hash);
+                    if let Some(s) = self.session() {
+                        s.sent.insert(n.id.clone(), hash);
+                    }
                 }
                 out.push_str(&format!("{header}\n```\n{code}\n```\n"));
             }

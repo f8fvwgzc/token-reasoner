@@ -9,7 +9,7 @@ mod report;
 mod seeds;
 mod traverse;
 
-pub use pack::{commit_line, evidence_pack, EvidencePack, PackOptions};
+pub use pack::{commit_line, evidence_pack, EvidencePack, PackOptions, SHOWN_EARLIER};
 pub use pipeline::{index_repo, refresh_if_stale, resolve_edges, unix_now, Freshness, IndexOptions, IndexReport};
 pub use render::{render_deps, render_impact, render_trace};
 pub use report::{

@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.0.11 (2026-11-29)
+
+Token techniques from Gortex (Apache-2.0) for lge's MCP tools, in lge's own Rust, and a new page.
+
+- Fix: over HTTP the daemon keeps one MCP server per folder for every Codex session, and
+  what it had sent ("source already shown above in this session") was shared by all of
+  them, so one session could be told it already had source only another one received.
+  The daemon now gives each MCP client a session (`Mcp-Session-Id`, issued with the
+  answer to `initialize`) and remembers what each one received apart. A client without a
+  session id is answered in full, with nothing remembered.
+- The same tool call with the same answer as earlier in the session gets a one-line
+  pointer to that call (`Same answer as call N of this session`) instead of the answer.
+  Asked once more, the answer is sent whole: the client no longer has it (after a
+  compaction, say). Storing a fact is never deduplicated.
+- `search_code_context` gives a one-line pointer for a starting symbol whose source the
+  session already received unchanged, so its budget goes to code the session has not
+  seen. A source pointed to once is sent whole the next time it is asked for, by either
+  tool.
+- `find_dependencies` lists verified edges first, then inferred, then unresolved, so a
+  list cut for the budget drops what is least sure.
+- The page is one screen, full width: the numbers in a strip at the top, six tabs
+  (Sessions, Rules, Savings, Cache, Folders, Replay) whose tables scroll inside their own
+  panes with fixed headers, a drawer with every figure of a session (click its row),
+  and Connect Codex and Settings as dialogs. On a narrow window the panes stack and the
+  page scrolls.
+- `lge usage trim-whatif` (and `GET /lge/api/trim-whatif`) now also reports **re-reads
+  after compaction**: outputs of file reads, in the first 20 requests after a compaction,
+  of files read before it, with their cost-weighted tokens (sent once uncached, then
+  cached on every later request until the next compaction) and their share of the
+  session's cost. A lower `model_auto_compact_token_limit` means more compactions and
+  more of these; the figure says whether a post-compaction note of the working set is
+  worth building. The idea comes from Gortex (Apache-2.0); see docs/PRIOR_ART.md.
+
 ## v0.0.10 (2026-11-28)
 
 - Fix: `scripts/install-macos.sh` could leave an updated lge that macOS kills on start
