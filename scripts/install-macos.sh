@@ -202,15 +202,19 @@ say "lge is running: $URL"
 if [ "$CONNECT" = 1 ]; then
   mkdir -p "$(dirname "$CODEX_CONFIG")"
   touch "$CODEX_CONFIG"
-  if grep -q "^$LINE\$" "$CODEX_CONFIG"; then
+  # Any spelling of this daemon's address (quotes, spaces, localhost) counts as connected.
+  EXISTING="$(grep -E '^[[:space:]]*openai_base_url[[:space:]]*=' "$CODEX_CONFIG" | head -1 || true)"
+  if grep -q "^$LINE\$" "$CODEX_CONFIG" \
+    || printf '%s' "$EXISTING" | grep -Eq "://(127\.0\.0\.1|localhost):$PORT(/|[\"']|\$)"; then
     say "Codex already points at lge"
   else
-    if grep -q '^openai_base_url' "$CODEX_CONFIG" && [ "$FORCE" != 1 ]; then
-      fail "$CODEX_CONFIG already sets openai_base_url to something else (another proxy?). Remove it, or run again with --force"
+    if [ -n "$EXISTING" ] && [ "$FORCE" != 1 ]; then
+      fail "$CODEX_CONFIG already has a different model address:  $EXISTING
+    Remove that line, or run again with --force (it keeps a backup at $BACKUP)"
     fi
     [ -f "$BACKUP" ] || cp -p "$CODEX_CONFIG" "$BACKUP"
     if [ "$FORCE" = 1 ]; then
-      /usr/bin/sed -i '' '/^openai_base_url/d' "$CODEX_CONFIG"
+      /usr/bin/sed -i '' -E '/^[[:space:]]*openai_base_url[[:space:]]*=/d' "$CODEX_CONFIG"
     fi
     # A top-level key must come before the first [section] of the file.
     { printf '%s\n%s\n\n' "$MARK" "$LINE"; cat "$CODEX_CONFIG"; } > "$CODEX_CONFIG.lge-tmp"
